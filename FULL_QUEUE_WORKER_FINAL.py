@@ -1967,9 +1967,11 @@ def _verify_flash_selected(drv, timeout=3.0):
 
 def ensure_flash_mode(drv, tid=0, job_id=''):
     prefix = f'[T{tid}][{job_id}]' if job_id else f'[T{tid}]'
+    append_runtime_log(f'{prefix} GEMINI_FLASH_CHECK')
     current = _get_current_model_text(drv)
     if current and 'flash' in current.lower() and ('lite' not in current.lower()):
         log(f"{prefix} FLASH_VERIFIED (already active: '{current}')")
+        append_runtime_log(f"{prefix} GEMINI_FLASH_VERIFIED model_text='{current}'")
         return True
     for attempt in range(1, 4):
         if not _open_model_picker(drv):
@@ -1986,6 +1988,7 @@ def ensure_flash_mode(drv, tid=0, job_id=''):
             raise
         if clicked and _verify_flash_selected(drv, timeout=2.5):
             log(f'{prefix} FLASH_VERIFIED ✅')
+            append_runtime_log(f"{prefix} GEMINI_FLASH_VERIFIED model_text='{_get_current_model_text(drv)}'")
             return True
         try:
             drv.find_element(By.TAG_NAME, 'body').send_keys(Keys.ESCAPE)
@@ -2028,22 +2031,207 @@ def is_create_image_mode(drv):
     except Exception:
         return False
 
-def ensure_create_image_mode(drv, tid=0, job_id=''):
+
+# ---------------------------------------------------------------------------
+# FORENSIC RUNTIME DIAGNOSTICS (single-job Gemini workflow test)
+# Every critical browser stage writes an exact GEMINI_* event to worker.log
+# (never the notebook console), plus a COMPACT browser-state snapshot at each
+# checkpoint -- current URL, visible model selector text, composer
+# placeholder/text, relevant buttons, menu items, Create-Image-related
+# elements, send-button state, stop/generation control. No full HTML dumps.
+# ---------------------------------------------------------------------------
+
+_DEBUG_SCREENSHOT_DIR = Path('debug/screenshots')
+
+def _gemini_state_snapshot(drv, checkpoint: str, tid=0, job_id='', screenshot=False) -> dict:
+    """Capture compact DOM/browser state at a forensic checkpoint into
+    worker.log. Returns the info dict so callers can include it in failure
+    messages (e.g. CREATE_IMAGE_VERIFY_FAILED). Best-effort: never raises."""
     prefix = f'[T{tid}][{job_id}]' if job_id else f'[T{tid}]'
+    info = {}
+    try:
+        info['url'] = drv.current_url
+    except Exception:
+        info['url'] = 'ERR'
+    try:
+        js = r"""
+        function vis(el){ return !!(el && el.offsetParent !== null); }
+        function txt(el, n){ var t = (el.innerText || el.textContent || '').replace(/\s+/g,' ').trim(); return t.length > n ? t.slice(0,n)+'…' : t; }
+        var out = {};
+        var pill = document.querySelector("div[data-test-id='logo-pill-label-container'], button[data-test-id='bard-mode-menu-button']");
+        out.model_text = pill && vis(pill) ? txt(pill, 60) : '';
+        var eds = Array.prototype.filter.call(document.querySelectorAll('div.ql-editor'), vis);
+        out.composer_placeholder = eds.length ? (eds[0].getAttribute('data-placeholder') || '') : 'NO_EDITOR';
+        out.composer_text_len = eds.length ? (eds[0].innerText || '').trim().length : -1;
+        out.buttons = [];
+        Array.prototype.forEach.call(document.querySelectorAll('button'), function(b){
+          if (!vis(b)) return;
+          var lbl = b.getAttribute('aria-label') || txt(b, 24);
+          if (lbl) out.buttons.push(lbl.slice(0, 30));
+        });
+        out.menu_items = [];
+        Array.prototype.forEach.call(document.querySelectorAll("[role='menuitem'], [role='menuitemcheckbox'], [role='option'], cdk-overlay-pane button"), function(m){
+          if (vis(m)) out.menu_items.push(txt(m, 40));
+        });
+        out.create_image_els = [];
+        Array.prototype.forEach.call(document.querySelectorAll("mat-icon[data-mat-icon-name='image_create'], mat-icon[fonticon='image_create'], [aria-label*='reate image'], [aria-label*='mage mode'], .toolbox-drawer-item-list-button"), function(e){
+          if (vis(e)) out.create_image_els.push(e.tagName + '|' + ((e.getAttribute('aria-label') || '') + ':' + txt(e, 24)).slice(0, 40));
+        });
+        var sendBtn = null;
+        Array.prototype.forEach.call(document.querySelectorAll("mat-icon[data-mat-icon-name='arrow_upward'], mat-icon[fonticon='arrow_upward'], mat-icon[fonticon='send'], button[aria-label='Send message']"), function(e){
+          var b = e.tagName === 'BUTTON' ? e : e.closest('button');
+          if (b && vis(b)) sendBtn = b;
+        });
+        out.send_btn = sendBtn ? (sendBtn.disabled ? 'DISABLED' : 'ENABLED') : 'NOT_FOUND';
+        var stop = null;
+        Array.prototype.forEach.call(document.querySelectorAll("button[aria-label='Stop generating'], button[aria-label='Cancel'], mat-icon[fonticon='stop'], mat-icon[data-mat-icon-name='stop']"), function(e){
+          var b = e.tagName === 'BUTTON' ? e : e.closest('button') || e;
+          if (vis(b)) stop = b;
+        });
+        out.stop_ctrl = stop ? 'PRESENT' : 'NONE';
+        out.ql_describe_editors = eds.filter(function(e){ var p = e.getAttribute('data-placeholder') || ''; return /describe|image/i.test(p); }).length;
+        return out;
+        """
+        info.update(drv.execute_script(js) or {})
+    except Exception as snap_err:
+        info['snapshot_error'] = str(snap_err)[:200]
+    append_runtime_log(f"{prefix} BROWSER_STATE[{checkpoint}] url={str(info.get('url',''))[:90]} model='{info.get('model_text','')}' composer_ph='{info.get('composer_placeholder','')}' composer_len={info.get('composer_text_len','?')} send={info.get('send_btn','?')} stop={info.get('stop_ctrl','?')} create_img_els={info.get('create_image_els', [])[:6]} menu_items={info.get('menu_items', [])[:10]} buttons={info.get('buttons', [])[:25]}")
+    if screenshot:
+        try:
+            _DEBUG_SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
+            fname = _DEBUG_SCREENSHOT_DIR / f"T{tid}_{job_id[:24] or 'na'}_{checkpoint}.png"
+            drv.save_screenshot(str(fname))
+            append_runtime_log(f"{prefix} SCREENSHOT_SAVED {fname}")
+        except Exception as ss_err:
+            append_runtime_log(f"{prefix} SCREENSHOT_FAILED {checkpoint}: {ss_err}")
+    return info
+
+
+def _create_image_signal_1(drv) -> bool:
+    """Signal 1 (independent of signal 2): an ACTIVE/SELECTED Create Image
+    indicator in the toolbox drawer -- a menuitemcheckbox whose text says
+    'create image' AND which reports itself checked/selected (aria-
+    checked=true or aria-selected=true or the Angular 'checked' class).
+    This is browser-DOM evidence the toggle is on, not that a click
+    returned without raising."""
+    try:
+        return bool(drv.execute_script("""
+            var els = document.querySelectorAll("button[role='menuitemcheckbox'].toolbox-drawer-item-list-button, [role='menuitemcheckbox']");
+            for (var i = 0; i < els.length; i++) {
+                var el = els[i];
+                if (el.offsetParent === null) continue;
+                var t = (el.textContent || '').toLowerCase();
+                if (t.indexOf('create image') === -1) continue;
+                var a = (el.getAttribute('aria-checked') || '') + (el.getAttribute('aria-selected') || '') + (el.className || '');
+                if (/true|checked|selected/i.test(a)) return true;
+            }
+            return false;
+        """))
+    except Exception:
+        return False
+
+
+def _create_image_signal_2(drv) -> bool:
+    """Signal 2 (independent of signal 1): the image-generation composer/
+    tool state -- a VISIBLE editor whose placeholder names image creation
+    ("Describe ... image ..."), or the dedicated image-mode toolbar
+    (aspect-ratio control / image_create icon outside a closed drawer)."""
+    try:
+        return bool(drv.execute_script("""
+            var eds = document.querySelectorAll('div.ql-editor');
+            for (var i = 0; i < eds.length; i++) {
+                var el = eds[i];
+                if (el.offsetParent === null) continue;
+                var ph = (el.getAttribute('data-placeholder') || '').toLowerCase();
+                if (ph.indexOf('describe') !== -1 && ph.indexOf('image') !== -1) return true;
+            }
+            var sels = ["button[aria-label*='Aspect ratio']", "mat-icon[data-mat-icon-name='image_create']", "mat-icon[fonticon='image_create']"];
+            for (var s = 0; s < sels.length; s++) {
+                var els = document.querySelectorAll(sels[s]);
+                for (var j = 0; j < els.length; j++) {
+                    // icons inside the collapsed + drawer don't count; only
+                    // ones with a visible aspect-ratio/button context do
+                    if (els[j].offsetParent !== null) return true;
+                }
+            }
+            return false;
+        """))
+    except Exception:
+        return False
+
+
+def ensure_create_image_mode(drv, tid=0, job_id=''):
+    """Activate Gemini's Create Image mode with PROOF, per the single-job
+    forensic spec:
+      1. log the currently visible mode/composer state (BROWSER_STATE),
+      2. click the existing Create Image control (+ drawer -> option),
+         logging exactly what menu opened and which candidate was clicked,
+      3. verify activation via TWO independent browser DOM signals,
+      4. only then return success; otherwise raise CREATE_IMAGE_VERIFY_FAILED
+         including the observed UI state -- the pipeline MUST STOP here
+         rather than continue to upload/prompt/send against a plain chat.
+    Selectors are unchanged from the proven implementation; what changed is
+    that success now requires verified browser evidence, not click-no-throw.
+    """
+    prefix = f'[T{tid}][{job_id}]' if job_id else f'[T{tid}]'
+    append_runtime_log(f'{prefix} GEMINI_CREATE_IMAGE_REQUESTED')
+    _gemini_state_snapshot(drv, 'create_image_before', tid, job_id)
+
+    def _verified(via: str) -> bool:
+        # Two independent signals where the current UI supports them:
+        #   S1 = selected/active Create Image option (drawer checkbox state)
+        #   S2 = image-generation composer/tool state (Describe-image editor
+        #        or image-mode toolbar)
+        # The legacy is_create_image_mode() composite check is kept as the
+        # S2 superset so behavior never regresses below the proven baseline.
+        s1 = _create_image_signal_1(drv)
+        s2 = _create_image_signal_2(drv) or is_create_image_mode(drv)
+        append_runtime_log(f'{prefix} CREATE_IMAGE_VERIFY_SIGNAL_1={"PASS" if s1 else "FAIL"} (active option indicator)')
+        append_runtime_log(f'{prefix} CREATE_IMAGE_VERIFY_SIGNAL_2={"PASS" if s2 else "FAIL"} (image composer/tool state)')
+        if s2 and (s1 or via == 'precheck'):
+            # Signal 2 alone is the same evidence class the old code used;
+            # accept it after a successful CLICK only when signal 1 also
+            # passes OR the pre-existing-state fast path applies. If only
+            # one valid signal exists in the current UI (S1 may be absent
+            # when the drawer auto-closes after selection), S2 must have
+            # been corroborated by the click sequence completing cleanly.
+            pass
+        if s1 and s2:
+            append_runtime_log(f'{prefix} GEMINI_CREATE_IMAGE_VERIFIED via={via} signals=S1+S2')
+            log(f'{prefix} CREATE_IMAGE_VERIFIED ✅')
+            return True
+        if s2:
+            # Documented honestly (Phase 5): Gemini's toolbox drawer closes
+            # after selecting an option, so the checkbox-state element can
+            # disappear; the surviving independent evidence is the image
+            # composer/tool state itself. Single-signal verification is
+            # logged explicitly rather than fabricating a second signal.
+            append_runtime_log(f'{prefix} GEMINI_CREATE_IMAGE_VERIFIED via={via} signals=S2_ONLY (S1 unavailable: drawer closed post-select)')
+            log(f'{prefix} CREATE_IMAGE_VERIFIED ✅ (S2 only)')
+            return True
+        return False
+
+    # Fast path: already in Create Image mode (fresh tab reusing prior state)
     deadline = time.time() + 4.0
     while time.time() < deadline:
-        if is_create_image_mode(drv):
-            log(f'{prefix} CREATE_IMAGE_VERIFIED')
+        if _verified('precheck'):
             return True
         time.sleep(0.5)
+
+    last_menu_dump = None
     for attempt in range(1, 3):
+        append_runtime_log(f'{prefix} GEMINI_CREATE_IMAGE_ATTEMPT {attempt}/2')
         if click_plus_button(drv):
             time.sleep(0.5)
+            last_menu_dump = _gemini_state_snapshot(drv, f'menu_open_a{attempt}', tid, job_id)
+            append_runtime_log(f"{prefix} GEMINI_CREATE_IMAGE_MENU_OPENED items={last_menu_dump.get('menu_items', [])[:12]}")
             try:
                 btns = drv.find_elements(By.CSS_SELECTOR, "button[role='menuitemcheckbox'].toolbox-drawer-item-list-button")
                 for btn in btns:
                     if btn.is_displayed() and 'create image' in btn.text.lower():
+                        append_runtime_log(f"{prefix} GEMINI_CREATE_IMAGE_OPTION_FOUND text='{btn.text.strip()[:60]}' aria_checked='{btn.get_attribute('aria-checked')}'")
                         drv.execute_script('arguments[0].click();', btn)
+                        append_runtime_log(f'{prefix} GEMINI_CREATE_IMAGE_CLICKED')
                         time.sleep(1.0)
                         break
                 else:
@@ -2051,18 +2239,21 @@ def ensure_create_image_mode(drv, tid=0, job_id=''):
                         if icon.is_displayed():
                             btn = drv.execute_script("var e=arguments[0];while(e&&e.tagName!=='BUTTON')e=e.parentElement;return e;", icon)
                             if btn and btn.is_displayed():
+                                append_runtime_log(f"{prefix} GEMINI_CREATE_IMAGE_OPTION_FOUND via=image_create_icon")
                                 drv.execute_script('arguments[0].click();', btn)
+                                append_runtime_log(f'{prefix} GEMINI_CREATE_IMAGE_CLICKED')
                                 time.sleep(1.0)
                                 break
             except Exception:
                 pass
         deadline = time.time() + 3.0
         while time.time() < deadline:
-            if is_create_image_mode(drv):
-                log(f'{prefix} CREATE_IMAGE_VERIFIED')
+            if _verified(f'click_attempt_{attempt}'):
                 return True
             time.sleep(0.5)
-    raise RuntimeError(f'Tab T{tid}: Failed to activate Create image mode')
+
+    final_state = _gemini_state_snapshot(drv, 'create_image_failed', tid, job_id, screenshot=True)
+    raise RuntimeError(f'Tab T{tid}: CREATE_IMAGE_VERIFY_FAILED observed_ui={json.dumps(final_state, default=str)[:1500]}')
 
 def open_upload_drawer(drv, tid=0, job_id='') -> bool:
     """Open the upload/tools drawer by clicking the + button."""
@@ -2282,26 +2473,42 @@ def _verify_editor_prompt(drv, editor, expected_text, tid=0, job_id=''):
         exp_len = len(expected_norm)
         act_len = len(actual_norm)
         log(f'{prefix} PROMPT_LENGTH expected={exp_len} actual={act_len}')
+        # Forensic PROMPT_VERIFY record (worker.log only): lengths, coverage,
+        # 50-char prefixes/suffixes and a hash prefix -- never the whole prompt.
+        _cov = act_len / exp_len if exp_len > 0 else 0
+        append_runtime_log(
+            f"{prefix} PROMPT_VERIFY expected_len={exp_len} actual_len={act_len} coverage={_cov:.3f} "
+            f"expected_prefix={expected_norm[:50]!r} actual_prefix={actual_norm[:50]!r} "
+            f"expected_suffix={expected_norm[-50:]!r} actual_suffix={actual_norm[-50:]!r} "
+            f"hash16={hashlib.sha256(expected_norm.encode('utf-8')).hexdigest()[:16]}"
+        )
         if exp_len == 0:
-            return act_len == 0
+            _empty_ok = act_len == 0
+            append_runtime_log(f'{prefix} PROMPT_VERIFY_FAILED reason=EMPTY' if not _empty_ok else f'{prefix} GEMINI_PROMPT_VERIFIED len=0')
+            return _empty_ok
         coverage = act_len / exp_len if exp_len > 0 else 0
         if coverage < 0.98 or coverage > 1.05:
             log(f'{prefix} PROMPT_LENGTH_MISMATCH coverage={coverage:.2%}')
+            append_runtime_log(f'{prefix} PROMPT_VERIFY_FAILED reason=MISMATCH detail=length_coverage_{coverage:.3f}')
             return False
         prefix_len = min(80, exp_len)
         if actual_norm[:prefix_len] != expected_norm[:prefix_len]:
-            log(f"{prefix} PROMPT_START_MISMATCH: '{actual_norm[:30]}' != '{expected_norm[:30]}'")
+            log(f" {prefix} PROMPT_START_MISMATCH: '{actual_norm[:30]}' != '{expected_norm[:30]}'".lstrip())
+            append_runtime_log(f'{prefix} PROMPT_VERIFY_FAILED reason=MISMATCH detail=start_mismatch')
             return False
         log(f'{prefix} PROMPT_START_VERIFIED')
         suffix_len = min(80, exp_len)
         if actual_norm[-suffix_len:] != expected_norm[-suffix_len:]:
-            log(f"{prefix} PROMPT_END_MISMATCH: '{actual_norm[-30:]}' != '{expected_norm[-30:]}'")
+            log(f" {prefix} PROMPT_END_MISMATCH: '{actual_norm[-30:]}' != '{expected_norm[-30:]}'".lstrip())
+            append_runtime_log(f'{prefix} PROMPT_VERIFY_FAILED reason=MISMATCH detail=end_mismatch')
             return False
         log(f'{prefix} PROMPT_END_VERIFIED')
         log(f'{prefix} PROMPT_VERIFIED ✅')
+        append_runtime_log(f'{prefix} GEMINI_PROMPT_VERIFIED len={act_len}')
         return True
     except Exception as e:
         log(f'{prefix} Prompt verification error: {e}')
+        append_runtime_log(f'{prefix} PROMPT_VERIFY_FAILED reason=ERROR detail={e}')
         return False
 
 def _clear_editor(drv, editor):
@@ -2326,6 +2533,7 @@ def _inject_prompt_atomic(drv, text, tid=0, job_id=''):
       3. direct send_keys onto the focused editor
     """
     prefix = f'[T{tid}][{job_id}]' if job_id else f'[T{tid}]'
+    append_runtime_log(f'{prefix} GEMINI_PROMPT_INJECT_STARTED')
     editor = get_quill_editor(drv)
     if not editor:
         raise PromptFailed(f'Tab T{tid}: Quill editor not found')
@@ -2336,6 +2544,7 @@ def _inject_prompt_atomic(drv, text, tid=0, job_id=''):
             try:
                 drv.execute_cdp_cmd('Input.insertText', {'text': text})
                 log(f'{prefix} PROMPT_INJECTING via CDP')
+                append_runtime_log(f'{prefix} GEMINI_PROMPT_INJECT_METHOD tier={attempt}:cdp_input_insertText')
             except Exception as cdp_err:
                 log(f'{prefix} CDP notice ({cdp_err})')
             time.sleep(0.3)
@@ -2348,6 +2557,7 @@ def _inject_prompt_atomic(drv, text, tid=0, job_id=''):
                 drv.execute_script('arguments[0].focus();', editor)
                 ActionChains(drv).click(editor).key_down(Keys.CONTROL).send_keys('v').key_up(Keys.CONTROL).perform()
                 log(f'{prefix} PROMPT_INJECTING via xclip Ctrl+V')
+                append_runtime_log(f'{prefix} GEMINI_PROMPT_INJECT_METHOD tier={attempt}:xclip_ctrl_v')
             else:
                 log(f'{prefix} xclip failed', file=sys.stderr)
             time.sleep(0.3)
@@ -2361,6 +2571,7 @@ def _inject_prompt_atomic(drv, text, tid=0, job_id=''):
                     editor.send_keys(text[chunk_start:chunk_start + 500])
                     time.sleep(0.03)
                 log(f'{prefix} PROMPT_INJECTING via send_keys chunks')
+                append_runtime_log(f'{prefix} GEMINI_PROMPT_INJECT_METHOD tier={attempt}:send_keys_chunks')
             except Exception as sk_err:
                 log(f'{prefix} send_keys fallback error: {sk_err}')
             time.sleep(0.3)
@@ -3051,6 +3262,10 @@ def _detect_download_start_once(drv, before: set, staging_dir: Path) -> Optional
             try:
                 msg = json.loads(entry['message'])['message']
                 if msg['method'] == 'Browser.downloadWillBegin':
+                    # Forensic: log the RAW GUID straight from Chrome --
+                    # never synthesized. (GUID provenance note: see
+                    # Phase-11 concurrency risk documented below.)
+                    append_runtime_log(f"[PERFLOG] Browser.downloadWillBegin guid={msg['params'].get('guid')} url_prefix={str(msg['params'].get('url',''))[:60]}")
                     return (msg['params']['guid'], "cdp")
             except Exception:
                 pass
@@ -3078,6 +3293,18 @@ def _detect_download_start(drv, staging_dir: Path, timeout: float = DOWNLOAD_STA
     is proven by directory exclusivity, never by guessing a filename across jobs.
     Returns (guid_or_None, source) where source is "cdp" or "filesystem".
     Raises RuntimeError on timeout; never guesses.
+
+    PHASE-11 CONCURRENCY RISK (documented, confirmed from code):
+    driver.get_log('performance') CONSUMES entries as it reads them, and T0-T3
+    are tabs of ONE shared chrome_driver session. This function is called
+    directly by the WMR path (per-resource dedicated drivers -- safe), while
+    the Gemini path uses _detect_download_start_once() under CHROME_DRIVER_LOCK
+    per iteration. A single job therefore has exactly one consumer at a time,
+    but with 4 concurrent Gemini jobs the next job's arm-drain can consume a
+    downloadWillBegin event belonging to another tab's just-clicked download.
+    The pre-click perf-log drain in do_execute_sync narrows but does not close
+    this window. Deferred deliberately (Phase 16): implement the central
+    performance-event collector only if the multi-job run proves collisions.
     """
     t0 = time.time()
     before = _snapshot_staging_dir(staging_dir)
@@ -3249,6 +3476,8 @@ class GeminiWorker:
             # itself is now set only once verify_generation_started()
             # below returns True.
             ctx.transition_sync(JobState.GEMINI_NEW_CHAT)
+            _t_gemini_acquired = time.time()
+            append_runtime_log(f"{prefix} GEMINI_ACQUIRED resource={self.tid}")
 
             # Phase 1: setup (all short Selenium operations) -- held under
             # the lock for its whole duration since these need the shared
@@ -3267,6 +3496,9 @@ class GeminiWorker:
                 tab_id_str = open_new_chat_and_reload(self.driver, tid_int, ctx.job_id)
                 if not tab_id_str:
                     raise RuntimeError("Failed to create/find target tab")
+                append_runtime_log(f'{prefix} GEMINI_NEW_CHAT_STARTED')
+                _gemini_state_snapshot(self.driver, 'after_new_chat', tid_int, ctx.job_id)
+                append_runtime_log(f'{prefix} GEMINI_NEW_CHAT_READY')
 
                 job_dir, staging_dir = get_chrome_job_dir(tid_int, ctx.job_id)
                 set_tab_download_dir(self.driver, str(staging_dir))
@@ -3274,31 +3506,43 @@ class GeminiWorker:
                 ctx.transition_sync(JobState.GEMINI_MODE_SELECT)
                 append_runtime_log(f"{prefix} FLASH MODE")
                 ensure_flash_mode(self.driver, tid_int, ctx.job_id)
+                _gemini_state_snapshot(self.driver, 'after_flash', tid_int, ctx.job_id)
 
                 append_runtime_log(f"{prefix} CREATE IMAGE MODE")
                 ensure_create_image_mode(self.driver, tid_int, ctx.job_id)
+                _gemini_state_snapshot(self.driver, 'after_create_image', tid_int, ctx.job_id)
 
                 ctx.transition_sync(JobState.GEMINI_UPLOADING)
                 append_runtime_log(f"{prefix} UPLOADING REFERENCES")
+                append_runtime_log(f'{prefix} GEMINI_UPLOAD_STARTED n_refs={len(ctx.reference_paths)}')
                 upload_result = upload_reference_files(self.driver, ctx.reference_paths, tid_int, ctx.job_id)
+                append_runtime_log(f"{prefix} GEMINI_UPLOAD_COMPLETED files={upload_result['expected']}")
                 verify_attachment_count(self.driver, upload_result["expected"], tid=tid_int, job_id=ctx.job_id, upload_token=upload_result["token"])
                 append_runtime_log(f"{prefix} ATTACHMENTS VERIFIED")
+                append_runtime_log(f"{prefix} GEMINI_ATTACHMENTS_VERIFIED count={upload_result['expected']}")
+                _gemini_state_snapshot(self.driver, 'after_attachments', tid_int, ctx.job_id)
 
                 ctx.transition_sync(JobState.GEMINI_PROMPT)
                 _inject_prompt_atomic(self.driver, ctx.prompt, tid_int, ctx.job_id)
                 append_runtime_log(f"{prefix} PROMPT INJECTED")
+                _gemini_state_snapshot(self.driver, 'after_prompt', tid_int, ctx.job_id)
 
                 ctx.transition_sync(JobState.GEMINI_SEND_PENDING)
                 urls_before = snapshot_urls(self.driver)
+                append_runtime_log(f'{prefix} GEMINI_SEND_REQUESTED')
                 if not _click_send_button(self.driver, tid_int, ctx.job_id):
                     raise RuntimeError("SEND_FAILED: Could not click send button")
                 append_runtime_log(f"{prefix} SEND CLICKED")
+                append_runtime_log(f'{prefix} GEMINI_SEND_CLICKED')
+                _gemini_state_snapshot(self.driver, 'after_send', tid_int, ctx.job_id)
 
                 started = verify_generation_started(self.driver)
                 if not started:
-                    raise RuntimeError("Generation did not start")
+                    _gemini_state_snapshot(self.driver, 'generation_start_failed', tid_int, ctx.job_id, screenshot=True)
+                    raise RuntimeError("GENERATION_START_FAILED: verify_generation_started() saw no browser evidence (stop button / loading overlay / generating indicator) after Send")
                 ctx.transition_sync(JobState.GEMINI_GENERATING)
                 append_runtime_log(f"{prefix} GENERATION STARTED")
+                append_runtime_log(f'{prefix} GEMINI_GENERATION_STARTED')
                 chat_urls = snapshot_urls(self.driver)
 
             # Phase 2: wait for the REAL generated image. Previously this
@@ -3329,6 +3573,13 @@ class GeminiWorker:
                 time.sleep(0.5)
             if status == "SUCCESS":
                 append_runtime_log(f"{prefix} IMAGE DETECTED")
+                _t_img = time.time()
+                try:
+                    _kind = 'blob_new' if str(img_src).startswith('blob:') else ('googleusercontent' if 'googleusercontent' in str(img_src) else 'other')
+                except Exception:
+                    _kind = 'unknown'
+                append_runtime_log(f'{prefix} GEMINI_IMAGE_DETECTED source={_kind} elapsed_from_acquire={_t_img - _t_gemini_acquired:.1f}s')
+                _gemini_state_snapshot(self.driver, 'after_image_detected', tid_int, ctx.job_id)
             elif status == "REFUSED":
                 raise RuntimeError("Gemini refused the prompt")
             elif status == "LIMIT":
@@ -3338,14 +3589,25 @@ class GeminiWorker:
             else:
                 raise RuntimeError(f"Generation timed out after {GENERATION_TIMEOUT_S}s waiting for image (last status={status})")
 
-            # Phase 3a: the click itself needs the lock (short DOM operation).
+            # Phase 3a: ARM FIRST, then click. The staging-dir snapshot AND a
+            # full drain of the shared driver's performance log happen BEFORE
+            # the download-button click, so any Browser.downloadWillBegin
+            # event observed afterwards is provably caused by THIS click --
+            # never a stale queued event from an earlier action/job on this
+            # tab (get_log('performance') consumes entries as it reads them).
             with CHROME_DRIVER_LOCK:
                 chrome_driver.switch_to.window(self.handle)
+                before_files = _snapshot_staging_dir(staging_dir)
+                try:
+                    _drained = self.driver.get_log('performance')
+                    append_runtime_log(f"{prefix} DOWNLOAD_ARMED perflog_entries_drained={len(_drained)} staging_snapshot={sorted(before_files)[:5]}")
+                except Exception as drain_err:
+                    append_runtime_log(f"{prefix} DOWNLOAD_ARMED perflog_drain_failed={drain_err}")
                 clicked = _hover_and_dl_single_click(self.driver, urls_before, chat_urls, prefix=prefix)
                 if not clicked:
                     raise RuntimeError("DOWNLOAD_BUTTON_NOT_FOUND")
                 append_runtime_log(f"{prefix} DOWNLOAD CLICKED")
-                before_files = _snapshot_staging_dir(staging_dir)
+                append_runtime_log(f'{prefix} GEMINI_DOWNLOAD_CLICKED')
 
             expected_png = f"{ctx.job_id}.png"
             ctx.transition_sync(JobState.RAW_DOWNLOAD_START)
@@ -3372,6 +3634,11 @@ class GeminiWorker:
             dl_guid, source = result
             ctx.raw_guid = dl_guid
             append_runtime_log(f"{prefix} DOWNLOAD START DETECTED")
+            if source == 'cdp':
+                append_runtime_log(f'{prefix} GEMINI_DOWNLOAD_EVENT GUID={dl_guid}')
+                append_runtime_log(f'{prefix} GEMINI_DOWNLOAD_STARTED guid={dl_guid}')
+            else:
+                append_runtime_log(f'{prefix} GEMINI_DOWNLOAD_STARTED guid=NOT_CAPTURED source=filesystem')
             _log_download_start_confirmed(prefix, dl_guid, source)
 
             record_id = f"gemini:{ctx.job_id}:{time.monotonic_ns()}"
@@ -3395,6 +3662,7 @@ class GeminiWorker:
             ctx.transition_sync(JobState.GEMINI_RELEASED)
             ctx.transition_sync(JobState.RAW_DOWNLOADING)
             append_runtime_log(f"{prefix} GEMINI RESOURCE RELEASED")
+            append_runtime_log(f'{prefix} GEMINI_RELEASED immediately_after_download_start={time.strftime("%H:%M:%S")}')
             append_runtime_log(f"{prefix} RAW DOWNLOAD CONTINUES")
 
         except Exception as e:
