@@ -3963,6 +3963,33 @@ def fetch_generation(gen_id):
 
 ALLOW_PROMPT_FALLBACK = os.environ.get('ALLOW_PROMPT_FALLBACK', '0') == '1'
 
+def _safe_url_for_log(url):
+    """Strip query params before logging a reference URL -- these are R2
+    public URLs with no secrets in the path, but any future signed URL
+    could carry a token/signature in its query string, so this is
+    stripped defensively rather than assumed safe."""
+    try:
+        parsed = urllib.parse.urlparse(str(url))
+        if not parsed.scheme:
+            return str(url)[:180]
+        return f'{parsed.scheme}://{parsed.netloc}{parsed.path}'
+    except Exception:
+        return '<unparseable-url>'
+
+
+def _download_labeled_ref(label, url, gen_id):
+    """download_remote_image() wrapper that logs WHICH reference field and
+    WHICH (query-stripped) URL failed before re-raising -- a bare
+    REF_HTTP_PERMANENT_FAILURE/REF_DOWNLOAD_FAILED gave no way to tell
+    whether a real run's 404s were bad/deleted R2 objects (data problem)
+    or a URL-construction bug on our side (code problem)."""
+    try:
+        return sys.modules['fashion_studio'].download_remote_image(url, REFS_CACHE_DIR)
+    except Exception as e:
+        append_runtime_log(f'[{gen_id}] REF_DOWNLOAD_FAILED_FIELD label={label} url={_safe_url_for_log(url)} error={e}')
+        raise
+
+
 def resolve_prompt_and_refs(gen):
     db_prompt = gen.get('prompt')
     if isinstance(db_prompt, str):
@@ -3982,9 +4009,9 @@ def resolve_prompt_and_refs(gen):
         raise ValueError(f"Generation {gen['id']}: No garment reference found in params.")
     model_img_url = params.get('modelImage') or gen.get('model_angle_url') or gen.get('model_image_url')
     holo_url = params.get('styleImage') or gen.get('hologram_url')
-    garment_path = sys.modules['fashion_studio'].download_remote_image(garment_url, REFS_CACHE_DIR)
-    model_path = sys.modules['fashion_studio'].download_remote_image(model_img_url, REFS_CACHE_DIR) if model_img_url else None
-    holo_path = sys.modules['fashion_studio'].download_remote_image(holo_url, REFS_CACHE_DIR) if holo_url else None
+    garment_path = _download_labeled_ref('garment', garment_url, gen['id'])
+    model_path = _download_labeled_ref('model', model_img_url, gen['id']) if model_img_url else None
+    holo_path = _download_labeled_ref('hologram', holo_url, gen['id']) if holo_url else None
     prompt = db_prompt or sys.modules['fashion_studio'].fashion_tryon_prompt(has_model=bool(model_path))
     return (prompt, garment_path, model_path, holo_path)
 
