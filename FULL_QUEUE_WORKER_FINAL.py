@@ -298,11 +298,13 @@ from bullmq import Worker, Job, Queue
 import psycopg2
 from psycopg2 import pool as _pgpool
 try:
-    from IPython.display import display as ipy_display, HTML, clear_output
+    from IPython.display import display as ipy_display, HTML, clear_output, update_display
 except ImportError:
     ipy_display = print
     HTML = str
     def clear_output(wait=False):
+        pass
+    def update_display(obj, display_id=None):
         pass
 try:
     from pyvirtualdisplay import Display
@@ -3180,12 +3182,14 @@ def _inject_prompt_atomic(drv, text, tid=0, job_id=''):
 
     for attempt in range(1, 3):
         for method_name, method in _PROMPT_INJECT_TIERS:
-            emit_live_event(f'job:{job_id}:prompt', f'{prefix} ✏️Prompt:{method_name}')
+            # Which tier is running goes to worker.log only -- the single
+            # per-job live line (JOB_PROGRESS 'prompt' stage, already
+            # marked run/ok elsewhere) is the only thing that updates in
+            # the notebook, so this doesn't spam a fresh line per tier.
             append_runtime_log(f'{prefix} PROMPT_METHOD_START={method_name} attempt={attempt}')
             try:
                 if method(drv, text, tid=tid, job_id=job_id):
                     append_runtime_log(f'{prefix} PROMPT_METHOD_SUCCESS={method_name}')
-                    emit_live_event(f'job:{job_id}:prompt', f'{prefix} ✅Prompt')
                     return True
                 append_runtime_log(f'{prefix} PROMPT_METHOD_FAIL={method_name}')
             except Exception as e:
@@ -3193,7 +3197,6 @@ def _inject_prompt_atomic(drv, text, tid=0, job_id=''):
         append_runtime_log(f'{prefix} PROMPT_VERIFY_FAIL attempt {attempt} (all tiers) — retrying')
         time.sleep(0.3)
 
-    emit_live_event(f'job:{job_id}:prompt', f'{prefix} ❌Prompt')
     raise PromptFailed(f'Tab T{tid}: Prompt injection failed after 2 attempts (all tiers unverified)')
 
 def _log_click_rect_and_occlusion(drv, element, label, prefix=''):
@@ -3308,7 +3311,10 @@ def _click_send_button(drv, tid=0, job_id=''):
         pre_len = int(_gemini_ui_snapshot(drv).get('composer_text_len') or -1)
     except Exception:
         pass
-    emit_live_event(f'job:{job_id}:send', f'{prefix} 📤SendTarget')
+    # PART: Send:Target/Send:Click/Sent detail goes to worker.log only --
+    # the single per-job live line (JOB_PROGRESS 'send' stage, marked
+    # run/ok/fail by the caller) is the only notebook-visible output for
+    # this job, so this function no longer prints its own extra lines.
     clicked = False
     for attempt in range(1, MAX_SEND_RETRIES + 1):
         if _click_send_button_once(drv, tid=tid, job_id=job_id):
@@ -3325,9 +3331,7 @@ def _click_send_button(drv, tid=0, job_id=''):
         except Exception as e:
             append_runtime_log(f'{prefix} Enter fallback failed: {e}')
     if not clicked:
-        emit_live_event(f'job:{job_id}:send', f'{prefix} ❌SendTarget')
         return False
-    emit_live_event(f'job:{job_id}:send', f'{prefix} 📤SendClick')
     append_runtime_log(f'{prefix} GEMINI_SEND_CLICKED pre_composer_len={pre_len}')
     deadline = time.time() + 8.0
     while time.time() < deadline:
@@ -3340,14 +3344,12 @@ def _click_send_button(drv, tid=0, job_id=''):
                 f"gen_evidence={gen_evidence} composer_len={snap.get('composer_text_len')}"
             )
             append_runtime_log(f'{prefix} SEND_VERIFIED ✅')
-            emit_live_event(f'job:{job_id}:send', f'{prefix} ✅Sent')
             return True
         time.sleep(0.4)
     append_runtime_log(
         f"{prefix} SEND_NOT_CONFIRMED composer did not empty / no generation evidence within 8s "
         f"(last composer_len={_gemini_ui_snapshot(drv).get('composer_text_len')})"
     )
-    emit_live_event(f'job:{job_id}:send', f'{prefix} ❌SendVerify')
     return False
 
 def verify_generation_started(drv, timeout=6.0):
@@ -5192,20 +5194,39 @@ def render_dashboard_html() -> str:
 
 _LIVE_PRINT_LOCK = threading.Lock()
 _LAST_PRINTED_LINE: Dict[str, str] = {}
+_LIVE_DISPLAY_BORN: set = set()
+_IPY_DISPLAY_AVAILABLE = (ipy_display is not print)
 
 
 def emit_live_event(key: str, line: str):
-    """Print ONE complete line atomically, but only if it actually changed
-    since the last print for this key -- keeps the notebook append-only
-    (nothing is ever erased or reprinted unchanged) while still limiting
-    output to real state changes, not a full redraw every tick. All
-    printing goes through this single lock so concurrent Gemini/WMR
-    threads can never interleave partial fragments into one garbled line."""
+    """Update ONE persistent output slot per key IN PLACE -- one job keeps
+    exactly one line that refreshes as its state changes, never a fresh
+    line appended per change (that produced a scrolling wall of one line
+    per micro-step, which is not what "single updating line per job"
+    means). Uses IPython's own display_id update mechanism
+    (display(..., display_id=...) once, then update_display(...) after)
+    -- the actual supported way to refresh one output region in a
+    Jupyter/Colab notebook without clear_output(), which would erase
+    every OTHER job's line and all prior plain output too. Falls back to
+    plain print() outside a real IPython/Colab kernel, where there is no
+    output cell to refresh in place anyway. All updates go through one
+    lock so concurrent Gemini/WMR threads can't interleave a partial
+    line."""
     with _LIVE_PRINT_LOCK:
         if _LAST_PRINTED_LINE.get(key) == line:
             return
         _LAST_PRINTED_LINE[key] = line
-        print(f"[{time.strftime('%H:%M:%S')}] {line}", flush=True)
+        text = f"[{time.strftime('%H:%M:%S')}] {line}"
+        if not _IPY_DISPLAY_AVAILABLE:
+            print(text, flush=True)
+            return
+        safe_key = re.sub(r'[^a-zA-Z0-9_:.-]', '_', key)
+        html = HTML(f'<pre style="font-family:monospace;font-size:13px;margin:0;white-space:pre-wrap;">{text}</pre>')
+        if safe_key in _LIVE_DISPLAY_BORN:
+            update_display(html, display_id=safe_key)
+        else:
+            _LIVE_DISPLAY_BORN.add(safe_key)
+            ipy_display(html, display_id=safe_key)
 
 
 async def dashboard_loop():
