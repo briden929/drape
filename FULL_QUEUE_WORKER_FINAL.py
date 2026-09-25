@@ -3667,6 +3667,42 @@ def launch_worker():
     duplicate runtime via _RUNTIME_INITIALIZED."""
     return start_worker()
 
+def run_worker_blocking():
+    """Alternate, opt-in entrypoint for the SAME cell you pasted this file
+    into, matching the old worker script's behavior: this call blocks the
+    cell and prints STEP 11+ / the queue status directly, instead of
+    scheduling main() as a background task that needs a separate
+    `launch_worker(); await task` cell.
+
+    Safe to call from inside Colab's already-running event loop because it
+    uses nest_asyncio, which properly patches asyncio for re-entrant
+    asyncio.run() calls -- this is NOT the same as the IPython.run_cell()
+    reentrant-cell hack this file previously removed (that one crashed with
+    "Cannot run the event loop while another loop is running" because
+    IPython's own cell runner has no re-entrancy support; nest_asyncio is
+    a purpose-built library for exactly this).
+
+    Prefer launch_worker() unless you specifically want this file to block
+    the current cell forever like the old script did. Respects the same
+    V16_STATE duplicate-run guard as start_worker() -- it refuses to start
+    a second runtime if one is already active from a previous cell run."""
+    global _RUNTIME_INITIALIZED
+    if V16_STATE.RUNTIME_INITIALIZED and V16_STATE.WORKER_MAIN_TASK is not None and not V16_STATE.WORKER_MAIN_TASK.done():
+        print("[BOOT] WORKER ALREADY RUNNING", flush=True)
+        print("[BOOT] REUSING EXISTING RUNTIME -- run_worker_blocking() only starts a fresh run; Runtime > Restart session first if you want a clean one.", flush=True)
+        return
+    try:
+        import nest_asyncio
+        nest_asyncio.apply()
+    except ImportError:
+        print("[BOOT] nest_asyncio not installed -- run `pip install nest_asyncio` first, or use launch_worker() instead.", flush=True)
+        raise
+    _RUNTIME_INITIALIZED = True
+    V16_STATE.RUNTIME_INITIALIZED = True
+    print("[BOOT] Starting main() in BLOCKING mode via nest_asyncio -- this cell now runs continuously.", flush=True)
+    print("[BOOT] To stop: Runtime -> Interrupt execution.", flush=True)
+    asyncio.run(main())
+
 if __name__ == '__main__':
     print("=" * 80, flush=True)
     _self_path = globals().get('__file__')
@@ -3696,14 +3732,20 @@ if __name__ == '__main__':
         print(f"[BOOT] {_sym}() =", "PRESENT" if _sym in globals() else "MISSING", flush=True)
     print("=" * 80, flush=True)
 
-    # start_worker() handles both cases: it schedules main() on the current
-    # running loop (Colab/IPython kernel loop) via create_task, or falls back
-    # to asyncio.run() when no loop is running (plain `python
-    # FULL_QUEUE_WORKER_FINAL.py`). Never drive a second loop on top of an
-    # already-running one (e.g. via IPython.run_cell("... await ...")) --
-    # that is what raised "Cannot run the event loop while another loop is
-    # running". When a loop is already running, the returned Task keeps
-    # executing on that same loop after this cell finishes, but its prints
-    # will not appear until something actually awaits it -- see the
-    # [BOOT] message start_worker() prints above for the exact next step.
-    start_worker()
+    # Default: start_worker() schedules main() on the current running loop
+    # (Colab/IPython kernel loop) via create_task, or falls back to
+    # asyncio.run() when no loop is running (plain `python
+    # FULL_QUEUE_WORKER_FINAL.py`). When a loop is already running, the
+    # returned Task keeps executing on that same loop after this cell
+    # finishes, but its prints will not appear until something actually
+    # awaits it -- see the [BOOT] message start_worker() prints above for
+    # the exact next step (launch_worker() in a new cell).
+    #
+    # Opt-in: set V16_BLOCKING_MODE=1 to instead block THIS cell forever via
+    # run_worker_blocking() (nest_asyncio-based), matching the old worker
+    # script's single-cell behavior. Off by default so existing notebooks
+    # keep the current, already-verified behavior unless asked for.
+    if os.environ.get("V16_BLOCKING_MODE") == "1":
+        run_worker_blocking()
+    else:
+        start_worker()
