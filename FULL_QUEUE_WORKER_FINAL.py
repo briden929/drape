@@ -1069,7 +1069,9 @@ def display_page_info(details, step_name=''):
     print('\n' + '=' * 70)
     print(f'📋 PAGE INFORMATION - {step_name}')
     if details['verification_number']:
-        print(f"🔢 VERIFICATION NUMBER: {details['verification_number']} 🔢🔢")
+        print('=' * 70)
+        print(f"🔢🔢 VERIFICATION NUMBER: {details['verification_number']} 🔢🔢")
+        print(f"📱 Check your phone and tap '{details['verification_number']}', then tap 'Yes' to approve")
     print('=' * 70)
 
 def take_screenshot(driver, step_name):
@@ -1114,10 +1116,13 @@ def detect_push_notification_verification(driver):
     except:
         return False
 
-def wait_for_push_notification_approval(driver, max_wait_seconds=60):
+def wait_for_push_notification_approval(driver, max_wait_seconds=60, verification_number=None):
     checks = max_wait_seconds // 5
     for check in range(1, checks + 1):
-        print(f'\n🔍 Check {check}/{checks}')
+        if verification_number:
+            print(f"\n🔍 Check {check}/{checks} -- tap '{verification_number}' on your phone")
+        else:
+            print(f'\n🔍 Check {check}/{checks}')
         for remaining in range(5, 0, -1):
             print(f'\r Waiting for approval: {remaining}s ', end='', flush=True)
             time.sleep(1)
@@ -1133,7 +1138,11 @@ def handle_verification_code_with_retry(driver, wait, max_attempts=3):
             display_page_info(page_details, f'Verification Attempt {attempt}')
             if detect_push_notification_verification(driver):
                 take_screenshot(driver, f'push_notification_attempt_{attempt}')
-                if wait_for_push_notification_approval(driver, max_wait_seconds=60 if attempt == 1 else 30):
+                if wait_for_push_notification_approval(
+                    driver,
+                    max_wait_seconds=60 if attempt == 1 else 30,
+                    verification_number=page_details.get('verification_number'),
+                ):
                     return True
                 if comprehensive_login_check(driver):
                     return True
