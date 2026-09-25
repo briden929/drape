@@ -321,6 +321,28 @@ os.environ.setdefault('REDIS_KEY_PREFIX', 'vastralook:')
 QUEUE_NAME = 'generations'
 REDIS_KEY_PREFIX = os.environ.get('REDIS_KEY_PREFIX', 'vastralook:')
 REDIS_URL = os.environ.get('REDIS_URL')
+# BullMQ job concurrency is independent of Gemini (4 T-resources) / WMR (8
+# W-resources) concurrency -- those are enforced separately by GEMINI_BROKER
+# and WMR_BROKER's own acquire() backpressure. Defaulting BullMQ's own
+# concurrency to 1 (its library default) would serialize job admission and
+# starve the resource brokers of anything to actually parallelize.
+BULLMQ_CONCURRENCY = int(os.environ.get('BULLMQ_CONCURRENCY', '8'))
+
+def build_redis_connection_opts(redis_url: str) -> dict:
+    """Canonical redis-py connection kwargs for a REDIS_URL, used by every
+    BullMQ Worker/Queue instantiation in this file (queue monitor, startup
+    preflight, and the production Worker) so there is exactly one place that
+    decides how rediss:// is handled. redis-py's Redis() takes `ssl=True`
+    for TLS -- it has no `tls` kwarg, which is what previously raised
+    TypeError: Redis.__init__() got an unexpected keyword argument 'tls'."""
+    u = urllib.parse.urlparse(redis_url or "")
+    opts = {"host": u.hostname or "localhost", "port": u.port or 6379}
+    if u.password:
+        opts["password"] = u.password
+    if u.scheme == 'rediss':
+        opts["ssl"] = True
+    return opts
+
 MAX_CONCURRENT_TABS = 4
 CHROME_WMR_WORKERS = 4
 GENERATION_TIMEOUT_S = 240
@@ -2962,6 +2984,15 @@ def run_architecture_self_test():
     assert "T3" in GEMINI_BROKER.resource_ids
     for rid in ["W0-T0","W0-T1","W1-T0","W1-T1","W2-T0","W2-T1","W3-T0","W3-T1"]:
         assert rid in WMR_BROKER.resource_ids
+    # Preflight: every symbol the N2N pipeline depends on must exist before
+    # the BullMQ Worker is allowed to start admitting real jobs.
+    for _name in (
+        "process_bullmq_job", "execute_pipeline", "poll_downloads_loop",
+        "fetch_generation", "resolve_prompt_and_refs",
+        "GEMINI_BROKER", "WMR_BROKER", "DOWNLOAD_REGISTRY", "JOB_CONTEXTS",
+        "GEMINI_WORKERS",
+    ):
+        assert _name in globals(), f"PREFLIGHT_MISSING_SYMBOL: {_name}"
 
 BACKGROUND_TASKS = set()
 BULLMQ_WORKER = None
@@ -2991,11 +3022,7 @@ def initialize_runtime_once():
 async def redis_queue_monitor_loop():
     global QUEUE_MONITOR
     opts = {"connection": os.environ.get("REDIS_URL"), "prefix": os.environ.get("REDIS_KEY_PREFIX")}
-    from urllib.parse import urlparse
-    u = urlparse(opts["connection"] or "")
-    real_opts = {"host": u.hostname or "localhost", "port": u.port or 6379}
-    if u.password: real_opts["password"] = u.password
-    if u.scheme == 'rediss': real_opts["ssl"] = True
+    real_opts = build_redis_connection_opts(opts["connection"])
     QUEUE_NAME = os.environ.get("QUEUE_NAME", "generations")
 
     QUEUE_MONITOR = Queue(
@@ -3111,11 +3138,7 @@ async def main():
         
         print("STEP 11: REDIS HEALTH")
         opts = {"connection": os.environ.get("REDIS_URL"), "prefix": os.environ.get("REDIS_KEY_PREFIX")}
-        from urllib.parse import urlparse
-        u = urlparse(opts["connection"] or "")
-        real_opts = {"host": u.hostname or "localhost", "port": u.port or 6379}
-        if u.password: real_opts["password"] = u.password
-        if u.scheme == 'rediss': real_opts["ssl"] = True
+        real_opts = build_redis_connection_opts(opts["connection"])
         QUEUE_NAME = os.environ.get("QUEUE_NAME", "generations")
         
         # Redis pre-flight
@@ -3177,7 +3200,13 @@ async def main():
             BACKGROUND_TASKS.add(HEARTBEAT_TASK)
 
         print("STEP 19: BULLMQ WORKER")
-        BULLMQ_WORKER = Worker(QUEUE_NAME, process_bullmq_job, {"connection": real_opts, "prefix": opts["prefix"]})
+        # concurrency is BullMQ's own job-admission width, independent of the
+        # 4 Gemini / 8 WMR resource counts -- those are enforced separately
+        # by GEMINI_BROKER/WMR_BROKER.acquire() backpressure. Leaving this
+        # unset falls back to bullmq's library default of 1, which would
+        # serialize every job and starve the resource brokers.
+        BULLMQ_WORKER = Worker(QUEUE_NAME, process_bullmq_job, {"connection": real_opts, "prefix": opts["prefix"], "concurrency": BULLMQ_CONCURRENCY})
+        print(f"[BULLMQ] concurrency={BULLMQ_CONCURRENCY}")
         RUNTIME_HEALTH["bullmq"] = True
 
         print("STEP 20: WORKER READY")
