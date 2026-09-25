@@ -267,6 +267,7 @@ if _V16_STATE_KEY not in sys.modules:
     _v16_state.novnc_proc = None
     _v16_state.cf_proc = None
     _v16_state.tunnel_url = None
+    _v16_state.DASHBOARD_TASK = None
     sys.modules[_V16_STATE_KEY] = _v16_state
 V16_STATE = sys.modules[_V16_STATE_KEY]
 
@@ -297,10 +298,12 @@ from bullmq import Worker, Job, Queue
 import psycopg2
 from psycopg2 import pool as _pgpool
 try:
-    from IPython.display import display as ipy_display, HTML
+    from IPython.display import display as ipy_display, HTML, clear_output
 except ImportError:
     ipy_display = print
     HTML = str
+    def clear_output(wait=False):
+        pass
 try:
     from pyvirtualdisplay import Display
 except ImportError:
@@ -458,6 +461,54 @@ for _i in range(CHROME_WMR_WORKERS):
 _drive_cookies = Path('/content/drive/MyDrive/gemini-queue-worker/cookies.pkl')
 COOKIES_FILE = _drive_cookies if _drive_cookies.parent.parent.exists() else STATE_DIR / 'cookies.pkl'
 COOKIES_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+# ==============================================================================
+# LIVE DASHBOARD -- console stays quiet after STEP 10; full forensic detail
+# (job IDs, GUIDs, exceptions, timings) goes to worker.log instead. The
+# dashboard is DISPLAY STATE ONLY: it reads GEMINI_BROKER/WMR_BROKER/
+# JOB_CONTEXTS/RUNTIME_HEALTH/LAST_QUEUE_COUNTS, it never creates a second
+# state machine, broker, or JobState enum.
+# ==============================================================================
+
+LOG_FILE = BASE_DIR / 'logs' / 'worker.log'
+LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+def append_runtime_log(msg: str):
+    """Full-detail forensic log -- console stays compact, this file doesn't."""
+    try:
+        with open(LOG_FILE, 'a', encoding='utf-8') as f:
+            f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}\n")
+    except Exception:
+        pass
+
+DASHBOARD_STATE = {
+    'queue': {'waiting': 0, 'active': 0, 'delayed': 0, 'local_active': 0, 'completed': 0, 'failed': 0, 'raw_downloads': 0, 'clean_downloads': 0},
+    'gemini': {f'T{i}': {} for i in range(4)},
+    'wmr': {f'W{i}-T{j}': {} for i in range(4) for j in range(2)},
+    'system': {'redis': 'OK', 'db': 'OK', 'r2': 'OK', 'bullmq': 'OK', 'download': 'OK', 'gemini': 'OK', 'wmr': 'OK'},
+    'last_event': '--',
+    'last_event_ts': None,
+    'start_time': time.time(),
+}
+
+def short_job_id(job_id):
+    """gen-0b0b664c-6442-43a3-bff8-38e6ba7ef7b9-1790325724229 -> gen-0b0b.
+    Full ID stays in JOB_CONTEXTS / worker.log; only the dashboard is short."""
+    if not job_id:
+        return '--'
+    text = str(job_id)
+    if len(text) <= 12:
+        return text
+    core = text[4:] if text.startswith('gen-') else text
+    return f'gen-{core[:4]}'
+
+def set_last_event(msg: str):
+    """The dashboard keeps exactly ONE latest event -- every new transition
+    replaces the previous one instead of accumulating a scrolling log in
+    the notebook. Full history still goes to worker.log."""
+    DASHBOARD_STATE['last_event'] = msg
+    DASHBOARD_STATE['last_event_ts'] = time.time()
+    append_runtime_log(f'[EVENT] {msg}')
 
 def get_chrome_job_dir(tab_id: int, job_id: str):
     """Returns (job_dir, incoming_dir) for Chrome downloads."""
@@ -2785,7 +2836,7 @@ class FirstFreeBroker:
             rec.state = ResourceState.BUSY
             rec.current_job_id = job_id
             rec.last_used = time.time()
-            print(f"[{self.name} BROKER] Acquired {resource_id} for {job_id}")
+            append_runtime_log(f"[{self.name} BROKER] Acquired {resource_id} for {job_id}")
             return resource_id
 
     def release(self, resource_id: str):
@@ -2799,7 +2850,7 @@ class FirstFreeBroker:
             if not any((res_id == resource_id for _, res_id in self._free_heap)):
                 self._seq += 1
                 heapq.heappush(self._free_heap, (self._seq, resource_id))
-                print(f"[{self.name} BROKER] Released {resource_id}")
+                append_runtime_log(f"[{self.name} BROKER] Released {resource_id}")
                 self._condition.notify_all()
 
     def fail(self, resource_id: str, error: str = ""):
@@ -2816,7 +2867,7 @@ class FirstFreeBroker:
                 return
             rec.state = ResourceState.RECOVERING
             cooldown = min(RECOVERY_COOLDOWN_BASE_S * (2 ** (rec.failure_count - 1)), RECOVERY_COOLDOWN_MAX_S)
-            print(f"[{self.name} BROKER] {resource_id} FAILED (#{rec.failure_count}): {rec.last_error} -> RECOVERY_QUEUED for {cooldown:.0f}s")
+            append_runtime_log(f"[{self.name} BROKER] {resource_id} FAILED (#{rec.failure_count}): {rec.last_error} -> RECOVERY_QUEUED for {cooldown:.0f}s")
             timer = threading.Timer(cooldown, self._recover, args=(resource_id,))
             timer.daemon = True
             timer.start()
@@ -2827,7 +2878,7 @@ class FirstFreeBroker:
             try:
                 ok = bool(self._recovery_fn(resource_id))
             except Exception as e:
-                print(f"[{self.name} BROKER] {resource_id} recovery_fn raised: {e}")
+                append_runtime_log(f"[{self.name} BROKER] {resource_id} recovery_fn raised: {e}")
                 ok = False
         with self._condition:
             rec = self._records.get(resource_id)
@@ -2839,7 +2890,7 @@ class FirstFreeBroker:
                 if not any((res_id == resource_id for _, res_id in self._free_heap)):
                     self._seq += 1
                     heapq.heappush(self._free_heap, (self._seq, resource_id))
-                print(f"[{self.name} BROKER] {resource_id} RECOVERY_COMPLETE -> AVAILABLE")
+                append_runtime_log(f"[{self.name} BROKER] {resource_id} RECOVERY_COMPLETE -> AVAILABLE")
                 self._condition.notify_all()
             else:
                 rec.failure_count += 1
@@ -2848,7 +2899,7 @@ class FirstFreeBroker:
                     print(f"[{self.name} BROKER] {resource_id} PERMANENTLY DEAD after {rec.failure_count} failed recovery attempts")
                 else:
                     cooldown = min(RECOVERY_COOLDOWN_BASE_S * (2 ** (rec.failure_count - 1)), RECOVERY_COOLDOWN_MAX_S)
-                    print(f"[{self.name} BROKER] {resource_id} RECOVERY_FAILED -> retrying in {cooldown:.0f}s")
+                    append_runtime_log(f"[{self.name} BROKER] {resource_id} RECOVERY_FAILED -> retrying in {cooldown:.0f}s")
                     timer = threading.Timer(cooldown, self._recover, args=(resource_id,))
                     timer.daemon = True
                     timer.start()
@@ -3083,7 +3134,7 @@ class GeminiWorker:
 
     def do_execute_sync(self, ctx: JobContext):
         prefix = f"[GEMINI][{self.tid}][{ctx.job_id}]"
-        print(f"{prefix} START", flush=True)
+        append_runtime_log(f"{prefix} START")
         tid_int = int(self.tid.replace('T', ''))
         try:
             ctx.transition_sync(JobState.GEMINI_GENERATING)
@@ -3094,14 +3145,14 @@ class GeminiWorker:
             with CHROME_DRIVER_LOCK:
                 # T0-T3 are TABS of the single shared, already-authenticated chrome_driver
                 # (see _create_gemini_tab) -- never a second Chrome process on the same profile.
-                print(f"{prefix} OPENING GEMINI", flush=True)
+                append_runtime_log(f"{prefix} OPENING GEMINI")
                 if self.handle is None or self.handle not in chrome_driver.window_handles:
                     self.handle = _create_gemini_tab(tid_int)
                     log(f"{prefix} PHYSICAL_TAB_CREATED handle={self.handle}")
                 chrome_driver.switch_to.window(self.handle)
                 self.driver = chrome_driver
 
-                print(f"{prefix} NEW CHAT", flush=True)
+                append_runtime_log(f"{prefix} NEW CHAT")
                 tab_id_str = open_new_chat_and_reload(self.driver, tid_int, ctx.job_id)
                 if not tab_id_str:
                     raise RuntimeError("Failed to create/find target tab")
@@ -3109,26 +3160,26 @@ class GeminiWorker:
                 job_dir, staging_dir = get_chrome_job_dir(tid_int, ctx.job_id)
                 set_tab_download_dir(self.driver, str(staging_dir))
 
-                print(f"{prefix} CREATE IMAGE MODE", flush=True)
+                append_runtime_log(f"{prefix} CREATE IMAGE MODE")
                 ensure_create_image_mode(self.driver, tid_int, ctx.job_id)
 
-                print(f"{prefix} UPLOADING REFERENCES", flush=True)
+                append_runtime_log(f"{prefix} UPLOADING REFERENCES")
                 upload_result = upload_reference_files(self.driver, ctx.reference_paths, tid_int, ctx.job_id)
                 verify_attachment_count(self.driver, upload_result["expected"], tid=tid_int, job_id=ctx.job_id, upload_token=upload_result["token"])
-                print(f"{prefix} ATTACHMENTS VERIFIED", flush=True)
+                append_runtime_log(f"{prefix} ATTACHMENTS VERIFIED")
 
                 _inject_prompt_atomic(self.driver, ctx.prompt, tid_int, ctx.job_id)
-                print(f"{prefix} PROMPT INJECTED", flush=True)
+                append_runtime_log(f"{prefix} PROMPT INJECTED")
 
                 urls_before = snapshot_urls(self.driver)
                 if not _click_send_button(self.driver, tid_int, ctx.job_id):
                     raise RuntimeError("SEND_FAILED: Could not click send button")
-                print(f"{prefix} SEND CLICKED", flush=True)
+                append_runtime_log(f"{prefix} SEND CLICKED")
 
                 started = verify_generation_started(self.driver)
                 if not started:
                     raise RuntimeError("Generation did not start")
-                print(f"{prefix} GENERATION STARTED", flush=True)
+                append_runtime_log(f"{prefix} GENERATION STARTED")
                 chat_urls = snapshot_urls(self.driver)
 
             # Phase 2: wait for the REAL generated image. Previously this
@@ -3158,7 +3209,7 @@ class GeminiWorker:
                     break
                 time.sleep(0.5)
             if status == "SUCCESS":
-                print(f"{prefix} IMAGE DETECTED", flush=True)
+                append_runtime_log(f"{prefix} IMAGE DETECTED")
             elif status == "REFUSED":
                 raise RuntimeError("Gemini refused the prompt")
             elif status == "LIMIT":
@@ -3172,14 +3223,14 @@ class GeminiWorker:
             with CHROME_DRIVER_LOCK:
                 chrome_driver.switch_to.window(self.handle)
                 _hover_and_dl_single_click(self.driver, urls_before, chat_urls)
-                print(f"{prefix} DOWNLOAD CLICKED", flush=True)
+                append_runtime_log(f"{prefix} DOWNLOAD CLICKED")
 
                 expected_png = f"{ctx.job_id}.png"
 
                 ctx.transition_sync(JobState.RAW_DOWNLOAD_START)
                 dl_guid, source = _detect_download_start(self.driver, staging_dir, timeout=DOWNLOAD_START_WINDOW_S)
                 ctx.raw_guid = dl_guid
-                print(f"{prefix} DOWNLOAD START DETECTED", flush=True)
+                append_runtime_log(f"{prefix} DOWNLOAD START DETECTED")
                 _log_download_start_confirmed(prefix, dl_guid, source)
 
                 record_id = f"gemini:{ctx.job_id}:{time.monotonic_ns()}"
@@ -3202,8 +3253,8 @@ class GeminiWorker:
                 release_gemini_once(ctx)
                 ctx.transition_sync(JobState.GEMINI_RELEASED)
                 ctx.transition_sync(JobState.RAW_DOWNLOADING)
-                print(f"{prefix} GEMINI RESOURCE RELEASED", flush=True)
-                print(f"{prefix} RAW DOWNLOAD CONTINUES", flush=True)
+                append_runtime_log(f"{prefix} GEMINI RESOURCE RELEASED")
+                append_runtime_log(f"{prefix} RAW DOWNLOAD CONTINUES")
 
         except Exception as e:
             ctx.error = str(e)
@@ -3263,13 +3314,13 @@ class WmrDriverThread(threading.Thread):
             ctx = payload
             if cmd == "EXECUTE":
                 prefix = f"[WMR][{self.resource_id}][{ctx.job_id}]"
-                print(f"{prefix} START", flush=True)
+                append_runtime_log(f"{prefix} START")
                 try:
                     if self.driver is None:
                         self.driver = create_wmr_chrome_driver(self.resource_id)
                         self.driver.get("https://www.watermarkremover.io/upload")
-                    print(f"{prefix} DRIVER READY", flush=True)
-                    print(f"{prefix} OPENING WMR", flush=True)
+                    append_runtime_log(f"{prefix} DRIVER READY")
+                    append_runtime_log(f"{prefix} OPENING WMR")
 
                     ctx.transition_sync(JobState.WMR_PROCESSING)
 
@@ -3278,18 +3329,18 @@ class WmrDriverThread(threading.Thread):
 
                     set_tab_download_dir(self.driver, str(staging_dir))
 
-                    print(f"{prefix} UPLOADING RAW PNG", flush=True)
+                    append_runtime_log(f"{prefix} UPLOADING RAW PNG")
                     _wmr_expose_file_inputs(self.driver)
                     file_input = _wmr_find_file_input(self.driver)
                     file_input.send_keys(str(Path(ctx.raw_path).resolve()))
 
-                    print(f"{prefix} PROCESSING", flush=True)
+                    append_runtime_log(f"{prefix} PROCESSING")
                     try: _wmr_check_status(self.driver)
                     except Exception: pass
 
                     try: _wmr_click_download(self.driver)
                     except Exception: _wmr_click_download(self.driver, attempts=6)
-                    print(f"{prefix} DOWNLOAD CLICKED", flush=True)
+                    append_runtime_log(f"{prefix} DOWNLOAD CLICKED")
 
                     expected_png = f"{ctx.job_id}_clean.png"
                     ctx.transition_sync(JobState.WMR_DOWNLOAD_START)
@@ -3316,7 +3367,7 @@ class WmrDriverThread(threading.Thread):
                     
                     release_wmr_once(ctx)
                     ctx.transition_sync(JobState.WMR_RELEASED)
-                    print(f"{prefix} WMR RESOURCE RELEASED", flush=True)
+                    append_runtime_log(f"{prefix} WMR RESOURCE RELEASED")
 
                 except Exception as e:
                     ctx.error = str(e)
@@ -3363,17 +3414,20 @@ def _fmt_span(start, end):
     return f"{end - start:.1f}s"
 
 def _print_job_timing(ctx: JobContext):
+    """Full timing breakdown goes to worker.log only -- the dashboard/
+    console stay compact."""
     now = ctx.completed_at or time.time()
-    print("JOB TIMING", flush=True)
-    print("-----------", flush=True)
-    print(f"Queue wait:     {_fmt_span(ctx.received_at, ctx.gemini_start_at)}", flush=True)
-    print(f"Gemini:         {_fmt_span(ctx.gemini_start_at, ctx.raw_download_start_at)}", flush=True)
-    print(f"Raw download:   {_fmt_span(ctx.raw_download_start_at, ctx.raw_ready_at)}", flush=True)
-    print(f"WMR:            {_fmt_span(ctx.wmr_start_at, ctx.clean_download_start_at)}", flush=True)
-    print(f"Clean download: {_fmt_span(ctx.clean_download_start_at, ctx.clean_ready_at)}", flush=True)
-    print(f"WebP:           {_fmt_span(ctx.clean_ready_at, ctx.webp_at)}", flush=True)
-    print(f"R2/DB:          {_fmt_span(ctx.webp_at, ctx.r2_at)}", flush=True)
-    print(f"Total:          {_fmt_span(ctx.received_at, now)}", flush=True)
+    append_runtime_log(
+        f"[{ctx.job_id}] JOB TIMING "
+        f"queue_wait={_fmt_span(ctx.received_at, ctx.gemini_start_at)} "
+        f"gemini={_fmt_span(ctx.gemini_start_at, ctx.raw_download_start_at)} "
+        f"raw_download={_fmt_span(ctx.raw_download_start_at, ctx.raw_ready_at)} "
+        f"wmr={_fmt_span(ctx.wmr_start_at, ctx.clean_download_start_at)} "
+        f"clean_download={_fmt_span(ctx.clean_download_start_at, ctx.clean_ready_at)} "
+        f"webp={_fmt_span(ctx.clean_ready_at, ctx.webp_at)} "
+        f"r2_db={_fmt_span(ctx.webp_at, ctx.r2_at)} "
+        f"total={_fmt_span(ctx.received_at, now)}"
+    )
 
 async def execute_pipeline(ctx: JobContext):
     try:
@@ -3404,29 +3458,29 @@ async def execute_pipeline(ctx: JobContext):
         print(f"Hologram:        {Path(holo_path).name if holo_path else None}", flush=True)
         print(f"Reference count: {len(ctx.reference_paths)}", flush=True)
 
-        print(f"[PIPELINE][{ctx.job_id}] GEMINI QUEUED", flush=True)
-        print(f"[PIPELINE][{ctx.job_id}] Acquiring Gemini resource", flush=True)
+        append_runtime_log(f"[PIPELINE][{ctx.job_id}] GEMINI QUEUED")
+        append_runtime_log(f"[PIPELINE][{ctx.job_id}] Acquiring Gemini resource")
         tid = await GEMINI_BROKER.acquire(ctx.job_id)
         ctx.gemini_resource = tid
         ctx.transition_sync(JobState.GEMINI_RESERVED)
-        print(f"[PIPELINE][{ctx.job_id}] Gemini acquired = {tid}", flush=True)
+        append_runtime_log(f"[PIPELINE][{ctx.job_id}] Gemini acquired = {tid}")
 
         worker = GEMINI_WORKERS[tid]
-        print(f"[PIPELINE][{ctx.job_id}] Gemini execution started", flush=True)
+        append_runtime_log(f"[PIPELINE][{ctx.job_id}] Gemini execution started")
         await ctx.loop.run_in_executor(GEMINI_EXECUTOR, worker.do_execute_sync, ctx)
         await ctx.wait_for_state(JobState.RAW_VALIDATED)
 
         ctx.transition_sync(JobState.WMR_QUEUED)
-        print(f"[PIPELINE][{ctx.job_id}] WMR QUEUED", flush=True)
-        print(f"[PIPELINE][{ctx.job_id}] Acquiring WMR resource", flush=True)
+        append_runtime_log(f"[PIPELINE][{ctx.job_id}] WMR QUEUED")
+        append_runtime_log(f"[PIPELINE][{ctx.job_id}] Acquiring WMR resource")
         w_tid = await WMR_BROKER.acquire(ctx.job_id)
         ctx.wmr_resource = w_tid
         ctx.transition_sync(JobState.WMR_RESERVED)
-        print(f"[PIPELINE][{ctx.job_id}] WMR resource acquired = {w_tid}", flush=True)
+        append_runtime_log(f"[PIPELINE][{ctx.job_id}] WMR resource acquired = {w_tid}")
 
         WMR_THREADS[w_tid].command_queue.put(("EXECUTE", ctx))
         await ctx.wait_for_state(JobState.CLEAN_READY)
-        print(f"[PIPELINE][{ctx.job_id}] CLEAN_READY", flush=True)
+        append_runtime_log(f"[PIPELINE][{ctx.job_id}] CLEAN_READY")
 
         webp_path = Path(ctx.clean_png_path).with_suffix('.webp')
         result = subprocess.run(['cwebp', '-q', '80', ctx.clean_png_path, '-o', str(webp_path)], capture_output=True)
@@ -3442,7 +3496,7 @@ async def execute_pipeline(ctx: JobContext):
             raise RuntimeError("WebP validation failed (format/dimensions/size check)")
         ctx.webp_path = str(webp_path)
         ctx.transition_sync(JobState.WEBP_READY)
-        print(f"[PIPELINE][{ctx.job_id}] WEBP_READY", flush=True)
+        append_runtime_log(f"[PIPELINE][{ctx.job_id}] WEBP_READY")
 
         fs = sys.modules["fashion_studio"]
         push_result = fs.push_generation(
@@ -3455,16 +3509,16 @@ async def execute_pipeline(ctx: JobContext):
         )
         ctx.output_url = (push_result or {}).get("output_url")
         ctx.transition_sync(JobState.R2_READY)
-        print(f"[PIPELINE][{ctx.job_id}] R2_READY (PNG + WebP uploaded)", flush=True)
+        append_runtime_log(f"[PIPELINE][{ctx.job_id}] R2_READY (PNG + WebP uploaded)")
         ctx.transition_sync(JobState.DB_FINALIZING)
         ctx.transition_sync(JobState.DB_READY)
-        print(f"[PIPELINE][{ctx.job_id}] DB_READY", flush=True)
+        append_runtime_log(f"[PIPELINE][{ctx.job_id}] DB_READY")
 
         try:
             crd = sys.modules["credits"]
             crd.settle_look(ctx.job_id)
             ctx.transition_sync(JobState.CREDITS_SETTLED)
-            print(f"[PIPELINE][{ctx.job_id}] CREDITS_SETTLED", flush=True)
+            append_runtime_log(f"[PIPELINE][{ctx.job_id}] CREDITS_SETTLED")
         except Exception as e:
             # R2 upload + DB finalization already succeeded above -- the image was
             # delivered to the user. Do not fail/refund a completed job over a
@@ -3472,17 +3526,12 @@ async def execute_pipeline(ctx: JobContext):
             log(f"[{ctx.job_id}] CREDITS_SETTLE_FAILED (job still marked COMPLETED): {e}")
 
         ctx.transition_sync(JobState.COMPLETED)
-        print("=" * 60, flush=True)
-        print("[BULLMQ] JOB COMPLETED SUCCESSFULLY", flush=True)
-        print("=" * 60, flush=True)
-        print(f"Job ID:          {ctx.job_id}", flush=True)
-        print(f"Generation ID:   {ctx.job_id}", flush=True)
-        print(f"Gemini resource: {ctx.gemini_resource}", flush=True)
-        print(f"WMR resource:    {ctx.wmr_resource}", flush=True)
-        print(f"Raw PNG:         {ctx.raw_path}", flush=True)
-        print(f"Clean PNG:       {ctx.clean_png_path}", flush=True)
-        print(f"WebP:            {ctx.webp_path}", flush=True)
-        print(f"R2 URL:          {ctx.output_url}", flush=True)
+        DASHBOARD_STATE["queue"]["completed"] = DASHBOARD_STATE["queue"].get("completed", 0) + 1
+        set_last_event(f"{short_job_id(ctx.job_id)} COMPLETED")
+        append_runtime_log(
+            f"[COMPLETED] job_id={ctx.job_id} gemini={ctx.gemini_resource} wmr={ctx.wmr_resource} "
+            f"raw={ctx.raw_path} clean={ctx.clean_png_path} webp={ctx.webp_path} r2_url={ctx.output_url}"
+        )
         _print_job_timing(ctx)
 
     except Exception as e:
@@ -3490,21 +3539,13 @@ async def execute_pipeline(ctx: JobContext):
         if ctx.state != JobState.FAILED:
             ctx.transition_sync(JobState.FAILED)
 
-        print("=" * 60, flush=True)
-        print("[BULLMQ] JOB FAILED", flush=True)
-        print("=" * 60, flush=True)
-        print(f"Job ID:          {ctx.job_id}", flush=True)
-        print(f"Generation ID:   {ctx.job_id}", flush=True)
-        print(f"Current state:   {ctx.state.name}", flush=True)
-        print(f"Error type:      {type(e).__name__}", flush=True)
-        print(f"Error message:   {e}", flush=True)
         import traceback as _tb
-        _tb.print_exc()
-        print(f"Gemini resource: {ctx.gemini_resource}", flush=True)
-        print(f"WMR resource:    {ctx.wmr_resource}", flush=True)
-        print(f"Download GUID:   raw={ctx.raw_guid} wmr={ctx.wmr_guid}", flush=True)
-
-        print("[BULLMQ] FAILURE CLEANUP START", flush=True)
+        set_last_event(f"ERROR [{ctx.gemini_resource or ctx.wmr_resource or '?'}] {short_job_id(ctx.job_id)} {type(e).__name__}: {str(e)[:80]}")
+        append_runtime_log(
+            f"[FAILED] job_id={ctx.job_id} state={ctx.state.name} error_type={type(e).__name__} "
+            f"error={e} gemini={ctx.gemini_resource} wmr={ctx.wmr_resource} "
+            f"raw_guid={ctx.raw_guid} wmr_guid={ctx.wmr_guid}\n{_tb.format_exc()}"
+        )
         # Only mark the DB row failed + refund credits on BullMQ's FINAL
         # attempt for this job. Doing this unconditionally on every attempt
         # (the previous behavior) marked the generation 'failed' and
@@ -3521,12 +3562,11 @@ async def execute_pipeline(ctx: JobContext):
             try:
                 sys.modules["credits"].refund_look(ctx.job_id, str(e)[:500])
             except Exception as refund_err:
-                log(f"[{ctx.job_id}] REFUND_FAILED (final attempt): {refund_err}")
+                append_runtime_log(f"[{ctx.job_id}] REFUND_FAILED (final attempt): {refund_err}")
         else:
-            log(f"[{ctx.job_id}] TRANSIENT_FAILURE_WILL_RETRY attempt={ctx.attempts_made + 1}/{ctx.max_attempts} -- DB/credits left untouched, BullMQ will retry")
+            append_runtime_log(f"[{ctx.job_id}] TRANSIENT_FAILURE_WILL_RETRY attempt={ctx.attempts_made + 1}/{ctx.max_attempts} -- DB/credits left untouched, BullMQ will retry")
         release_gemini_once(ctx)
         release_wmr_once(ctx)
-        print("[BULLMQ] FAILURE CLEANUP COMPLETE", flush=True)
 
 # ------------------------------------------------------------------------------
 # DOWNLOAD WATCHER
@@ -3618,34 +3658,35 @@ async def poll_downloads_loop():
 # BULLMQ INTEGRATION
 # ------------------------------------------------------------------------------
 
+_LOGGED_RECEIPTS = set()  # (job.id, attempt) already logged -- never duplicate a receipt line
+
 async def process_bullmq_job(job, job_token):
-    # This is the ONLY place allowed to print REAL JOB RECEIVED -- it fires
+    # This is the ONLY place allowed to log REAL JOB RECEIVED -- it fires
     # exactly once per real invocation from the BullMQ Worker itself, never
-    # inferred from queue counts or the queue monitor.
+    # inferred from queue counts or the queue monitor. Full detail (worker
+    # ID, job data keys, DB status, user ID, ...) goes to worker.log only;
+    # the dashboard is the console's live view now, not a growing wall of
+    # per-job header blocks.
     generation_id = job.data.get("generationId") or job.data.get("id") or job.id
-    print("=" * 60, flush=True)
-    print("[BULLMQ] REAL JOB RECEIVED", flush=True)
-    print("=" * 60, flush=True)
-    print(f"Worker ID:       {WORKER_ID}", flush=True)
-    print(f"Job ID:          {job.id}", flush=True)
-    print(f"Generation ID:   {generation_id}", flush=True)
-    print(f"Attempt:         {job.attemptsMade + 1}", flush=True)
-    print(f"Queue:           {QUEUE_NAME}", flush=True)
-    print(f"Job data keys:   {sorted(job.data.keys()) if isinstance(job.data, dict) else 'n/a'}", flush=True)
-    print("=" * 60, flush=True)
+    attempt = job.attemptsMade + 1
+    receipt_key = (job.id, attempt)
+    if receipt_key not in _LOGGED_RECEIPTS:
+        _LOGGED_RECEIPTS.add(receipt_key)
+        set_last_event(f"{short_job_id(generation_id)} RECEIVED attempt={attempt}")
+        append_runtime_log(
+            f"[BULLMQ RECEIVED] worker={WORKER_ID} job_id={job.id} generation_id={generation_id} "
+            f"attempt={attempt} queue={QUEUE_NAME} "
+            f"data_keys={sorted(job.data.keys()) if isinstance(job.data, dict) else 'n/a'}"
+        )
 
     existing = JOB_CONTEXTS.get(generation_id)
     if existing is not None and existing.state not in (JobState.COMPLETED, JobState.FAILED):
-        log(f"[{generation_id}] DUPLICATE_JOB_REJECTED: already in-flight (state={existing.state.name})")
+        append_runtime_log(f"[{generation_id}] DUPLICATE_JOB_REJECTED: already in-flight (state={existing.state.name})")
         raise RuntimeError(f"Duplicate job for generation {generation_id} already in-flight (state={existing.state.name})")
 
-    print("[BULLMQ] FETCHING GENERATION", flush=True)
     gen = fetch_generation(generation_id)
     if not gen: raise RuntimeError(f"Generation {generation_id} not found in DB.")
-    print("[BULLMQ] GENERATION FOUND", flush=True)
-    print(f"Generation ID:   {generation_id}", flush=True)
-    print(f"DB status:       {gen.get('status')}", flush=True)
-    print(f"User ID:         {gen.get('user_id')}", flush=True)
+    append_runtime_log(f"[{generation_id}] GENERATION FOUND db_status={gen.get('status')} user_id={gen.get('user_id')}")
 
     ctx = JobContext(job_id=generation_id, payload=gen, loop=asyncio.get_running_loop())
     ctx.attempts_made = job.attemptsMade
@@ -3736,6 +3777,7 @@ async def redis_queue_monitor_loop():
         try:
             counts = await QUEUE_MONITOR.getJobCounts()
             RUNTIME_HEALTH["redis"] = True
+            DASHBOARD_STATE["system"]["redis"] = "OK"
 
             waiting = counts.get("waiting", 0)
             active = counts.get("active", 0)
@@ -3745,6 +3787,9 @@ async def redis_queue_monitor_loop():
             # Change detection against the previous poll -- this is a display
             # convenience only, NEVER proof a worker actually picked up a job
             # (that's exclusively process_bullmq_job's "REAL JOB RECEIVED").
+            # Feeds the live dashboard's top summary + last-event line instead
+            # of printing a console line every 5s -- the dashboard is now the
+            # authoritative live view; full history still goes to worker.log.
             changed = [
                 f"{_key}={counts.get(_key, 0)}"
                 for _key in ("waiting", "active", "delayed", "failed", "completed")
@@ -3753,19 +3798,21 @@ async def redis_queue_monitor_loop():
             LAST_QUEUE_COUNTS.update(counts)
             LAST_QUEUE_COUNTS["_queue_name"] = QUEUE_NAME
 
-            if changed:
-                # One line per change, no matter how many jobs are queued --
-                # this replaces the old always-on 7-line status block that
-                # printed unconditionally every 5s even with nothing to say.
-                print(f"[QUEUE] {QUEUE_NAME}: {' '.join(changed)}", flush=True)
+            DASHBOARD_STATE["queue"]["waiting"] = waiting
+            DASHBOARD_STATE["queue"]["active"] = active
+            DASHBOARD_STATE["queue"]["delayed"] = delayed
+            DASHBOARD_STATE["queue"]["completed"] = counts.get("completed", 0)
+            DASHBOARD_STATE["queue"]["failed"] = counts.get("failed", 0)
 
-            if is_idle and _was_idle is not True:
-                print("[QUEUE] NO PENDING JOBS -- WORKER LISTENING", flush=True)
+            if changed:
+                set_last_event(f"QUEUE {QUEUE_NAME}: {' '.join(changed)}")
+
             _was_idle = is_idle
 
         except Exception as e:
             RUNTIME_HEALTH["redis"] = False
-            print(f"[REDIS MONITOR ERROR] {type(e).__name__}: {e}")
+            DASHBOARD_STATE["system"]["redis"] = "ERROR"
+            append_runtime_log(f"[REDIS MONITOR ERROR] {type(e).__name__}: {e}")
 
         await asyncio.sleep(5)
 
@@ -3779,19 +3826,17 @@ def _resource_label(state_value: str) -> str:
     return "DEAD"  # RECOVERING or DEAD both surface as DEAD in the FREE/BUSY/DEAD heartbeat view
 
 async def worker_heartbeat_loop():
+    """Feeds DASHBOARD_STATE only -- the live dashboard (dashboard_loop) is
+    now the visual surface for this data. No console printing here at all;
+    the old ~25-line snapshot block (printed every 10-60s regardless of
+    activity) was a large share of the notebook-output flooding this
+    dashboard exists to replace. Full detail still goes to worker.log."""
     RUNTIME_HEALTH["heartbeat"] = True
     start_time = time.time()
-    tick = 0
-    last_summary_key = None
+    DASHBOARD_STATE["start_time"] = start_time
 
     while True:
-        tick += 1
         try:
-            uptime = time.time() - start_time
-            hours, rem = divmod(uptime, 3600)
-            minutes, seconds = divmod(rem, 60)
-            uptime_str = f"{int(hours):02}:{int(minutes):02}:{int(seconds):02}"
-
             now = time.time()
             stale = [jid for jid, j in JOB_CONTEXTS.items()
                      if j.state in (JobState.COMPLETED, JobState.FAILED)
@@ -3799,95 +3844,136 @@ async def worker_heartbeat_loop():
             for jid in stale:
                 JOB_CONTEXTS.pop(jid, None)
 
-            gemini_states = GEMINI_BROKER.snapshot_full()
-            wmr_states = WMR_BROKER.snapshot_full()
             raw_downloads = sum(1 for r in DOWNLOAD_REGISTRY.values() if r.resource_type == "gemini")
             clean_downloads = sum(1 for r in DOWNLOAD_REGISTRY.values() if r.resource_type == "wmr")
             active_jobs = sum(1 for j in JOB_CONTEXTS.values() if j.state not in (JobState.COMPLETED, JobState.FAILED))
 
-            # Compact single-line status, always printed -- this is what
-            # you see on every idle tick. The full multi-line block below
-            # only prints when something is actually happening (active
-            # jobs, or a resource state changed) or every 6th tick (~60s)
-            # as a periodic full snapshot, instead of the old behavior of
-            # printing the whole ~25-line block unconditionally every 10s.
-            gemini_busy = sum(1 for r in gemini_states.values() if r.get("state") == ResourceState.BUSY.value)
-            wmr_busy = sum(1 for r in wmr_states.values() if r.get("state") == ResourceState.BUSY.value)
-            summary_key = (
-                LAST_QUEUE_COUNTS.get("waiting"), LAST_QUEUE_COUNTS.get("active"),
-                gemini_busy, wmr_busy, active_jobs,
+            DASHBOARD_STATE["queue"]["local_active"] = active_jobs
+            DASHBOARD_STATE["queue"]["raw_downloads"] = raw_downloads
+            DASHBOARD_STATE["queue"]["clean_downloads"] = clean_downloads
+            DASHBOARD_STATE["system"]["bullmq"] = "OK" if RUNTIME_HEALTH["bullmq"] else "ERROR"
+            DASHBOARD_STATE["system"]["download"] = "OK" if RUNTIME_HEALTH["download_monitor"] else "ERROR"
+
+            gemini_states = GEMINI_BROKER.snapshot_full()
+            wmr_states = WMR_BROKER.snapshot_full()
+            DASHBOARD_STATE["system"]["gemini"] = "OK" if any(r["state"] != ResourceState.DEAD.value for r in gemini_states.values()) else "ERROR"
+            DASHBOARD_STATE["system"]["wmr"] = "OK" if any(r["state"] != ResourceState.DEAD.value for r in wmr_states.values()) else "ERROR"
+
+            append_runtime_log(
+                f"[HEARTBEAT] uptime={now - start_time:.0f}s waiting={LAST_QUEUE_COUNTS.get('waiting','n/a')} "
+                f"active={LAST_QUEUE_COUNTS.get('active','n/a')} local_active={active_jobs} "
+                f"raw_dl={raw_downloads} clean_dl={clean_downloads}"
             )
-            print(
-                f"[HEARTBEAT] {uptime_str} | Q waiting={LAST_QUEUE_COUNTS.get('waiting', 'n/a')} "
-                f"active={LAST_QUEUE_COUNTS.get('active', 'n/a')} | Gemini {gemini_busy}/4 BUSY | "
-                f"WMR {wmr_busy}/8 BUSY | jobs={active_jobs}",
-                flush=True,
-            )
-
-            full_snapshot_due = (tick % 6 == 0) or (summary_key != last_summary_key) or active_jobs > 0
-            last_summary_key = summary_key
-            if not full_snapshot_due:
-                await asyncio.sleep(10)
-                continue
-
-            def _print_resource_line(rid, rec):
-                label = _resource_label(rec.get("state", "DEAD")) if rec else "DEAD"
-                print(f"{rid} = {label}")
-                if label == "BUSY" and rec.get("job_id"):
-                    age_s = now - rec["last_used"] if rec.get("last_used") else 0
-                    print(f"     JOB = {rec['job_id']}")
-                    print(f"     AGE = {age_s:.0f}s")
-
-            print("\n" + "=" * 60)
-            print("V16 WORKER HEARTBEAT")
-            print("=" * 60)
-            print(f"Worker ID: {WORKER_ID}  Uptime: {uptime_str}")
-
-            print("\nRedis:")
-            print("CONNECTED" if RUNTIME_HEALTH["redis"] else "DISCONNECTED")
-
-            print("\nBullMQ:")
-            print("RUNNING" if RUNTIME_HEALTH["bullmq"] else "FAILED")
-
-            print("\nQueue (BullMQ, whole queue -- may include other workers/retries):")
-            print(f"{LAST_QUEUE_COUNTS.get('_queue_name', QUEUE_NAME)}")
-            print(f"Waiting:   {LAST_QUEUE_COUNTS.get('waiting', 'n/a')}")
-            print(f"Active:    {LAST_QUEUE_COUNTS.get('active', 'n/a')}")
-            print(f"Delayed:   {LAST_QUEUE_COUNTS.get('delayed', 'n/a')}")
-            print(f"Failed:    {LAST_QUEUE_COUNTS.get('failed', 'n/a')}")
-            print(f"Completed: {LAST_QUEUE_COUNTS.get('completed', 'n/a')}")
-
-            print("\nGemini:")
-            for rid in ["T0", "T1", "T2", "T3"]:
-                _print_resource_line(rid, gemini_states.get(rid))
-
-            print("\nWMR:")
-            for rid in ["W0-T0", "W0-T1", "W1-T0", "W1-T1", "W2-T0", "W2-T1", "W3-T0", "W3-T1"]:
-                _print_resource_line(rid, wmr_states.get(rid))
-
-            print("\nDownloads:")
-            print(f"RAW = {raw_downloads}")
-            print(f"CLEAN = {clean_downloads}")
-            print("Download monitor:")
-            print("RUNNING" if RUNTIME_HEALTH["download_monitor"] else "STOPPED")
-
-            print("\nGemini broker:")
-            print("HEALTHY" if any(r["state"] != ResourceState.DEAD.value for r in gemini_states.values()) else "DEGRADED")
-
-            print("\nWMR broker:")
-            print("HEALTHY" if any(r["state"] != ResourceState.DEAD.value for r in wmr_states.values()) else "DEGRADED")
-
-            print("\nJobs (this worker process only, distinct from the queue-wide Active count above):")
-            print(f"LOCAL_ACTIVE = {active_jobs}")
-
-            print("\nWorker:")
-            print("ALIVE")
-            print("=" * 60)
 
         except Exception as e:
-            print(f"[HEARTBEAT ERROR] {type(e).__name__}: {e}")
+            append_runtime_log(f"[HEARTBEAT ERROR] {type(e).__name__}: {e}")
 
         await asyncio.sleep(10)
+
+# ------------------------------------------------------------------------------
+# DASHBOARD RESOURCE ADAPTERS -- read existing GEMINI_BROKER/WMR_BROKER/
+# JOB_CONTEXTS state and normalize it for display. No second state machine,
+# no second broker, no duplicate JobState.
+# ------------------------------------------------------------------------------
+
+_GEMINI_DASHBOARD_LABELS = {
+    JobState.GEMINI_RESERVED: ("ACQUIRED", "NEW_CHAT"),
+    JobState.GEMINI_GENERATING: ("GENERATING", "IMAGE_WAIT"),
+    JobState.RAW_DOWNLOAD_START: ("DOWNLOAD", "RELEASE"),
+    JobState.FAILED: ("ERROR", "--"),
+}
+_WMR_DASHBOARD_LABELS = {
+    JobState.WMR_RESERVED: ("ACQUIRE", "START"),
+    JobState.WMR_PROCESSING: ("PROCESSING", "CLEAN_WAIT"),
+    JobState.WMR_DOWNLOAD_START: ("DOWNLOAD", "RELEASE"),
+    JobState.FAILED: ("ERROR", "--"),
+}
+
+def _resource_dashboard_row(rec, label_map):
+    if not rec or rec.get("state") != ResourceState.BUSY.value or not rec.get("job_id"):
+        return {"job_id": None, "state": "FREE", "age": None, "next": "--"}
+    job_id = rec["job_id"]
+    age = time.time() - rec["last_used"] if rec.get("last_used") else 0
+    ctx = JOB_CONTEXTS.get(job_id)
+    label, nxt = label_map.get(ctx.state, ("BUSY", "--")) if ctx else ("BUSY", "--")
+    return {"job_id": job_id, "state": label, "age": age, "next": nxt}
+
+def get_gemini_dashboard_state():
+    snap = GEMINI_BROKER.snapshot_full()
+    return {rid: _resource_dashboard_row(snap.get(rid), _GEMINI_DASHBOARD_LABELS) for rid in ["T0", "T1", "T2", "T3"]}
+
+def get_wmr_dashboard_state():
+    snap = WMR_BROKER.snapshot_full()
+    rids = [f"W{i}-T{j}" for i in range(4) for j in range(2)]
+    return {rid: _resource_dashboard_row(snap.get(rid), _WMR_DASHBOARD_LABELS) for rid in rids}
+
+def _fmt_age(seconds):
+    if seconds is None:
+        return "--"
+    seconds = max(0, int(seconds))
+    return f"{seconds // 60:02d}:{seconds % 60:02d}"
+
+def _dashboard_table_row(resource, row):
+    jid = short_job_id(row["job_id"]) if row["job_id"] else "FREE"
+    return f'{resource:<7}| {jid:<26}| {row["state"]:<15}| {_fmt_age(row["age"]):<9}| {row["next"]}'
+
+def render_dashboard_html() -> str:
+    q = DASHBOARD_STATE["queue"]
+    sys_state = DASHBOARD_STATE["system"]
+    uptime_s = int(time.time() - DASHBOARD_STATE["start_time"])
+    uptime_str = f"{uptime_s // 3600:02d}:{(uptime_s % 3600) // 60:02d}:{uptime_s % 60:02d}"
+
+    gemini_rows = get_gemini_dashboard_state()
+    wmr_rows = get_wmr_dashboard_state()
+
+    lines = []
+    W = 86
+    lines.append("=" * W)
+    lines.append("ECOM N2N QUEUE WORKER".center(W))
+    lines.append(
+        f"Queue: {QUEUE_NAME}   WAIT {q['waiting']}   ACTIVE {q['active']}   DELAY {q['delayed']}   "
+        f"LOCAL {q['local_active']}   UPTIME {uptime_str}"
+    )
+    lines.append(
+        f"Completed {q['completed']}   Failed {q['failed']}   RAW-DL {q['raw_downloads']}   "
+        f"WMR-DL {q['clean_downloads']}"
+    )
+    lines.append("-" * W)
+    lines.append("GEMINI / RAW GENERATION")
+    lines.append(f'{"RES":<7}| {"JOB":<26}| {"STATE":<15}| {"AGE":<9}| NEXT')
+    for rid in ["T0", "T1", "T2", "T3"]:
+        lines.append(_dashboard_table_row(rid, gemini_rows[rid]))
+    lines.append("-" * W)
+    lines.append("WMR / CLEAN")
+    lines.append(f'{"RES":<7}| {"JOB":<26}| {"STATE":<15}| {"AGE":<9}| NEXT')
+    for rid in ["W0-T0", "W0-T1", "W1-T0", "W1-T1", "W2-T0", "W2-T1", "W3-T0", "W3-T1"]:
+        lines.append(_dashboard_table_row(rid, wmr_rows[rid]))
+    lines.append("-" * W)
+    lines.append(
+        f"SYSTEM  Redis {sys_state['redis']}  DB {sys_state['db']}  R2 {sys_state['r2']}  "
+        f"BullMQ {sys_state['bullmq']}  Download {sys_state['download']}  Gemini {sys_state['gemini']}  WMR {sys_state['wmr']}"
+    )
+    last_ts = time.strftime("%H:%M:%S", time.localtime(DASHBOARD_STATE["last_event_ts"])) if DASHBOARD_STATE["last_event_ts"] else "--:--:--"
+    lines.append(f"LAST EVENT: [{last_ts}] {DASHBOARD_STATE['last_event']}")
+    lines.append("=" * W)
+
+    body = "\n".join(lines)
+    return f'<pre style="font-family:monospace;font-size:13px;line-height:1.35;white-space:pre;">{body}</pre>'
+
+async def dashboard_loop():
+    """The ONE live dashboard task. Refreshes an in-place output region
+    roughly once per second via clear_output(wait=True) + display(HTML(...))
+    -- never print(), which would accumulate a new copy of the table on
+    every tick. Stored on V16_STATE.DASHBOARD_TASK so a Colab cell re-run
+    reuses the existing task instead of starting a second one."""
+    while True:
+        try:
+            html = render_dashboard_html()
+            clear_output(wait=True)
+            ipy_display(HTML(html))
+        except Exception as e:
+            append_runtime_log(f"DASHBOARD_ERROR: {type(e).__name__}: {e}")
+        await asyncio.sleep(1)
 
 REDIS_STARTUP_TIMEOUT_S = float(os.environ.get("REDIS_STARTUP_TIMEOUT_S", "15"))
 
@@ -3935,6 +4021,7 @@ async def main():
         print("[DB] SELECT 1 completed", flush=True)
         print("[DB] CONNECTION = OK", flush=True)
         RUNTIME_HEALTH["db"] = True
+        DASHBOARD_STATE["system"]["db"] = "OK"
 
         print("STEP 13: R2 HEALTH", flush=True)
         print("[R2] health check starting", flush=True)
@@ -3943,13 +4030,16 @@ async def main():
                 _r2_client().head_bucket(Bucket=R2_BUCKET_NAME)
                 print("[R2] HEALTH = OK", flush=True)
                 RUNTIME_HEALTH["r2"] = True
+                DASHBOARD_STATE["system"]["r2"] = "OK"
             except Exception as e:
                 print(f"[R2] HEALTH = FAILED: {type(e).__name__}", flush=True)
                 RUNTIME_HEALTH["r2"] = False
+                DASHBOARD_STATE["system"]["r2"] = "ERROR"
                 raise
         else:
             print("[R2] HEALTH = FAILED: R2 not configured", flush=True)
             RUNTIME_HEALTH["r2"] = False
+            DASHBOARD_STATE["system"]["r2"] = "ERROR"
             raise RuntimeError("R2 required but not configured")
 
         print("STEP 14: GEMINI BROKER", flush=True)
@@ -3994,6 +4084,14 @@ async def main():
         V16_STATE.BULLMQ_WORKER = BULLMQ_WORKER
         print(f"[BULLMQ] Worker CREATED (concurrency={BULLMQ_CONCURRENCY})", flush=True)
         RUNTIME_HEALTH["bullmq"] = True
+
+        print("[DASHBOARD] Starting live dashboard -- console goes quiet after this; full detail in worker.log", flush=True)
+        if V16_STATE.DASHBOARD_TASK is not None and not V16_STATE.DASHBOARD_TASK.done():
+            print("[DASHBOARD] Already running", flush=True)
+        else:
+            dashboard_task = asyncio.create_task(dashboard_loop())
+            V16_STATE.DASHBOARD_TASK = dashboard_task
+            BACKGROUND_TASKS.add(dashboard_task)
 
         print("STEP 20: WORKER READY", flush=True)
         print("\n============================================================", flush=True)
