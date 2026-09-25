@@ -2698,6 +2698,7 @@ CHROME_DRIVER_LOCK = threading.RLock()
 
 def _recover_gemini_resource(resource_id: str) -> bool:
     """Recreate this Gemini tab on the shared chrome_driver and prove it responds."""
+    global chrome_driver
     worker = GEMINI_WORKERS.get(resource_id)
     if worker is None:
         return False
@@ -2712,6 +2713,27 @@ def _recover_gemini_resource(resource_id: str) -> bool:
                     pass
             worker.handle = None
             worker.driver = None
+
+            # If EVERY tab recovers as "target window already closed" at once
+            # (T0-T3 all failing in the same health-check pass), the shared
+            # chrome_driver's browser process itself has died -- retrying tab
+            # creation on a dead session fails forever. Detect that and
+            # relaunch the whole browser once; the other 3 slots' own
+            # recovery passes then just create a tab on the fresh browser.
+            try:
+                _ = chrome_driver.window_handles
+            except Exception:
+                log(f"[GEMINI BROKER] {resource_id} SHARED CHROME PROCESS IS DEAD -- relaunching browser")
+                try:
+                    chrome_driver.quit()
+                except Exception:
+                    pass
+                chrome_driver = create_chrome_driver()
+                V16_STATE.chrome_driver = chrome_driver
+                for w in GEMINI_WORKERS.values():
+                    w.handle = None
+                    w.driver = None
+
             new_handle = _create_gemini_tab(tid_int)
             chrome_driver.switch_to.window(new_handle)
             _ = chrome_driver.title
@@ -3321,42 +3343,38 @@ async def redis_queue_monitor_loop():
     )
     V16_STATE.QUEUE_MONITOR = QUEUE_MONITOR
 
+    _was_idle = None  # None = not yet known, True/False = last reported idle state
+
     while True:
         try:
             counts = await QUEUE_MONITOR.getJobCounts()
             RUNTIME_HEALTH["redis"] = True
 
-            print("\n" + "=" * 60)
-            print("REDIS / BULLMQ QUEUE STATUS")
-            print("=" * 60)
-            print(f"Queue: {QUEUE_NAME}")
-            print(f"WAITING: {counts.get('waiting', 0)}")
-            print(f"ACTIVE: {counts.get('active', 0)}")
-            print(f"DELAYED: {counts.get('delayed', 0)}")
-            print(f"PRIORITIZED: {counts.get('prioritized', 0)}")
-            print(f"WAITING-CHILDREN: {counts.get('waiting-children', 0)}")
-            print(f"COMPLETED: {counts.get('completed', 0)}")
-            print(f"FAILED: {counts.get('failed', 0)}")
-            print("=" * 60)
+            waiting = counts.get("waiting", 0)
+            active = counts.get("active", 0)
+            delayed = counts.get("delayed", 0)
+            is_idle = not any([waiting, active, delayed])
 
             # Change detection against the previous poll -- this is a display
             # convenience only, NEVER proof a worker actually picked up a job
             # (that's exclusively process_bullmq_job's "REAL JOB RECEIVED").
-            for _key in ("waiting", "active", "failed", "completed"):
-                _prev = LAST_QUEUE_COUNTS.get(_key)
-                _cur = counts.get(_key, 0)
-                if _prev is not None and _prev != _cur:
-                    print(f"[QUEUE] {_key.upper()} changed {_prev} -> {_cur}")
+            changed = [
+                f"{_key}={counts.get(_key, 0)}"
+                for _key in ("waiting", "active", "delayed", "failed", "completed")
+                if LAST_QUEUE_COUNTS.get(_key) != counts.get(_key, 0)
+            ]
             LAST_QUEUE_COUNTS.update(counts)
             LAST_QUEUE_COUNTS["_queue_name"] = QUEUE_NAME
 
-            if not any([
-                counts.get("waiting", 0),
-                counts.get("active", 0),
-                counts.get("delayed", 0),
-            ]):
-                print("[QUEUE] NO PENDING JOBS")
-                print("[BULLMQ] WORKER LISTENING — WAITING FOR REAL JOB")
+            if changed:
+                # One line per change, no matter how many jobs are queued --
+                # this replaces the old always-on 7-line status block that
+                # printed unconditionally every 5s even with nothing to say.
+                print(f"[QUEUE] {QUEUE_NAME}: {' '.join(changed)}", flush=True)
+
+            if is_idle and _was_idle is not True:
+                print("[QUEUE] NO PENDING JOBS -- WORKER LISTENING", flush=True)
+            _was_idle = is_idle
 
         except Exception as e:
             RUNTIME_HEALTH["redis"] = False
