@@ -3126,12 +3126,11 @@ def verify_attachment_count(drv, expected: int, tid=0, job_id='', upload_token=N
         try:
             result = drv.execute_script(
                 "var selectors = ['gem-media-attachment', 'uploader-file-preview', '[data-test-id=\"uploaded-img\"]'];"
-                "var nodes = [];"
-                "selectors.forEach(function(sel) { document.querySelectorAll(sel).forEach(function(el) { nodes.push(el); }); });"
-                "var unique = new Map();"
-                "nodes.forEach(function(el) {"
-                "  var key = el.getAttribute('data-id') || el.getAttribute('data-file-id') || el.getAttribute('data-filename') || el.getAttribute('aria-label') || el.textContent.trim();"
-                "  if (key) unique.set(key, el);"
+                "var unique = new Set();"
+                "selectors.forEach(function(sel) {"
+                "  document.querySelectorAll(sel).forEach(function(el) {"
+                "    if (el.offsetParent !== null) unique.add(el);"
+                "  });"
                 "});"
                 "return unique.size;"
             )
