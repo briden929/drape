@@ -324,19 +324,31 @@ try:
                 if _v:
                     os.environ[_k] = _v
             except Exception:
-                pass
+                print(f"[SECRET CHECK] {_k}: Colab Secret read failed")
 except Exception:
-    pass  # not running in Colab, or Colab Secrets not configured
+    print("[SECRET CHECK] Google Colab userdata unavailable")
 
+# Per-secret PRESENT/MISSING status -- never the value itself.
 _missing = []
 for _k in _REQUIRED_SECRETS:
-    if not os.environ.get(_k):
+    if os.environ.get(_k):
+        print(f"✅ {_k}: PRESENT")
+    else:
+        print(f"❌ {_k}: MISSING")
         _missing.append(_k)
 
 if _missing:
-    print(f"[FATAL ERROR] Missing required environment variables: {', '.join(_missing)}")
-    print("[FATAL ERROR] Add each one under Colab Secrets (key icon, left sidebar) with notebook access enabled, or set it in os.environ before running this file.")
+    print()
+    print('=' * 80)
+    print("[FATAL ERROR] Missing required secrets:")
+    for _k in _missing:
+        print(f"  - {_k}")
+    print('=' * 80)
+    print("Add each one under Colab Secrets (key icon, left sidebar) with notebook access enabled, or set it in os.environ before running this file.")
     sys.exit(1)
+
+print()
+print("✅ ALL 7 REQUIRED SECRETS ARE AVAILABLE")
 
 os.environ.setdefault('REDIS_KEY_PREFIX', 'vastralook:')
 QUEUE_NAME = 'generations'
