@@ -4201,7 +4201,17 @@ class ResourceAcquireTimeout(Exception):
 MAX_RESOURCE_FAILURES = 5
 RECOVERY_COOLDOWN_BASE_S = 15
 RECOVERY_COOLDOWN_MAX_S = 300
-RESOURCE_ACQUIRE_TIMEOUT_S = 120
+# A Gemini (T0-T3) resource is held from acquire through setup (NewChat/
+# Flash/CreateImage/Upload/Prompt/Send, tens of seconds) + the generation
+# wait (GENERATION_TIMEOUT_S=240) + the download-start window
+# (DOWNLOAD_START_WINDOW_S), i.e. up to ~300s worst case, before
+# release_gemini_once() runs. With BULLMQ_CONCURRENCY > len(resources), a
+# queued job legitimately waiting its turn for a slot -- not stuck on a
+# dead resource, which is handled separately via fail()/recovery -- could
+# need to wait close to that long. The previous 120s value failed jobs
+# purely from normal queuing depth, well before any resource actually
+# hung. Sized with headroom above the worst realistic single-job hold time.
+RESOURCE_ACQUIRE_TIMEOUT_S = 600
 
 class FirstFreeBroker:
     def __init__(self, name: str, resources: List[str]):
