@@ -2316,19 +2316,47 @@ class JobContext:
     raw_path: Optional[str] = None
     clean_png_path: Optional[str] = None
     webp_path: Optional[str] = None
+    output_url: Optional[str] = None
     
     error: Optional[str] = None
     completed_at: Optional[float] = None
+
+    # Timing checkpoints for the JOB TIMING report printed at completion --
+    # each set once, the first time execution reaches the corresponding
+    # state, from _set_state_threadsafe's _TIMING_FIELD_BY_STATE map.
+    received_at: float = field(default_factory=time.time)
+    gemini_start_at: Optional[float] = None
+    raw_download_start_at: Optional[float] = None
+    raw_ready_at: Optional[float] = None
+    wmr_start_at: Optional[float] = None
+    clean_download_start_at: Optional[float] = None
+    clean_ready_at: Optional[float] = None
+    webp_at: Optional[float] = None
+    r2_at: Optional[float] = None
 
     state_waiters: Dict[JobState, List[asyncio.Future]] = field(default_factory=dict)
 
     def transition_sync(self, new_state: JobState):
         self.loop.call_soon_threadsafe(self._set_state_threadsafe, new_state)
 
+    _TIMING_FIELD_BY_STATE = {
+        JobState.GEMINI_GENERATING: "gemini_start_at",
+        JobState.RAW_DOWNLOAD_START: "raw_download_start_at",
+        JobState.RAW_READY: "raw_ready_at",
+        JobState.WMR_PROCESSING: "wmr_start_at",
+        JobState.WMR_DOWNLOAD_START: "clean_download_start_at",
+        JobState.CLEAN_READY: "clean_ready_at",
+        JobState.WEBP_READY: "webp_at",
+        JobState.R2_READY: "r2_at",
+    }
+
     def _set_state_threadsafe(self, new_state: JobState):
         old = self.state
         self.state = new_state
-        print(f"[STATE] {self.job_id}: {old.name} -> {new_state.name}")
+        print(f"[STATE][{self.job_id}] {old.name} -> {new_state.name}", flush=True)
+        _timing_field = self._TIMING_FIELD_BY_STATE.get(new_state)
+        if _timing_field is not None and getattr(self, _timing_field) is None:
+            setattr(self, _timing_field, time.time())
         if new_state in (JobState.COMPLETED, JobState.FAILED):
             self.completed_at = time.time()
 
@@ -2512,6 +2540,15 @@ class FirstFreeBroker:
         with self._condition:
             return self.snapshot_locked()
 
+    def snapshot_full(self) -> Dict[str, dict]:
+        """Same as snapshot() but also carries current_job_id/last_used, for
+        heartbeat's JOB=/AGE= reporting on BUSY resources."""
+        with self._condition:
+            return {
+                rid: {"state": rec.state.value, "job_id": rec.current_job_id, "last_used": rec.last_used}
+                for rid, rec in self._records.items()
+            }
+
     @property
     def free_resources(self):
         with self._condition:
@@ -2642,7 +2679,8 @@ class GeminiWorker:
         self.handle = None
 
     def do_execute_sync(self, ctx: JobContext):
-        prefix = f"[{self.tid}][{ctx.job_id}]"
+        prefix = f"[GEMINI][{self.tid}][{ctx.job_id}]"
+        print(f"{prefix} START", flush=True)
         with CHROME_DRIVER_LOCK:
             try:
                 ctx.transition_sync(JobState.GEMINI_GENERATING)
@@ -2750,7 +2788,8 @@ class WmrDriverThread(threading.Thread):
         while True:
             cmd, ctx = self.command_queue.get()
             if cmd == "EXECUTE":
-                prefix = f"[{self.resource_id}][{ctx.job_id}]"
+                prefix = f"[WMR][{self.resource_id}][{ctx.job_id}]"
+                print(f"{prefix} START", flush=True)
                 try:
                     if self.driver is None:
                         self.driver = create_wmr_chrome_driver(self.resource_id)
@@ -2821,6 +2860,24 @@ class WmrDriverThread(threading.Thread):
 # V16: Only initialize at runtime
 WMR_THREADS = {}
 
+def _fmt_span(start, end):
+    if start is None or end is None:
+        return "n/a"
+    return f"{end - start:.1f}s"
+
+def _print_job_timing(ctx: JobContext):
+    now = ctx.completed_at or time.time()
+    print("JOB TIMING", flush=True)
+    print("-----------", flush=True)
+    print(f"Queue wait:     {_fmt_span(ctx.received_at, ctx.gemini_start_at)}", flush=True)
+    print(f"Gemini:         {_fmt_span(ctx.gemini_start_at, ctx.raw_download_start_at)}", flush=True)
+    print(f"Raw download:   {_fmt_span(ctx.raw_download_start_at, ctx.raw_ready_at)}", flush=True)
+    print(f"WMR:            {_fmt_span(ctx.wmr_start_at, ctx.clean_download_start_at)}", flush=True)
+    print(f"Clean download: {_fmt_span(ctx.clean_download_start_at, ctx.clean_ready_at)}", flush=True)
+    print(f"WebP:           {_fmt_span(ctx.clean_ready_at, ctx.webp_at)}", flush=True)
+    print(f"R2/DB:          {_fmt_span(ctx.webp_at, ctx.r2_at)}", flush=True)
+    print(f"Total:          {_fmt_span(ctx.received_at, now)}", flush=True)
+
 async def execute_pipeline(ctx: JobContext):
     try:
         existing_status = str(ctx.payload.get('status') or '').lower()
@@ -2830,7 +2887,7 @@ async def execute_pipeline(ctx: JobContext):
             ctx.transition_sync(JobState.COMPLETED)
             return
 
-        print(f"[JOB] {ctx.job_id}: Resolving references", flush=True)
+        print("[BULLMQ] RESOLVING PROMPT + REFERENCES", flush=True)
         prompt, garment_path, model_path, holo_path = resolve_prompt_and_refs(ctx.payload)
         ctx.prompt = prompt
         ctx.garment_path = garment_path
@@ -2841,7 +2898,14 @@ async def execute_pipeline(ctx: JobContext):
         for p in ctx.reference_paths:
             if not Path(p).exists() or Path(p).stat().st_size == 0:
                 raise RuntimeError(f"Reference invalid: {p}")
-        print(f"[JOB] {ctx.job_id}: References ready ({len(ctx.reference_paths)} files)", flush=True)
+        # Local cache paths only -- never the original remote reference URLs
+        # (params_json/URLs are DB-owned strings that can carry pre-signed
+        # query params, so this stays as filenames only, not full paths).
+        print("[BULLMQ] REFERENCES READY", flush=True)
+        print(f"Garment:         {Path(garment_path).name if garment_path else None}", flush=True)
+        print(f"Model:           {Path(model_path).name if model_path else None}", flush=True)
+        print(f"Hologram:        {Path(holo_path).name if holo_path else None}", flush=True)
+        print(f"Reference count: {len(ctx.reference_paths)}", flush=True)
 
         print(f"[PIPELINE][{ctx.job_id}] GEMINI QUEUED", flush=True)
         print(f"[PIPELINE][{ctx.job_id}] Acquiring Gemini resource", flush=True)
@@ -2884,7 +2948,7 @@ async def execute_pipeline(ctx: JobContext):
         print(f"[PIPELINE][{ctx.job_id}] WEBP_READY", flush=True)
 
         fs = sys.modules["fashion_studio"]
-        fs.push_generation(
+        push_result = fs.push_generation(
             image_path=ctx.clean_png_path,
             prompt=ctx.prompt,
             user_id=ctx.payload.get("user_id"),
@@ -2892,6 +2956,7 @@ async def execute_pipeline(ctx: JobContext):
             webp_path=ctx.webp_path,
             force=True
         )
+        ctx.output_url = (push_result or {}).get("output_url")
         ctx.transition_sync(JobState.R2_READY)
         print(f"[PIPELINE][{ctx.job_id}] R2_READY (PNG + WebP uploaded)", flush=True)
         ctx.transition_sync(JobState.DB_FINALIZING)
@@ -2910,18 +2975,46 @@ async def execute_pipeline(ctx: JobContext):
             log(f"[{ctx.job_id}] CREDITS_SETTLE_FAILED (job still marked COMPLETED): {e}")
 
         ctx.transition_sync(JobState.COMPLETED)
-        print(f"[PIPELINE][{ctx.job_id}] COMPLETED", flush=True)
+        print("=" * 60, flush=True)
+        print("[BULLMQ] JOB COMPLETED SUCCESSFULLY", flush=True)
+        print("=" * 60, flush=True)
+        print(f"Job ID:          {ctx.job_id}", flush=True)
+        print(f"Generation ID:   {ctx.job_id}", flush=True)
+        print(f"Gemini resource: {ctx.gemini_resource}", flush=True)
+        print(f"WMR resource:    {ctx.wmr_resource}", flush=True)
+        print(f"Raw PNG:         {ctx.raw_path}", flush=True)
+        print(f"Clean PNG:       {ctx.clean_png_path}", flush=True)
+        print(f"WebP:            {ctx.webp_path}", flush=True)
+        print(f"R2 URL:          {ctx.output_url}", flush=True)
+        _print_job_timing(ctx)
 
     except Exception as e:
         ctx.error = str(e)
         if ctx.state != JobState.FAILED:
             ctx.transition_sync(JobState.FAILED)
+
+        print("=" * 60, flush=True)
+        print("[BULLMQ] JOB FAILED", flush=True)
+        print("=" * 60, flush=True)
+        print(f"Job ID:          {ctx.job_id}", flush=True)
+        print(f"Generation ID:   {ctx.job_id}", flush=True)
+        print(f"Current state:   {ctx.state.name}", flush=True)
+        print(f"Error type:      {type(e).__name__}", flush=True)
+        print(f"Error message:   {e}", flush=True)
+        import traceback as _tb
+        _tb.print_exc()
+        print(f"Gemini resource: {ctx.gemini_resource}", flush=True)
+        print(f"WMR resource:    {ctx.wmr_resource}", flush=True)
+        print(f"Download GUID:   raw={ctx.raw_guid} wmr={ctx.wmr_guid}", flush=True)
+
+        print("[BULLMQ] FAILURE CLEANUP START", flush=True)
         try:
             sys.modules["credits"].refund_look(ctx.job_id, str(e)[:500])
         except Exception:
             pass
         release_gemini_once(ctx)
         release_wmr_once(ctx)
+        print("[BULLMQ] FAILURE CLEANUP COMPLETE", flush=True)
 
 # ------------------------------------------------------------------------------
 # DOWNLOAD WATCHER
@@ -3002,33 +3095,41 @@ async def poll_downloads_loop():
 # ------------------------------------------------------------------------------
 
 async def process_bullmq_job(job, job_token):
+    # This is the ONLY place allowed to print REAL JOB RECEIVED -- it fires
+    # exactly once per real invocation from the BullMQ Worker itself, never
+    # inferred from queue counts or the queue monitor.
     generation_id = job.data.get("generationId") or job.data.get("id") or job.id
     print("=" * 60, flush=True)
-    print("BULLMQ JOB RECEIVED", flush=True)
+    print("[BULLMQ] REAL JOB RECEIVED", flush=True)
     print("=" * 60, flush=True)
-    print(f"  job.id:         {job.id}", flush=True)
-    print(f"  job.name:       {job.name}", flush=True)
-    print(f"  generationId:   {generation_id}", flush=True)
+    print(f"Worker ID:       {WORKER_ID}", flush=True)
+    print(f"Job ID:          {job.id}", flush=True)
+    print(f"Generation ID:   {generation_id}", flush=True)
+    print(f"Attempt:         {job.attemptsMade + 1}", flush=True)
+    print(f"Queue:           {QUEUE_NAME}", flush=True)
+    print(f"Job data keys:   {sorted(job.data.keys()) if isinstance(job.data, dict) else 'n/a'}", flush=True)
+    print("=" * 60, flush=True)
 
     existing = JOB_CONTEXTS.get(generation_id)
     if existing is not None and existing.state not in (JobState.COMPLETED, JobState.FAILED):
         log(f"[{generation_id}] DUPLICATE_JOB_REJECTED: already in-flight (state={existing.state.name})")
         raise RuntimeError(f"Duplicate job for generation {generation_id} already in-flight (state={existing.state.name})")
 
-    print(f"[JOB] {generation_id}: Fetching generation from PostgreSQL", flush=True)
+    print("[BULLMQ] FETCHING GENERATION", flush=True)
     gen = fetch_generation(generation_id)
     if not gen: raise RuntimeError(f"Generation {generation_id} not found in DB.")
-    print(f"[JOB] {generation_id}: Generation loaded", flush=True)
+    print("[BULLMQ] GENERATION FOUND", flush=True)
+    print(f"Generation ID:   {generation_id}", flush=True)
+    print(f"DB status:       {gen.get('status')}", flush=True)
+    print(f"User ID:         {gen.get('user_id')}", flush=True)
 
     ctx = JobContext(job_id=generation_id, payload=gen, loop=asyncio.get_running_loop())
     JOB_CONTEXTS[generation_id] = ctx
 
-    print(f"[JOB] {generation_id}: Entering execute_pipeline()", flush=True)
     await execute_pipeline(ctx)
 
     if ctx.state == JobState.FAILED:
         raise RuntimeError(ctx.error)
-    print(f"[JOB] {generation_id}: COMPLETED", flush=True)
     return {"status": "success"}
 
 
@@ -3096,6 +3197,12 @@ RUNTIME_HEALTH = {
     "heartbeat": False,
 }
 
+# Last-seen queue counts, updated only by redis_queue_monitor_loop -- used
+# for its own change-detection logging and mirrored into the heartbeat.
+# This is a cache for display only; it is never treated as proof of job
+# receipt (only process_bullmq_job's "[BULLMQ] REAL JOB RECEIVED" is that).
+LAST_QUEUE_COUNTS = {}
+
 def initialize_runtime_once():
     global WMR_THREADS
     if not WMR_THREADS:
@@ -3138,12 +3245,24 @@ async def redis_queue_monitor_loop():
             print(f"FAILED: {counts.get('failed', 0)}")
             print("=" * 60)
 
+            # Change detection against the previous poll -- this is a display
+            # convenience only, NEVER proof a worker actually picked up a job
+            # (that's exclusively process_bullmq_job's "REAL JOB RECEIVED").
+            for _key in ("waiting", "active", "failed", "completed"):
+                _prev = LAST_QUEUE_COUNTS.get(_key)
+                _cur = counts.get(_key, 0)
+                if _prev is not None and _prev != _cur:
+                    print(f"[QUEUE] {_key.upper()} changed {_prev} -> {_cur}")
+            LAST_QUEUE_COUNTS.update(counts)
+            LAST_QUEUE_COUNTS["_queue_name"] = QUEUE_NAME
+
             if not any([
                 counts.get("waiting", 0),
                 counts.get("active", 0),
                 counts.get("delayed", 0),
             ]):
-                print("[REDIS] QUEUE EMPTY — worker alive and waiting for jobs")
+                print("[QUEUE] NO PENDING JOBS")
+                print("[BULLMQ] WORKER LISTENING — WAITING FOR REAL JOB")
 
         except Exception as e:
             RUNTIME_HEALTH["redis"] = False
@@ -3178,11 +3297,19 @@ async def worker_heartbeat_loop():
             for jid in stale:
                 JOB_CONTEXTS.pop(jid, None)
 
-            gemini_states = GEMINI_BROKER.snapshot()
-            wmr_states = WMR_BROKER.snapshot()
+            gemini_states = GEMINI_BROKER.snapshot_full()
+            wmr_states = WMR_BROKER.snapshot_full()
             raw_downloads = sum(1 for r in DOWNLOAD_REGISTRY.values() if r.resource_type == "gemini")
             clean_downloads = sum(1 for r in DOWNLOAD_REGISTRY.values() if r.resource_type == "wmr")
             active_jobs = sum(1 for j in JOB_CONTEXTS.values() if j.state not in (JobState.COMPLETED, JobState.FAILED))
+
+            def _print_resource_line(rid, rec):
+                label = _resource_label(rec.get("state", "DEAD")) if rec else "DEAD"
+                print(f"{rid} = {label}")
+                if label == "BUSY" and rec.get("job_id"):
+                    age_s = now - rec["last_used"] if rec.get("last_used") else 0
+                    print(f"     JOB = {rec['job_id']}")
+                    print(f"     AGE = {age_s:.0f}s")
 
             print("\n" + "=" * 60)
             print("V16 WORKER HEARTBEAT")
@@ -3195,17 +3322,33 @@ async def worker_heartbeat_loop():
             print("\nBullMQ:")
             print("RUNNING" if RUNTIME_HEALTH["bullmq"] else "FAILED")
 
+            print("\nQueue:")
+            print(f"{LAST_QUEUE_COUNTS.get('_queue_name', QUEUE_NAME)}")
+            print(f"Waiting:   {LAST_QUEUE_COUNTS.get('waiting', 'n/a')}")
+            print(f"Active:    {LAST_QUEUE_COUNTS.get('active', 'n/a')}")
+            print(f"Delayed:   {LAST_QUEUE_COUNTS.get('delayed', 'n/a')}")
+            print(f"Failed:    {LAST_QUEUE_COUNTS.get('failed', 'n/a')}")
+            print(f"Completed: {LAST_QUEUE_COUNTS.get('completed', 'n/a')}")
+
             print("\nGemini:")
             for rid in ["T0", "T1", "T2", "T3"]:
-                print(f"{rid} = {_resource_label(gemini_states.get(rid, 'DEAD'))}")
+                _print_resource_line(rid, gemini_states.get(rid))
 
             print("\nWMR:")
             for rid in ["W0-T0", "W0-T1", "W1-T0", "W1-T1", "W2-T0", "W2-T1", "W3-T0", "W3-T1"]:
-                print(f"{rid} = {_resource_label(wmr_states.get(rid, 'DEAD'))}")
+                _print_resource_line(rid, wmr_states.get(rid))
 
             print("\nDownloads:")
             print(f"RAW = {raw_downloads}")
             print(f"CLEAN = {clean_downloads}")
+            print("Download monitor:")
+            print("RUNNING" if RUNTIME_HEALTH["download_monitor"] else "STOPPED")
+
+            print("\nGemini broker:")
+            print("HEALTHY" if any(r["state"] != ResourceState.DEAD.value for r in gemini_states.values()) else "DEGRADED")
+
+            print("\nWMR broker:")
+            print("HEALTHY" if any(r["state"] != ResourceState.DEAD.value for r in wmr_states.values()) else "DEGRADED")
 
             print("\nJobs:")
             print(f"ACTIVE = {active_jobs}")
@@ -3346,19 +3489,55 @@ async def main():
 
 async def shutdown_worker():
     global BULLMQ_WORKER, QUEUE_MONITOR
-    if BULLMQ_WORKER: await BULLMQ_WORKER.close()
-    if QUEUE_MONITOR: await QUEUE_MONITOR.close()
-    
+
+    # 1. stop BullMQ worker (stops admitting new jobs)
+    if BULLMQ_WORKER:
+        await BULLMQ_WORKER.close()
+        print("[SHUTDOWN] BullMQ Worker closed.", flush=True)
+
+    # 2-5. stop queue monitor, heartbeat, download monitor, other background tasks
     if QUEUE_MONITOR_TASK: QUEUE_MONITOR_TASK.cancel()
     if HEARTBEAT_TASK: HEARTBEAT_TASK.cancel()
     if WATCHER_TASK: WATCHER_TASK.cancel()
     if WORKER_MAIN_TASK: WORKER_MAIN_TASK.cancel()
-    
     for task in BACKGROUND_TASKS:
         task.cancel()
     if BACKGROUND_TASKS:
         await asyncio.gather(*BACKGROUND_TASKS, return_exceptions=True)
-    
+    print("[SHUTDOWN] Monitor/heartbeat/download tasks stopped.", flush=True)
+
+    # 6. close Redis Queue clients -- this is what previously leaked as
+    # "Unclosed Redis client" when this step was skipped.
+    if QUEUE_MONITOR:
+        await QUEUE_MONITOR.close()
+        print("[SHUTDOWN] Redis Queue client closed.", flush=True)
+
+    # 7. release/close WMR drivers
+    for rid, thread in list(WMR_THREADS.items()):
+        try:
+            if thread.driver is not None:
+                thread.driver.quit()
+                print(f"[SHUTDOWN] WMR driver {rid} closed.", flush=True)
+        except Exception as e:
+            print(f"[SHUTDOWN] WMR driver {rid} close failed: {e}", flush=True)
+
+    # 8. close Gemini browser resources (the single shared chrome_driver)
+    try:
+        if "chrome_driver" in globals() and chrome_driver is not None:
+            chrome_driver.quit()
+            print("[SHUTDOWN] Gemini Chrome driver closed.", flush=True)
+    except Exception as e:
+        print(f"[SHUTDOWN] Gemini Chrome driver close failed: {e}", flush=True)
+
+    # 9. clear singleton state only now that shutdown actually succeeded
+    V16_STATE.BULLMQ_WORKER = None
+    V16_STATE.QUEUE_MONITOR = None
+    V16_STATE.QUEUE_MONITOR_TASK = None
+    V16_STATE.HEARTBEAT_TASK = None
+    V16_STATE.WATCHER_TASK = None
+    V16_STATE.WORKER_MAIN_TASK = None
+    V16_STATE.RUNTIME_INITIALIZED = False
+
     print("[SHUTDOWN] Worker stopped cleanly.")
 
 # Source of truth is V16_STATE (persists across this file being re-run in
@@ -3407,7 +3586,8 @@ def start_worker():
     # previous run's main() is still alive on this kernel's event loop.
     existing_task = V16_STATE.WORKER_MAIN_TASK
     if V16_STATE.RUNTIME_INITIALIZED and existing_task is not None and not existing_task.done():
-        print("[BOOT] WORKER ALREADY RUNNING (from a previous run of this cell in this same kernel) -- reusing it instead of starting a duplicate BullMQ Worker.", flush=True)
+        print("[BOOT] WORKER ALREADY RUNNING", flush=True)
+        print("[BOOT] REUSING EXISTING RUNTIME", flush=True)
         WORKER_MAIN_TASK = existing_task
         return existing_task
 
@@ -3422,7 +3602,8 @@ def start_worker():
         return asyncio.run(main())
 
     if existing_task is not None and not existing_task.done():
-        print("[BOOT] WORKER ALREADY RUNNING (from a previous run of this cell in this same kernel) -- reusing it instead of starting a duplicate BullMQ Worker.", flush=True)
+        print("[BOOT] WORKER ALREADY RUNNING", flush=True)
+        print("[BOOT] REUSING EXISTING RUNTIME", flush=True)
         WORKER_MAIN_TASK = existing_task
         return existing_task
 
