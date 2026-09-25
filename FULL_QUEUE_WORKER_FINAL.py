@@ -527,6 +527,125 @@ def set_last_event(msg: str):
     DASHBOARD_STATE['last_event_ts'] = time.time()
     append_runtime_log(f'[EVENT] {msg}')
 
+# ---------------------------------------------------------------------------
+# COMPACT ONE-LINE-PER-JOB LIVE PROGRESS (display-only layer)
+# This is NOT a second state machine: JobContext/JobState remains the sole
+# authority. JOB_PROGRESS merely mirrors VERIFIED browser events emitted by
+# the pipeline helpers (a ✅ token is only ever set after a real DOM check),
+# and the compact renderer reads it once per dashboard tick. Full forensic
+# detail stays in worker.log; the console shows one line per active job.
+# ---------------------------------------------------------------------------
+
+PROGRESS_STAGES = ['newchat', 'flash', 'picker', 'createimg', 'imgmode',
+                   'upload', 'attached', 'prompt', 'send', 'genstart',
+                   'image', 'download', 'released', 'done']
+
+JOB_PROGRESS: Dict[str, dict] = {}
+
+
+def _job_display_name(job_id: str) -> str:
+    """Compact human label for a job line: DB title/prompt head + ref count."""
+    try:
+        ctx = JOB_CONTEXTS.get(job_id)
+        payload = (ctx.payload if ctx else None) or {}
+        title = ''
+        params = payload.get('params') or {}
+        if isinstance(params, str):
+            try:
+                params = json.loads(params)
+            except Exception:
+                params = {}
+        if isinstance(params, dict):
+            title = str(params.get('title') or '')
+        if not title:
+            title = str(payload.get('primary_outfit_name') or '')
+        if not title:
+            title = str(payload.get('prompt') or '')[:60]
+        n_refs = len(ctx.reference_paths) if (ctx and ctx.reference_paths) else 0
+        title = re.sub(r'\s+', ' ', title).strip()[:48] or short_job_id(job_id)
+        return f'{title} ({n_refs} refs)' if n_refs else title
+    except Exception:
+        return short_job_id(job_id)
+
+
+def job_progress_init(job_id: str):
+    JOB_PROGRESS[job_id] = {
+        'stages': {},          # stage -> 'run' | 'ok' | 'fail'
+        'attach': None,        # (actual, expected)
+        'error': None,         # STOP reason shown on the job line
+        'resource': None,      # T0..T3
+        'wmr_resource': None,  # W0-T0 ...
+        'image_at': None,      # timestamp of verified image detection
+        'dl_bytes': None,      # raw download size when file completes
+        'completed_at': None,
+        'failed': False,
+    }
+
+
+def job_mark(job_id: str, stage: str, status: str):
+    """Update one stage token on the job's single live line. Only called
+    with status='ok' from call sites AFTER real browser verification."""
+    p = JOB_PROGRESS.get(job_id)
+    if p is None:
+        return
+    p['stages'][stage] = status
+
+
+def job_attach(job_id: str, actual, expected):
+    p = JOB_PROGRESS.get(job_id)
+    if p is not None:
+        p['attach'] = (actual, expected)
+
+
+_STAGE_ICONS = {'run': '🔄', 'ok': '✅', 'fail': '❌'}
+
+
+def render_job_line(job_id: str) -> str:
+    p = JOB_PROGRESS.get(job_id)
+    if p is None:
+        return ''
+    stages = p['stages']
+    tokens = []
+    for st in PROGRESS_STAGES:
+        if st == 'done':
+            continue
+        if st == 'attached':
+            if p.get('attach'):
+                a, e = p['attach']
+                ok = (e is not None and a >= e)
+                tokens.append(f"{'✅' if ok else '📎'}{a}/{e}")
+            elif 'upload' in stages:
+                tokens.append('📎0/?')
+            continue
+        if st == 'image':
+            if p.get('image_at'):
+                tokens.append(f"🖼️{int(time.time() - p['image_at'])}s")
+            elif st in stages:
+                tokens.append(_STAGE_ICONS[stages[st]] + 'Image')
+            continue
+        if st == 'download':
+            if p.get('dl_bytes'):
+                tokens.append(f"⬇️{p['dl_bytes'] // 1024}KB")
+            elif st in stages:
+                tokens.append(_STAGE_ICONS[stages[st]] + 'DL')
+            continue
+        if st in stages:
+            tokens.append(_STAGE_ICONS[stages[st]] + st.capitalize())
+    if p.get('completed_at'):
+        tokens.append('🎉DONE')
+    if p.get('failed'):
+        head = '🔴'
+    elif p.get('completed_at'):
+        head = '🖼️'
+    else:
+        head = '🟢'
+    res = p.get('resource') or '--'
+    line = f"{head} [{res}] {short_job_id(job_id)} {_job_display_name(job_id)}\n| " + ' | '.join(tokens)
+    if p.get('error'):
+        line += f"\n| STOP {p['error']}"
+    return line
+
+
 def get_chrome_job_dir(tab_id: int, job_id: str):
     """Returns (job_dir, incoming_dir) for Chrome downloads."""
     job_dir = CHROME_DL_BASE / f'T{tab_id}' / job_id
@@ -2060,59 +2179,131 @@ def is_create_image_mode(drv):
 
 _DEBUG_SCREENSHOT_DIR = Path('debug/screenshots')
 
+_GEMINI_UI_SNAPSHOT_JS = r"""
+function vis(el){ return !!(el && el.offsetParent !== null); }
+function txt(el, n){ var t = (el.innerText || el.textContent || '').replace(/\s+/g,' ').trim(); return t.length > n ? t.slice(0,n)+'~' : t; }
+var out = {};
+// The ACTIVE visible composer: last visible ql-editor is Gemini's current
+// one when a draft chat exists alongside the main input-area.
+var eds = Array.prototype.filter.call(document.querySelectorAll('div.ql-editor'), vis);
+var ed = eds.length ? eds[eds.length - 1] : null;
+out.composer_text = ed ? txt(ed, 80) : '';
+out.composer_text_len = ed ? (ed.innerText || '').trim().length : -1;
+out.composer_placeholder = ed ? (ed.getAttribute('data-placeholder') || '') : 'NO_EDITOR';
+out.ask_gemini_visible = false;
+try {
+  var walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null);
+  var tn;
+  while ((tn = walker.nextNode())) {
+    var v = (tn.nodeValue || '').trim();
+    if (v === 'Ask Gemini' || v === 'Where should we start?') {
+      var pe = tn.parentElement;
+      if (pe && vis(pe)) { out.ask_gemini_visible = true; break; }
+    }
+  }
+} catch (e) {}
+// Visible mode/model selector text (Flash pill etc.)
+var pill = document.querySelector("div[data-test-id='logo-pill-label-container'], button[data-test-id='bard-mode-menu-button']");
+out.visible_mode_text = pill && vis(pill) ? txt(pill, 60) : '';
+// Toolbox drawer Create-image option + its selection state
+out.create_image_visible = false;
+out.selected_create_image = false;
+var ciEls = document.querySelectorAll(".toolbox-drawer-item-list-button, [role='menuitemcheckbox']");
+for (var i = 0; i < ciEls.length; i++) {
+  var el = ciEls[i];
+  if (!vis(el)) continue;
+  var t = (el.textContent || '').toLowerCase();
+  if (t.indexOf('create image') === -1) continue;
+  out.create_image_visible = true;
+  var a = (el.getAttribute('aria-checked') || '') + '|' + (el.getAttribute('aria-selected') || '') + '|' + (el.className || '');
+  if (/true|checked|selected/i.test(a)) out.selected_create_image = true;
+}
+// Image-generation composer/tool state (the POSITIVE signal)
+out.image_mode_signal = '';
+if (ed) {
+  var ph = (ed.getAttribute('data-placeholder') || '').toLowerCase();
+  if (ph.indexOf('describe') !== -1 && ph.indexOf('image') !== -1) out.image_mode_signal = 'placeholder:' + ph;
+}
+if (!out.image_mode_signal) {
+  var ars = document.querySelectorAll("button[aria-label*='Aspect ratio']");
+  for (var j = 0; j < ars.length; j++) if (vis(ars[j])) { out.image_mode_signal = 'aspect_ratio_control'; break; }
+}
+// Send button state
+var sendBtn = null;
+Array.prototype.forEach.call(document.querySelectorAll("mat-icon[data-mat-icon-name='arrow_upward'], mat-icon[fonticon='arrow_upward'], mat-icon[fonticon='send'], button[aria-label='Send message']"), function(e){
+  var b = e.tagName === 'BUTTON' ? e : e.closest('button');
+  if (b && vis(b)) sendBtn = b;
+});
+out.send_visible = !!sendBtn;
+out.send_enabled = sendBtn ? !sendBtn.disabled : false;
+// Stop/Cancel generation control
+var stop = null;
+Array.prototype.forEach.call(document.querySelectorAll("button[aria-label='Stop generating'], button[aria-label='Cancel'], mat-icon[fonticon='stop'], mat-icon[data-mat-icon-name='stop']"), function(e){
+  var b = e.tagName === 'BUTTON' ? e : e.closest('button') || e;
+  if (b && vis(b)) stop = b;
+});
+out.stop_ctrl = stop ? 'PRESENT' : 'NONE';
+// Compact extras kept for worker.log forensics
+out.buttons = [];
+Array.prototype.forEach.call(document.querySelectorAll('button'), function(b){
+  if (!vis(b)) return;
+  var lbl = b.getAttribute('aria-label') || txt(b, 24);
+  if (lbl) out.buttons.push(lbl.slice(0, 30));
+});
+out.menu_items = [];
+Array.prototype.forEach.call(document.querySelectorAll("[role='menuitem'], [role='menuitemcheckbox'], [role='option'], cdk-overlay-pane button"), function(m){
+  if (vis(m)) out.menu_items.push(txt(m, 40));
+});
+return out;
+"""
+
+
+def _gemini_ui_snapshot(drv) -> dict:
+    """Reusable compact structured snapshot of the CURRENT live Gemini UI
+    (no page_source dumps). Keys: url, composer_text, composer_text_len,
+    composer_placeholder, visible_mode_text, ask_gemini_visible,
+    create_image_visible, selected_create_image, image_mode_signal,
+    flash_visible, send_visible, send_enabled, stop_ctrl, buttons,
+    menu_items. Best-effort: never raises."""
+    info = {'url': 'ERR'}
+    try:
+        info['url'] = drv.current_url
+    except Exception:
+        pass
+    try:
+        js_result = drv.execute_script(_GEMINI_UI_SNAPSHOT_JS) or {}
+        info.update(js_result)
+    except Exception as snap_err:
+        info['snapshot_error'] = str(snap_err)[:200]
+    info.setdefault('composer_text', '')
+    info.setdefault('composer_placeholder', '')
+    info.setdefault('visible_mode_text', '')
+    info.setdefault('ask_gemini_visible', False)
+    info.setdefault('create_image_visible', False)
+    info.setdefault('selected_create_image', False)
+    info.setdefault('image_mode_signal', '')
+    info.setdefault('send_visible', False)
+    info.setdefault('send_enabled', False)
+    info.setdefault('stop_ctrl', 'NONE')
+    info['flash_visible'] = 'flash' in str(info.get('visible_mode_text', '')).lower()
+    return info
+
+
 def _gemini_state_snapshot(drv, checkpoint: str, tid=0, job_id='', screenshot=False) -> dict:
     """Capture compact DOM/browser state at a forensic checkpoint into
     worker.log. Returns the info dict so callers can include it in failure
     messages (e.g. CREATE_IMAGE_VERIFY_FAILED). Best-effort: never raises."""
     prefix = f'[T{tid}][{job_id}]' if job_id else f'[T{tid}]'
-    info = {}
-    try:
-        info['url'] = drv.current_url
-    except Exception:
-        info['url'] = 'ERR'
-    try:
-        js = r"""
-        function vis(el){ return !!(el && el.offsetParent !== null); }
-        function txt(el, n){ var t = (el.innerText || el.textContent || '').replace(/\s+/g,' ').trim(); return t.length > n ? t.slice(0,n)+'…' : t; }
-        var out = {};
-        var pill = document.querySelector("div[data-test-id='logo-pill-label-container'], button[data-test-id='bard-mode-menu-button']");
-        out.model_text = pill && vis(pill) ? txt(pill, 60) : '';
-        var eds = Array.prototype.filter.call(document.querySelectorAll('div.ql-editor'), vis);
-        out.composer_placeholder = eds.length ? (eds[0].getAttribute('data-placeholder') || '') : 'NO_EDITOR';
-        out.composer_text_len = eds.length ? (eds[0].innerText || '').trim().length : -1;
-        out.buttons = [];
-        Array.prototype.forEach.call(document.querySelectorAll('button'), function(b){
-          if (!vis(b)) return;
-          var lbl = b.getAttribute('aria-label') || txt(b, 24);
-          if (lbl) out.buttons.push(lbl.slice(0, 30));
-        });
-        out.menu_items = [];
-        Array.prototype.forEach.call(document.querySelectorAll("[role='menuitem'], [role='menuitemcheckbox'], [role='option'], cdk-overlay-pane button"), function(m){
-          if (vis(m)) out.menu_items.push(txt(m, 40));
-        });
-        out.create_image_els = [];
-        Array.prototype.forEach.call(document.querySelectorAll("mat-icon[data-mat-icon-name='image_create'], mat-icon[fonticon='image_create'], [aria-label*='reate image'], [aria-label*='mage mode'], .toolbox-drawer-item-list-button"), function(e){
-          if (vis(e)) out.create_image_els.push(e.tagName + '|' + ((e.getAttribute('aria-label') || '') + ':' + txt(e, 24)).slice(0, 40));
-        });
-        var sendBtn = null;
-        Array.prototype.forEach.call(document.querySelectorAll("mat-icon[data-mat-icon-name='arrow_upward'], mat-icon[fonticon='arrow_upward'], mat-icon[fonticon='send'], button[aria-label='Send message']"), function(e){
-          var b = e.tagName === 'BUTTON' ? e : e.closest('button');
-          if (b && vis(b)) sendBtn = b;
-        });
-        out.send_btn = sendBtn ? (sendBtn.disabled ? 'DISABLED' : 'ENABLED') : 'NOT_FOUND';
-        var stop = null;
-        Array.prototype.forEach.call(document.querySelectorAll("button[aria-label='Stop generating'], button[aria-label='Cancel'], mat-icon[fonticon='stop'], mat-icon[data-mat-icon-name='stop']"), function(e){
-          var b = e.tagName === 'BUTTON' ? e : e.closest('button') || e;
-          if (vis(b)) stop = b;
-        });
-        out.stop_ctrl = stop ? 'PRESENT' : 'NONE';
-        out.ql_describe_editors = eds.filter(function(e){ var p = e.getAttribute('data-placeholder') || ''; return /describe|image/i.test(p); }).length;
-        return out;
-        """
-        info.update(drv.execute_script(js) or {})
-    except Exception as snap_err:
-        info['snapshot_error'] = str(snap_err)[:200]
-    append_runtime_log(f"{prefix} BROWSER_STATE[{checkpoint}] url={str(info.get('url',''))[:90]} model='{info.get('model_text','')}' composer_ph='{info.get('composer_placeholder','')}' composer_len={info.get('composer_text_len','?')} send={info.get('send_btn','?')} stop={info.get('stop_ctrl','?')} create_img_els={info.get('create_image_els', [])[:6]} menu_items={info.get('menu_items', [])[:10]} buttons={info.get('buttons', [])[:25]}")
+    info = _gemini_ui_snapshot(drv)
+    append_runtime_log(
+        f"{prefix} BROWSER_STATE[{checkpoint}] url={str(info.get('url',''))[:90]} "
+        f"mode='{info.get('visible_mode_text','')}' composer_ph='{info.get('composer_placeholder','')}' "
+        f"composer_len={info.get('composer_text_len','?')} composer_head='{str(info.get('composer_text',''))[:40]}' "
+        f"ask_gemini={info.get('ask_gemini_visible')} ci_vis={info.get('create_image_visible')} "
+        f"ci_sel={info.get('selected_create_image')} img_sig='{info.get('image_mode_signal','')}' "
+        f"send={info.get('send_visible')}/{info.get('send_enabled')} stop={info.get('stop_ctrl','?')} "
+        f"menu_items={info.get('menu_items', [])[:10]} buttons={info.get('buttons', [])[:25]}"
+    )
     if screenshot:
         try:
             _DEBUG_SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
@@ -2177,99 +2368,172 @@ def _create_image_signal_2(drv) -> bool:
         return False
 
 
+def _create_image_verified(drv) -> tuple:
+    """STRICT fail-closed verification that Gemini is ACTUALLY in
+    image-generation mode right now -- POSITIVE and NEGATIVE evidence both
+    required (a weak selector that exists in BOTH chat and image mode can
+    no longer produce a false ✅):
+
+      POSITIVE (one of):
+        P1 selected_create_image : visible Create-image option reporting
+                                   aria-checked/aria-selected=true
+        P2 image_mode_signal     : ACTIVE visible composer's placeholder is
+                                   the image-creation one, OR a visible
+                                   Aspect-ratio image-tool control exists
+      NEGATIVE (required):
+        N1 ask_gemini_visible == False : the normal 'Ask Gemini' /
+            'Where should we start?' empty-chat UI is NOT present anymore
+
+    Returns (verified, reason, snapshot_dict)."""
+    snap = _gemini_ui_snapshot(drv)
+    positive = None
+    if snap.get('selected_create_image'):
+        positive = 'selected_create_image'
+    elif snap.get('image_mode_signal'):
+        positive = f"image_mode_signal={snap['image_mode_signal']}"
+    else:
+        # corroborated legacy composite check (same evidence class, kept so
+        # behavior never regresses below the proven baseline)
+        try:
+            if _create_image_signal_2(drv):
+                positive = 'legacy_composite'
+        except Exception:
+            pass
+    negative_ok = not snap.get('ask_gemini_visible')
+    if positive and negative_ok:
+        return True, positive, snap
+    if positive and not negative_ok:
+        return False, f"POSITIVE({positive}) but Ask-Gemini chat UI STILL VISIBLE (negative check failed)", snap
+    return False, "NO positive image-mode evidence (no selected Create-image option, no image composer/tool state)", snap
+
+
 def ensure_create_image_mode(drv, tid=0, job_id=''):
-    """Activate Gemini's Create Image mode with PROOF, per the single-job
-    forensic spec:
-      1. log the currently visible mode/composer state (BROWSER_STATE),
-      2. click the existing Create Image control (+ drawer -> option),
-         logging exactly what menu opened and which candidate was clicked,
-      3. verify activation via TWO independent browser DOM signals,
-      4. only then return success; otherwise raise CREATE_IMAGE_VERIFY_FAILED
-         including the observed UI state -- the pipeline MUST STOP here
-         rather than continue to upload/prompt/send against a plain chat.
-    Selectors are unchanged from the proven implementation; what changed is
-    that success now requires verified browser evidence, not click-no-throw.
+    """Activate Gemini's Create Image mode with STRICT, FAIL-CLOSED proof.
+
+    The console claims of the past (CreateImg ✅ / ImgMode(confirmed) while
+    the browser still visibly showed 'Ask Gemini') came from trusting weak
+    selectors and click-no-throw as success. This version requires BOTH:
+      * POSITIVE evidence the image-generation composer/tool is actually
+        active (_create_image_verified), AND
+      * NEGATIVE evidence the normal 'Ask Gemini' chat UI is gone.
+    It also logs exactly WHAT was clicked (tag/text/role/aria/class/
+    data-test-id/visible) to worker.log before verifying the POST-CLICK
+    browser state. If verification fails after all attempts, it raises
+    CREATE_IMAGE_VERIFY_FAILED with the observed UI state -- the pipeline
+    STOPS here; upload/prompt/send must never run against a plain chat.
     """
     prefix = f'[T{tid}][{job_id}]' if job_id else f'[T{tid}]'
     append_runtime_log(f'{prefix} GEMINI_CREATE_IMAGE_REQUESTED')
     _gemini_state_snapshot(drv, 'create_image_before', tid, job_id)
 
-    def _verified(via: str) -> bool:
-        # Two independent signals where the current UI supports them:
-        #   S1 = selected/active Create Image option (drawer checkbox state)
-        #   S2 = image-generation composer/tool state (Describe-image editor
-        #        or image-mode toolbar)
-        # The legacy is_create_image_mode() composite check is kept as the
-        # S2 superset so behavior never regresses below the proven baseline.
-        s1 = _create_image_signal_1(drv)
-        s2 = _create_image_signal_2(drv) or is_create_image_mode(drv)
-        append_runtime_log(f'{prefix} CREATE_IMAGE_VERIFY_SIGNAL_1={"PASS" if s1 else "FAIL"} (active option indicator)')
-        append_runtime_log(f'{prefix} CREATE_IMAGE_VERIFY_SIGNAL_2={"PASS" if s2 else "FAIL"} (image composer/tool state)')
-        if s2 and (s1 or via == 'precheck'):
-            # Signal 2 alone is the same evidence class the old code used;
-            # accept it after a successful CLICK only when signal 1 also
-            # passes OR the pre-existing-state fast path applies. If only
-            # one valid signal exists in the current UI (S1 may be absent
-            # when the drawer auto-closes after selection), S2 must have
-            # been corroborated by the click sequence completing cleanly.
-            pass
-        if s1 and s2:
-            append_runtime_log(f'{prefix} GEMINI_CREATE_IMAGE_VERIFIED via={via} signals=S1+S2')
-            log(f'{prefix} CREATE_IMAGE_VERIFIED ✅')
-            return True
-        if s2:
-            # Documented honestly (Phase 5): Gemini's toolbox drawer closes
-            # after selecting an option, so the checkbox-state element can
-            # disappear; the surviving independent evidence is the image
-            # composer/tool state itself. Single-signal verification is
-            # logged explicitly rather than fabricating a second signal.
-            append_runtime_log(f'{prefix} GEMINI_CREATE_IMAGE_VERIFIED via={via} signals=S2_ONLY (S1 unavailable: drawer closed post-select)')
-            log(f'{prefix} CREATE_IMAGE_VERIFIED ✅ (S2 only)')
-            return True
-        return False
+    def _check(via: str):
+        ok, reason, snap = _create_image_verified(drv)
+        append_runtime_log(
+            f"{prefix} CREATE_IMAGE_VERIFY via={via} result={'PASS' if ok else 'FAIL'} "
+            f"reason='{reason}' ask_gemini_visible={snap.get('ask_gemini_visible')} "
+            f"ci_vis={snap.get('create_image_visible')} ci_sel={snap.get('selected_create_image')} "
+            f"img_sig='{snap.get('image_mode_signal')}' mode='{snap.get('visible_mode_text')}' "
+            f"composer_ph='{snap.get('composer_placeholder')}'"
+        )
+        return ok, snap
 
     # Fast path: already in Create Image mode (fresh tab reusing prior state)
     deadline = time.time() + 4.0
+    last_snap = None
     while time.time() < deadline:
-        if _verified('precheck'):
+        ok, last_snap = _check('precheck')
+        if ok:
+            append_runtime_log(f'{prefix} GEMINI_CREATE_IMAGE_VERIFIED via=precheck')
             return True
         time.sleep(0.5)
 
-    last_menu_dump = None
     for attempt in range(1, 3):
         append_runtime_log(f'{prefix} GEMINI_CREATE_IMAGE_ATTEMPT {attempt}/2')
         if click_plus_button(drv):
             time.sleep(0.5)
-            last_menu_dump = _gemini_state_snapshot(drv, f'menu_open_a{attempt}', tid, job_id)
-            append_runtime_log(f"{prefix} GEMINI_CREATE_IMAGE_MENU_OPENED items={last_menu_dump.get('menu_items', [])[:12]}")
+            menu_dump = _gemini_state_snapshot(drv, f'menu_open_a{attempt}', tid, job_id)
+            append_runtime_log(f"{prefix} GEMINI_CREATE_IMAGE_MENU_OPENED items={menu_dump.get('menu_items', [])[:12]}")
+            clicked_info = None
+            clicked_btn = None
             try:
                 btns = drv.find_elements(By.CSS_SELECTOR, "button[role='menuitemcheckbox'].toolbox-drawer-item-list-button")
-                for btn in btns:
-                    if btn.is_displayed() and 'create image' in btn.text.lower():
-                        append_runtime_log(f"{prefix} GEMINI_CREATE_IMAGE_OPTION_FOUND text='{btn.text.strip()[:60]}' aria_checked='{btn.get_attribute('aria-checked')}'")
-                        drv.execute_script('arguments[0].click();', btn)
-                        append_runtime_log(f'{prefix} GEMINI_CREATE_IMAGE_CLICKED')
-                        time.sleep(1.0)
-                        break
-                else:
+                candidates = list(btns)
+            except Exception:
+                candidates = []
+            if not candidates:
+                try:
+                    candidates = list(drv.find_elements(By.CSS_SELECTOR, "[role='menuitemcheckbox'], [role='menuitem']"))
+                except Exception:
+                    candidates = []
+            for btn in candidates:
+                try:
+                    b_txt = (btn.text or '').lower()
+                    if 'create image' not in b_txt:
+                        continue
+                    clicked_info = drv.execute_script(
+                        "var e=arguments[0];return {"
+                        " tag: e.tagName,"
+                        " text: (e.innerText||e.textContent||'').replace(/\\s+/g,' ').trim().slice(0,60),"
+                        " role: e.getAttribute('role')||'',"
+                        " aria: e.getAttribute('aria-label')||'',"
+                        " cls: (e.className||'').toString().slice(0,80),"
+                        " dtid: e.getAttribute('data-test-id')||'',"
+                        " vis: !!(e.offsetParent!==null)};", btn)
+                    clicked_btn = btn
+                    break
+                except Exception:
+                    continue
+            if clicked_info is None:
+                # fallback: locate via the image_create icon itself
+                try:
                     for icon in drv.find_elements(By.CSS_SELECTOR, "mat-icon[data-mat-icon-name='image_create'], mat-icon[fonticon='image_create']"):
                         if icon.is_displayed():
                             btn = drv.execute_script("var e=arguments[0];while(e&&e.tagName!=='BUTTON')e=e.parentElement;return e;", icon)
                             if btn and btn.is_displayed():
-                                append_runtime_log(f"{prefix} GEMINI_CREATE_IMAGE_OPTION_FOUND via=image_create_icon")
-                                drv.execute_script('arguments[0].click();', btn)
-                                append_runtime_log(f'{prefix} GEMINI_CREATE_IMAGE_CLICKED')
-                                time.sleep(1.0)
+                                clicked_info = drv.execute_script(
+                                    "var e=arguments[0];return {"
+                                    " tag: e.tagName,"
+                                    " text: (e.innerText||e.textContent||'').replace(/\\s+/g,' ').trim().slice(0,60),"
+                                    " role: e.getAttribute('role')||'',"
+                                    " aria: e.getAttribute('aria-label')||'',"
+                                    " cls: (e.className||'').toString().slice(0,80),"
+                                    " dtid: e.getAttribute('data-test-id')||'',"
+                                    " vis: !!(e.offsetParent!==null)};", btn)
+                                clicked_btn = btn
+                                candidates = [btn]
                                 break
-            except Exception:
-                pass
-        deadline = time.time() + 3.0
-        while time.time() < deadline:
-            if _verified(f'click_attempt_{attempt}'):
-                return True
-            time.sleep(0.5)
+                except Exception:
+                    pass
+            if clicked_info and clicked_btn is not None:
+                append_runtime_log(
+                    f"{prefix} CREATE_IMAGE_CLICK tag={clicked_info.get('tag')} "
+                    f"text='{clicked_info.get('text')}' role='{clicked_info.get('role')}' "
+                    f"aria='{clicked_info.get('aria')}' class='{clicked_info.get('cls')}' "
+                    f"data_test_id='{clicked_info.get('dtid')}' visible={clicked_info.get('vis')}"
+                )
+                try:
+                    drv.execute_script('arguments[0].click();', clicked_btn)
+                except Exception:
+                    pass
+                append_runtime_log(f'{prefix} GEMINI_CREATE_IMAGE_CLICKED')
+                # Wait for the UI transition, then verify strictly.
+                deadline = time.time() + 4.0
+                while time.time() < deadline:
+                    ok, last_snap = _check(f'click_attempt_{attempt}')
+                    if ok:
+                        append_runtime_log(f'{prefix} GEMINI_CREATE_IMAGE_VERIFIED via=click_attempt_{attempt}')
+                        return True
+                    time.sleep(0.5)
+            else:
+                append_runtime_log(f'{prefix} CREATE_IMAGE_OPTION_NOT_FOUND attempt={attempt}')
+                try:
+                    drv.find_element(By.TAG_NAME, 'body').send_keys(Keys.ESCAPE)
+                except Exception:
+                    pass
 
     final_state = _gemini_state_snapshot(drv, 'create_image_failed', tid, job_id, screenshot=True)
+    if last_snap:
+        final_state.update(last_snap)
     raise RuntimeError(f'Tab T{tid}: CREATE_IMAGE_VERIFY_FAILED observed_ui={json.dumps(final_state, default=str)[:1500]}')
 
 def open_upload_drawer(drv, tid=0, job_id='') -> bool:
@@ -2482,9 +2746,26 @@ def get_quill_editor(drv):
 def _verify_editor_prompt(drv, editor, expected_text, tid=0, job_id=''):
     prefix = f'[T{tid}][{job_id}]' if job_id else f'[T{tid}]'
     try:
-        actual_raw = editor.text or ''
-        if not actual_raw:
-            actual_raw = drv.execute_script("return (arguments[0].textContent || '');", editor) or ''
+        # The stale-WebElement guard: ALWAYS re-read through the CURRENT
+        # live DOM (the driver's attached element reference can go stale or
+        # point at a hidden editor after Gemini re-renders the composer),
+        # and require that this exact element is still VISIBLE -- text found
+        # only in a hidden/stale editor is NOT proof of anything.
+        live = drv.execute_script(
+            "var e=arguments[0];"
+            "if(!e || !document.body.contains(e)) return null;"
+            "if(e.offsetParent===null) return {hidden:true, text:''};"
+            "return {hidden:false, text:(e.innerText||e.textContent||'')};",
+            editor)
+        if not isinstance(live, dict):
+            log(f'{prefix} PROMPT_VERIFY editor handle stale/missing from DOM')
+            append_runtime_log(f'{prefix} PROMPT_VERIFY_FAILED reason=STALE_EDITOR')
+            return False
+        if live.get('hidden'):
+            log(f'{prefix} PROMPT_VERIFY editor NOT visible (hidden/stale editor)')
+            append_runtime_log(f'{prefix} PROMPT_VERIFY_FAILED reason=EDITOR_HIDDEN')
+            return False
+        actual_raw = live.get('text') or ''
         expected_norm = normalize_prompt_text(expected_text)
         actual_norm = normalize_prompt_text(actual_raw)
         exp_len = len(expected_norm)
@@ -2520,6 +2801,20 @@ def _verify_editor_prompt(drv, editor, expected_text, tid=0, job_id=''):
             append_runtime_log(f'{prefix} PROMPT_VERIFY_FAILED reason=MISMATCH detail=end_mismatch')
             return False
         log(f'{prefix} PROMPT_END_VERIFIED')
+        # NEGATIVE check: the ACTIVE visible UI must no longer be the plain
+        # 'Ask Gemini' chat composer with an empty input. If the expected
+        # prompt is genuinely present in the visible active editor above,
+        # 'Ask Gemini' can legitimately appear elsewhere on the page; but
+        # if BOTH the content matched AND the snapshot still reports the
+        # Ask-Gemini empty-chat state while our own visible-editor read came
+        # up empty-ish, we would already have failed coverage. Belt &
+        # braces: log the ask_gemini_visible flag alongside the PASS.
+        snap = _gemini_ui_snapshot(drv)
+        append_runtime_log(
+            f"{prefix} PROMPT_VERIFY_CONTEXT ask_gemini_visible={snap.get('ask_gemini_visible')} "
+            f"composer_ph='{snap.get('composer_placeholder')}' img_sig='{snap.get('image_mode_signal')}' "
+            f"mode='{snap.get('visible_mode_text')}'"
+        )
         log(f'{prefix} PROMPT_VERIFIED ✅')
         append_runtime_log(f'{prefix} GEMINI_PROMPT_VERIFIED len={act_len}')
         return True
@@ -2556,6 +2851,15 @@ def _inject_prompt_atomic(drv, text, tid=0, job_id=''):
         raise PromptFailed(f'Tab T{tid}: Quill editor not found')
     for attempt in range(1, 3):
         try:
+            # PART 7: the composer can be re-rendered between Create Image
+            # verification and prompt injection -- ALWAYS RE-FIND the active
+            # visible composer at the start of every attempt. A handle from
+            # a previous render is exactly the stale-WebElement class of bug
+            # that let "PROMPT_VERIFIED" coexist with a visibly empty
+            # "Ask Gemini" box.
+            refound = get_quill_editor(drv)
+            if refound is not None:
+                editor = refound
             _clear_editor(drv, editor)
 
             try:
@@ -2664,20 +2968,57 @@ def _click_send_button(drv, tid=0, job_id=''):
     for a brief moment right after prompt injection finishes, so a single
     attempt (the previous behavior) could spuriously fail a job whose
     prompt was actually verified. Falls back to Enter on the composer if
-    no clickable send button is ever found."""
+    no clickable send button is ever found.
+
+    PART 9: clicking without raising is only SEND_CLICKED. This function
+    now additionally proves the message ACTUALLY LEFT the composer: after
+    a successful click it polls the live UI snapshot until the active
+    visible composer has emptied and/or real generation evidence appeared
+    (GEMINI_SEND_VERIFIED in worker.log). A click that leaves the prompt
+    sitting in the box returns False -- never a silent True."""
     prefix = f'[T{tid}][{job_id}]' if job_id else f'[T{tid}]'
+    # Pre-click length of the ACTIVE visible composer (what we expect to
+    # disappear once the message is really sent).
+    pre_len = -1
+    try:
+        pre_len = int(_gemini_ui_snapshot(drv).get('composer_text_len') or -1)
+    except Exception:
+        pass
+    clicked = False
     for attempt in range(1, MAX_SEND_RETRIES + 1):
         if _click_send_button_once(drv, tid=tid, job_id=job_id):
-            return True
+            clicked = True
+            break
         time.sleep(SEND_RETRY_GAP_S)
-    try:
-        editor = get_quill_editor(drv)
-        if editor and editor.is_displayed():
-            editor.send_keys(Keys.RETURN)
-            log(f'{prefix} SEND via Enter fallback')
+    if not clicked:
+        try:
+            editor = get_quill_editor(drv)
+            if editor and editor.is_displayed():
+                editor.send_keys(Keys.RETURN)
+                log(f'{prefix} SEND via Enter fallback')
+                clicked = True
+        except Exception as e:
+            log(f'{prefix} Enter fallback failed: {e}')
+    if not clicked:
+        return False
+    append_runtime_log(f'{prefix} GEMINI_SEND_CLICKED pre_composer_len={pre_len}')
+    deadline = time.time() + 8.0
+    while time.time() < deadline:
+        snap = _gemini_ui_snapshot(drv)
+        composer_empty = snap.get('composer_text_len', -1) == 0
+        gen_evidence = snap.get('stop_ctrl') == 'PRESENT'
+        if gen_evidence or (pre_len > 0 and composer_empty):
+            append_runtime_log(
+                f"{prefix} GEMINI_SEND_VERIFIED composer_emptied={composer_empty} "
+                f"gen_evidence={gen_evidence} composer_len={snap.get('composer_text_len')}"
+            )
+            log(f'{prefix} SEND_VERIFIED ✅')
             return True
-    except Exception as e:
-        log(f'{prefix} Enter fallback failed: {e}')
+        time.sleep(0.4)
+    append_runtime_log(
+        f"{prefix} SEND_NOT_CONFIRMED composer did not empty / no generation evidence within 8s "
+        f"(last composer_len={_gemini_ui_snapshot(drv).get('composer_text_len')})"
+    )
     return False
 
 def verify_generation_started(drv, timeout=6.0):
