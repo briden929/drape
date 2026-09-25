@@ -848,9 +848,15 @@ def create_chrome_driver():
     opts.add_argument('--disable-features=IdentityConsistencyBrowserUI,SyncPromoUI')
     opts.add_argument('--disable-features=IsolateOrigins,site-per-process')
     opts.add_argument('--disable-site-isolation-trials')
+    opts.add_argument('--disable-notifications')
     opts.add_experimental_option('excludeSwitches', ['enable-automation'])
     opts.add_experimental_option('useAutomationExtension', False)
-    prefs = {'download.default_directory': str(CHROME_DL_BASE), 'download.prompt_for_download': False, 'download.directory_upgrade': True, 'safebrowsing.enabled': False, 'safebrowsing.disable_download_protection': True, 'profile.default_content_setting_values.automatic_downloads': 1}
+    # profile.default_content_setting_values.notifications=2 blocks the
+    # "gemini.google.com wants to Show notifications" permission popup --
+    # it can sit on top of and occlude the composer's + button, which is a
+    # plausible cause of some of the "file input not found"/click-target
+    # failures seen in production.
+    prefs = {'download.default_directory': str(CHROME_DL_BASE), 'download.prompt_for_download': False, 'download.directory_upgrade': True, 'safebrowsing.enabled': False, 'safebrowsing.disable_download_protection': True, 'profile.default_content_setting_values.automatic_downloads': 1, 'profile.default_content_setting_values.notifications': 2}
     opts.add_experimental_option('prefs', prefs)
     drv = webdriver.Chrome(options=opts)
     try:
@@ -1939,13 +1945,8 @@ def click_upload_files_in_drawer(drv):
         pass
     return False
 
-def find_file_input_strict(drv, tid=0, job_id=''):
-    """
-    Finds the file input element. Raises FileInputMissing if not found.
-    Never silently continues.
-    """
-    prefix = f'[T{tid}][{job_id}]' if job_id else f'[T{tid}]'
-    deadline = time.time() + 4.0
+def _poll_for_file_input(drv, timeout: float):
+    deadline = time.time() + timeout
     while time.time() < deadline:
         try:
             drv.execute_script('\n                document.querySelectorAll(\'input[type="file"]\').forEach(function(el){\n                    el.style.cssText=\'display:block!important;opacity:1!important;position:fixed!important;top:0;left:0;z-index:99999;width:200px;height:50px;\';\n                    el.removeAttribute(\'hidden\'); el.removeAttribute(\'disabled\');\n                });\n            ')
@@ -1955,7 +1956,42 @@ def find_file_input_strict(drv, tid=0, job_id=''):
         if inputs:
             return inputs[0]
         time.sleep(0.3)
-    raise FileInputMissing(f'Tab T{tid}: file input not found after Create Image mode was verified (4s wait)')
+    return None
+
+def find_file_input_strict(drv, tid=0, job_id=''):
+    """
+    Finds the file input element. Raises FileInputMissing if not found.
+
+    The file input only exists in the DOM once the upload drawer is open
+    (+ button -> "Upload files") -- it is not a persistent hidden element.
+    open_upload_drawer()/click_upload_files_in_drawer() open it, but were
+    never actually wired into this path (dead code -- defined, never
+    called), so this used to just poll raw DOM for 4s and give up even
+    though nothing had ever asked the drawer to open. It now opens the
+    drawer itself before polling, and retries the whole open+poll sequence
+    up to 3 times before raising.
+    """
+    prefix = f'[T{tid}][{job_id}]' if job_id else f'[T{tid}]'
+    fi = _poll_for_file_input(drv, timeout=1.5)
+    if fi:
+        return fi
+    for attempt in range(1, 4):
+        if not open_upload_drawer(drv, tid, job_id):
+            log(f'{prefix} FILE_INPUT_RETRY (attempt {attempt}/3): could not open + drawer')
+            time.sleep(0.5)
+            continue
+        if not click_upload_files_in_drawer(drv):
+            log(f'{prefix} FILE_INPUT_RETRY (attempt {attempt}/3): "Upload files" not found in drawer')
+            try:
+                drv.find_element(By.TAG_NAME, 'body').send_keys(Keys.ESCAPE)
+            except Exception:
+                pass
+            time.sleep(0.5)
+            continue
+        fi = _poll_for_file_input(drv, timeout=3.0)
+        if fi:
+            return fi
+    raise FileInputMissing(f'Tab T{tid}: file input not found after {3} drawer-open attempts')
 
 def upload_reference_files(drv, abs_paths: list, tid=0, job_id='') -> bool:
     """Send file paths to the file input. Returns True on success."""
@@ -2744,24 +2780,24 @@ def _recover_gemini_resource(resource_id: str) -> bool:
     tid_int = int(resource_id.replace('T', ''))
     with CHROME_DRIVER_LOCK:
         try:
-            if worker.handle and worker.handle in chrome_driver.window_handles:
-                try:
-                    chrome_driver.switch_to.window(worker.handle)
-                    chrome_driver.close()
-                except Exception:
-                    pass
-            worker.handle = None
-            worker.driver = None
-
-            # If EVERY tab recovers as "target window already closed" at once
-            # (T0-T3 all failing in the same health-check pass), the shared
-            # chrome_driver's browser process itself has died -- retrying tab
-            # creation on a dead session fails forever. Detect that and
-            # relaunch the whole browser once; the other 3 slots' own
-            # recovery passes then just create a tab on the fresh browser.
+            # Check whether the shared browser PROCESS itself is still alive
+            # BEFORE touching worker.handle -- `worker.handle in
+            # chrome_driver.window_handles` below also calls
+            # chrome_driver.window_handles, so if that call is what's
+            # actually raising "target window already closed" (whole
+            # process dead, not just this tab), checking it only AFTER that
+            # line -- as a prior version of this function did -- means the
+            # exception fires right there and jumps straight to the outer
+            # except below, and this relaunch code never runs at all. That
+            # was the real bug behind the identical stack trace repeating
+            # forever on every recovery attempt.
+            browser_alive = True
             try:
                 _ = chrome_driver.window_handles
             except Exception:
+                browser_alive = False
+
+            if not browser_alive:
                 log(f"[GEMINI BROKER] {resource_id} SHARED CHROME PROCESS IS DEAD -- relaunching browser")
                 try:
                     chrome_driver.quit()
@@ -2772,6 +2808,15 @@ def _recover_gemini_resource(resource_id: str) -> bool:
                 for w in GEMINI_WORKERS.values():
                     w.handle = None
                     w.driver = None
+            elif worker.handle and worker.handle in chrome_driver.window_handles:
+                try:
+                    chrome_driver.switch_to.window(worker.handle)
+                    chrome_driver.close()
+                except Exception:
+                    pass
+
+            worker.handle = None
+            worker.driver = None
 
             new_handle = _create_gemini_tab(tid_int)
             chrome_driver.switch_to.window(new_handle)
@@ -3480,8 +3525,11 @@ def _resource_label(state_value: str) -> str:
 async def worker_heartbeat_loop():
     RUNTIME_HEALTH["heartbeat"] = True
     start_time = time.time()
+    tick = 0
+    last_summary_key = None
 
     while True:
+        tick += 1
         try:
             uptime = time.time() - start_time
             hours, rem = divmod(uptime, 3600)
@@ -3500,6 +3548,31 @@ async def worker_heartbeat_loop():
             raw_downloads = sum(1 for r in DOWNLOAD_REGISTRY.values() if r.resource_type == "gemini")
             clean_downloads = sum(1 for r in DOWNLOAD_REGISTRY.values() if r.resource_type == "wmr")
             active_jobs = sum(1 for j in JOB_CONTEXTS.values() if j.state not in (JobState.COMPLETED, JobState.FAILED))
+
+            # Compact single-line status, always printed -- this is what
+            # you see on every idle tick. The full multi-line block below
+            # only prints when something is actually happening (active
+            # jobs, or a resource state changed) or every 6th tick (~60s)
+            # as a periodic full snapshot, instead of the old behavior of
+            # printing the whole ~25-line block unconditionally every 10s.
+            gemini_busy = sum(1 for r in gemini_states.values() if r.get("state") == ResourceState.BUSY.value)
+            wmr_busy = sum(1 for r in wmr_states.values() if r.get("state") == ResourceState.BUSY.value)
+            summary_key = (
+                LAST_QUEUE_COUNTS.get("waiting"), LAST_QUEUE_COUNTS.get("active"),
+                gemini_busy, wmr_busy, active_jobs,
+            )
+            print(
+                f"[HEARTBEAT] {uptime_str} | Q waiting={LAST_QUEUE_COUNTS.get('waiting', 'n/a')} "
+                f"active={LAST_QUEUE_COUNTS.get('active', 'n/a')} | Gemini {gemini_busy}/4 BUSY | "
+                f"WMR {wmr_busy}/8 BUSY | jobs={active_jobs}",
+                flush=True,
+            )
+
+            full_snapshot_due = (tick % 6 == 0) or (summary_key != last_summary_key) or active_jobs > 0
+            last_summary_key = summary_key
+            if not full_snapshot_due:
+                await asyncio.sleep(10)
+                continue
 
             def _print_resource_line(rid, rec):
                 label = _resource_label(rec.get("state", "DEAD")) if rec else "DEAD"
