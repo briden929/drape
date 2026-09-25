@@ -2016,15 +2016,6 @@ def is_create_image_mode(drv):
         return False
     except Exception:
         return False
-        signals = ["mat-icon[data-mat-icon-name='image_create']", "mat-icon[fonticon='image_create']", "button[aria-label*='Aspect ratio']", "//span[contains(text(), 'Aspect ratio')]", "//button[contains(., 'Images')]"]
-        for sig in signals:
-            by = By.XPATH if sig.startswith('//') else By.CSS_SELECTOR
-            for el in drv.find_elements(by, sig):
-                if el.is_displayed():
-                    return True
-        return len(editors) > 0
-    except Exception:
-        return False
 
 def ensure_create_image_mode(drv, tid=0, job_id=''):
     prefix = f'[T{tid}][{job_id}]' if job_id else f'[T{tid}]'
@@ -2302,12 +2293,26 @@ def _verify_editor_prompt(drv, editor, expected_text, tid=0, job_id=''):
         log(f'{prefix} Prompt verification error: {e}')
         return False
 
+def _clear_editor(drv, editor):
+    drv.execute_script('arguments[0].focus();', editor)
+    time.sleep(0.1)
+    ActionChains(drv).click(editor).key_down(Keys.CONTROL).send_keys('a').key_up(Keys.CONTROL).perform()
+    time.sleep(0.05)
+    ActionChains(drv).send_keys(Keys.DELETE).perform()
+    drv.execute_script("document.execCommand('selectAll',false,null);document.execCommand('delete',false,null);")
+    time.sleep(0.1)
+
+
 def _inject_prompt_atomic(drv, text, tid=0, job_id=''):
     """
-    Inject full prompt in ONE atomic operation.
-    Primary: Chrome CDP Input.insertText
-    Fallback: single xclip Ctrl+V
-    No chunked/loop typing ever.
+    Inject the prompt via a tiered fallback chain, verifying actual editor
+    content after EVERY tier -- a CDP call returning without raising is not
+    proof the Quill editor's content actually changed, so each tier is
+    tried in turn until _verify_editor_prompt() confirms real content,
+    never assumed from a tier's return/no-exception alone.
+      1. CDP Input.insertText
+      2. xclip clipboard + Ctrl+V
+      3. direct send_keys onto the focused editor
     """
     prefix = f'[T{tid}][{job_id}]' if job_id else f'[T{tid}]'
     editor = get_quill_editor(drv)
@@ -2315,44 +2320,53 @@ def _inject_prompt_atomic(drv, text, tid=0, job_id=''):
         raise PromptFailed(f'Tab T{tid}: Quill editor not found')
     for attempt in range(1, 3):
         try:
-            drv.execute_script('arguments[0].focus();', editor)
-            time.sleep(0.1)
-            ActionChains(drv).click(editor).key_down(Keys.CONTROL).send_keys('a').key_up(Keys.CONTROL).perform()
-            time.sleep(0.05)
-            ActionChains(drv).send_keys(Keys.DELETE).perform()
-            drv.execute_script("document.execCommand('selectAll',false,null);document.execCommand('delete',false,null);")
-            time.sleep(0.1)
-            cdp_ok = False
+            _clear_editor(drv, editor)
+
             try:
                 drv.execute_cdp_cmd('Input.insertText', {'text': text})
-                cdp_ok = True
                 log(f'{prefix} PROMPT_INJECTING via CDP')
             except Exception as cdp_err:
-                log(f'{prefix} CDP notice ({cdp_err}), trying xclip fallback...')
-            if not cdp_ok:
-                if _set_clipboard_xclip(text):
-                    drv.execute_script('arguments[0].focus();', editor)
-                    ActionChains(drv).click(editor).key_down(Keys.CONTROL).send_keys('v').key_up(Keys.CONTROL).perform()
-                    log(f'{prefix} PROMPT_INJECTING via xclip Ctrl+V')
-                else:
-                    log(f'{prefix} xclip failed', file=sys.stderr)
+                log(f'{prefix} CDP notice ({cdp_err})')
             time.sleep(0.3)
             if _verify_editor_prompt(drv, editor, text, tid=tid, job_id=job_id):
                 return True
+            log(f'{prefix} CDP insertText did not verify -- trying xclip fallback')
+
+            _clear_editor(drv, editor)
+            if _set_clipboard_xclip(text):
+                drv.execute_script('arguments[0].focus();', editor)
+                ActionChains(drv).click(editor).key_down(Keys.CONTROL).send_keys('v').key_up(Keys.CONTROL).perform()
+                log(f'{prefix} PROMPT_INJECTING via xclip Ctrl+V')
             else:
-                log(f'{prefix} PROMPT_VERIFY_FAIL attempt {attempt} — clearing and retrying')
-                drv.execute_script("arguments[0].focus();document.execCommand('selectAll',false,null);document.execCommand('delete',false,null);", editor)
-                time.sleep(0.3)
+                log(f'{prefix} xclip failed', file=sys.stderr)
+            time.sleep(0.3)
+            if _verify_editor_prompt(drv, editor, text, tid=tid, job_id=job_id):
+                return True
+            log(f'{prefix} xclip paste did not verify -- trying direct send_keys fallback')
+
+            _clear_editor(drv, editor)
+            try:
+                for chunk_start in range(0, len(text), 500):
+                    editor.send_keys(text[chunk_start:chunk_start + 500])
+                    time.sleep(0.03)
+                log(f'{prefix} PROMPT_INJECTING via send_keys chunks')
+            except Exception as sk_err:
+                log(f'{prefix} send_keys fallback error: {sk_err}')
+            time.sleep(0.3)
+            if _verify_editor_prompt(drv, editor, text, tid=tid, job_id=job_id):
+                return True
+
+            log(f'{prefix} PROMPT_VERIFY_FAIL attempt {attempt} (all 3 tiers) — retrying')
         except PromptFailed:
             raise
         except Exception as e:
             log(f'{prefix} Prompt injection exception (attempt {attempt}): {e}')
             try:
-                drv.execute_script("arguments[0].focus();document.execCommand('selectAll',false,null);document.execCommand('delete',false,null);", editor)
+                _clear_editor(drv, editor)
             except Exception:
                 pass
             time.sleep(0.3)
-    raise PromptFailed(f'Tab T{tid}: Prompt injection failed after 2 atomic attempts')
+    raise PromptFailed(f'Tab T{tid}: Prompt injection failed after 2 attempts (CDP/xclip/send_keys all unverified)')
 
 def _log_click_rect_and_occlusion(drv, element, label, prefix=''):
     """Logs the element's viewport rect before a critical click, and whether
@@ -2379,7 +2393,7 @@ def _log_click_rect_and_occlusion(drv, element, label, prefix=''):
     except Exception:
         return True
 
-def _click_send_button(drv, tid=0, job_id=''):
+def _click_send_button_once(drv, tid=0, job_id=''):
     prefix = f'[T{tid}][{job_id}]' if job_id else f'[T{tid}]'
     try:
         candidates = drv.execute_script('\n            var sels = [\'mat-icon[fonticon="arrow_upward"]\', \'mat-icon[data-mat-icon-name="arrow_upward"]\',\n                        \'mat-icon[fonticon="send"]\', \'button[aria-label="Send message"]\'];\n            var res = [];\n            for (var s = 0; s < sels.length; s++) {\n                var els = document.querySelectorAll(sels[s]);\n                for (var i = 0; i < els.length; i++) {\n                    var b = els[i].tagName === \'BUTTON\' ? els[i] : els[i].closest(\'button\');\n                    if (b && !b.disabled && b.offsetParent !== null) res.push(b);\n                }\n            } return res;\n        ') or []
@@ -2399,6 +2413,32 @@ def _click_send_button(drv, tid=0, job_id=''):
                     return True
         except Exception:
             continue
+    return False
+
+
+MAX_SEND_RETRIES = 6
+SEND_RETRY_GAP_S = 0.3
+
+
+def _click_send_button(drv, tid=0, job_id=''):
+    """Retries the send-button click -- the button can still be disabled
+    for a brief moment right after prompt injection finishes, so a single
+    attempt (the previous behavior) could spuriously fail a job whose
+    prompt was actually verified. Falls back to Enter on the composer if
+    no clickable send button is ever found."""
+    prefix = f'[T{tid}][{job_id}]' if job_id else f'[T{tid}]'
+    for attempt in range(1, MAX_SEND_RETRIES + 1):
+        if _click_send_button_once(drv, tid=tid, job_id=job_id):
+            return True
+        time.sleep(SEND_RETRY_GAP_S)
+    try:
+        editor = get_quill_editor(drv)
+        if editor and editor.is_displayed():
+            editor.send_keys(Keys.RETURN)
+            log(f'{prefix} SEND via Enter fallback')
+            return True
+    except Exception as e:
+        log(f'{prefix} Enter fallback failed: {e}')
     return False
 
 def verify_generation_started(drv, timeout=6.0):
@@ -2513,24 +2553,50 @@ def nb_check_image(drv, urls_before, chat_urls):
             return ('TIMEOUT', None)
     return ('WAITING', None)
 
-def _hover_and_dl_single_click(drv, urls_before, chat_urls) -> bool:
+def _hover_and_dl_single_click_once(drv, urls_before, chat_urls) -> bool:
     """
     Primary download method: hover over the generated image, click Download button.
     Returns True if download button was clicked.
     """
 
+    def _find_and_click_dl_btn():
+        for sel in ["button[data-test-id='download-generated-image-button']", "//mat-icon[@data-mat-icon-name='download']/ancestor::button", "//mat-icon[@fonticon='download']/ancestor::button", "button[aria-label*='Download']"]:
+            by = By.XPATH if sel.startswith('//') else By.CSS_SELECTOR
+            for btn in reversed(drv.find_elements(by, sel)):
+                if btn.is_displayed() and btn.is_enabled():
+                    drv.execute_script('arguments[0].click();', btn)
+                    return True
+        return False
+
     def _try_hover(img):
         try:
-            drv.execute_script("arguments[0].scrollIntoView({block:'center',behavior:'instant'});", img)
-            time.sleep(0.15)
-            ActionChains(drv).move_to_element(img).perform()
-            time.sleep(0.2)
-            for sel in ["button[data-test-id='download-generated-image-button']", "//mat-icon[@data-mat-icon-name='download']/ancestor::button", "//mat-icon[@fonticon='download']/ancestor::button", "button[aria-label*='Download']"]:
-                by = By.XPATH if sel.startswith('//') else By.CSS_SELECTOR
-                for btn in reversed(drv.find_elements(by, sel)):
-                    if btn.is_displayed() and btn.is_enabled():
-                        drv.execute_script('arguments[0].click();', btn)
-                        return True
+            drv.execute_script("arguments[0].scrollIntoView({block:'center',behavior:'smooth'});", img)
+            time.sleep(0.4)
+            try:
+                ActionChains(drv).move_to_element(img).perform()
+                time.sleep(0.5)
+                if _find_and_click_dl_btn():
+                    return True
+            except Exception:
+                pass
+            # Real ActionChains hover can miss Gemini's hover-triggered download
+            # button (proven behavior from the older browser implementation) --
+            # dispatch synthetic mouse events as a second attempt before giving
+            # up on this image.
+            try:
+                drv.execute_script(
+                    "var el=arguments[0];"
+                    "['mouseenter','mouseover','mousemove'].forEach(function(evt){"
+                    "el.dispatchEvent(new MouseEvent(evt,{bubbles:true,cancelable:true,view:window,"
+                    "clientX:el.getBoundingClientRect().left+el.offsetWidth/2,"
+                    "clientY:el.getBoundingClientRect().top+el.offsetHeight/2}));});",
+                    img,
+                )
+                time.sleep(0.5)
+                if _find_and_click_dl_btn():
+                    return True
+            except Exception:
+                pass
         except Exception:
             pass
         return False
@@ -2559,6 +2625,24 @@ def _hover_and_dl_single_click(drv, urls_before, chat_urls) -> bool:
             return True
     except Exception:
         pass
+    return False
+
+
+DOWNLOAD_BUTTON_RETRIES = 3
+DOWNLOAD_BUTTON_RETRY_GAP_S = 0.5
+
+
+def _hover_and_dl_single_click(drv, urls_before, chat_urls, prefix='') -> bool:
+    """Retries the hover+click download attempt -- Gemini's download button
+    is hover-triggered and can take a moment to render, so a single pass
+    (the previous behavior, whose return value the caller didn't even
+    check) could miss it even though the image was ready."""
+    for attempt in range(1, DOWNLOAD_BUTTON_RETRIES + 1):
+        if _hover_and_dl_single_click_once(drv, urls_before, chat_urls):
+            return True
+        log(f'{prefix} DOWNLOAD_BUTTON_NOT_FOUND attempt {attempt}/{DOWNLOAD_BUTTON_RETRIES}')
+        if attempt < DOWNLOAD_BUTTON_RETRIES:
+            time.sleep(DOWNLOAD_BUTTON_RETRY_GAP_S)
     return False
 
 def _direct_fetch_cdp(drv, save_path, urls_before) -> bool:
@@ -3225,7 +3309,9 @@ class GeminiWorker:
             # Phase 3: download click + start detection -- short lock again.
             with CHROME_DRIVER_LOCK:
                 chrome_driver.switch_to.window(self.handle)
-                _hover_and_dl_single_click(self.driver, urls_before, chat_urls)
+                clicked = _hover_and_dl_single_click(self.driver, urls_before, chat_urls, prefix=prefix)
+                if not clicked:
+                    raise RuntimeError("DOWNLOAD_BUTTON_NOT_FOUND")
                 append_runtime_log(f"{prefix} DOWNLOAD CLICKED")
 
                 expected_png = f"{ctx.job_id}.png"
@@ -3338,11 +3424,29 @@ class WmrDriverThread(threading.Thread):
                     file_input.send_keys(str(Path(ctx.raw_path).resolve()))
 
                     append_runtime_log(f"{prefix} PROCESSING")
-                    try: _wmr_check_status(self.driver)
-                    except Exception: pass
+                    # Previously this called _wmr_check_status() exactly once and
+                    # discarded the result -- meaning WMR processing status was
+                    # never actually awaited before attempting the download click.
+                    # Poll until the page reports DONE (or a terminal failure).
+                    deadline = time.time() + WMR_TIMEOUT_S
+                    wmr_status = "LOADING"
+                    while time.time() < deadline:
+                        try:
+                            wmr_status = _wmr_check_status(self.driver)
+                        except Exception as status_err:
+                            wmr_status = "ERROR"
+                            append_runtime_log(f"{prefix} STATUS_CHECK_ERROR: {status_err}")
+                        if wmr_status in ("DONE", "NOT_FOUND"):
+                            break
+                        time.sleep(0.5)
+                    if wmr_status == "NOT_FOUND":
+                        raise RuntimeError("WMR_WATERMARK_NOT_DETECTED")
+                    if wmr_status not in ("DONE",):
+                        raise RuntimeError(f"WMR_PROCESSING_TIMEOUT (last status={wmr_status})")
 
-                    try: _wmr_click_download(self.driver)
-                    except Exception: _wmr_click_download(self.driver, attempts=6)
+                    clicked = _wmr_click_download(self.driver, attempts=6)
+                    if not clicked:
+                        raise RuntimeError("WMR_DOWNLOAD_BUTTON_NOT_FOUND")
                     append_runtime_log(f"{prefix} DOWNLOAD CLICKED")
 
                     expected_png = f"{ctx.job_id}_clean.png"
