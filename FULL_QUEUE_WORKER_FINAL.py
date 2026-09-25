@@ -414,6 +414,71 @@ REDIS_URL = os.environ.get('REDIS_URL')
 # starve the resource brokers of anything to actually parallelize.
 BULLMQ_CONCURRENCY = int(os.environ.get('BULLMQ_CONCURRENCY', '8'))
 
+# ---------------------------------------------------------------------------
+# BOUNDED LOCAL ADMISSION + HTTP CONNECTION-POOL HARDENING
+# ---------------------------------------------------------------------------
+# MAX_GEMINI_PENDING: at most this many BullMQ jobs may sit PAST the local
+# admission gate (doing ref-resolution / browser work) at once. Derived from
+# real capacity -- 4 Gemini tabs x 2 -- NOT from BullMQ's callback width, so
+# an 8-job burst can no longer trigger 8 parallel expensive reference
+# resolutions for work that cannot reach Gemini yet. The rest wait inside
+# execute_pipeline and are displayed as LOCAL-Qn (Redis still truthfully
+# reports them ACTIVE -- official BullMQ semantics are never redefined).
+MAX_GEMINI_PENDING = int(os.environ.get('MAX_GEMINI_PENDING', str(4 * 2)))
+# Created lazily INSIDE the running event loop (execute_pipeline) via
+# _get_admission_semaphore() -- a module-level asyncio.Semaphore would bind
+# to whichever loop existed at import time in Colab.
+_ADMISSION_SEMAPHORE_HOLDER: Dict[str, Any] = {}
+
+def _get_admission_semaphore() -> "asyncio.Semaphore":
+    sem = _ADMISSION_SEMAPHORE_HOLDER.get('sem')
+    if sem is None:
+        sem = asyncio.Semaphore(MAX_GEMINI_PENDING)
+        _ADMISSION_SEMAPHORE_HOLDER['sem'] = sem
+    return sem
+
+# urllib3 "Connection pool is full, discarding connection: localhost.
+# Connection pool size: 1" ROOT CAUSE: selenium's webdriver-command transport
+# is urllib3 behind the scenes; every ChromeDriver session ships a pool of
+# size 1, and T0-T3 tab workers + the recovery threads + queue polling issue
+# concurrent commands against the SAME shared localhost chromedriver HTTP
+# endpoints. The fix below raises those pools to cover the real command
+# concurrency (no warning suppression -- the pool genuinely fits now).
+_HTTP_POOL_SIZE = max(BULLMQ_CONCURRENCY + 8, 16)
+
+def _patched_pool_init(self, *args, **kwargs):
+    try:
+        kwargs.setdefault('maxsize', _HTTP_POOL_SIZE)
+        kwargs.setdefault('block', False)
+    except Exception:
+        pass
+    return self._orig_init(*args, **kwargs)
+
+try:
+    import urllib3.connectionpool as _u3cp
+    if not hasattr(_u3cp.HTTPConnectionPool, '_orig_init'):
+        _u3cp.HTTPConnectionPool._orig_init = _u3cp.HTTPConnectionPool.__init__
+        _u3cp.HTTPConnectionPool.__init__ = _patched_pool_init
+except Exception as _u3_patch_err:  # urllib3 absent/renamed -- non-fatal
+    print(f'[NET] urllib3 pool patch skipped: {_u3_patch_err}', flush=True)
+
+# Shared requests.Session with an adapter sized for the actual concurrent
+# consumers (Selenium sessions + API calls), so nobody ever gets a size-1
+# default pool while others run in parallel.
+_SHARED_HTTP_SESSION = None
+
+def get_shared_http_session():
+    global _SHARED_HTTP_SESSION
+    if _SHARED_HTTP_SESSION is None:
+        import requests as _rq
+        from requests.adapters import HTTPAdapter as _HA
+        s = _rq.Session()
+        ad = _HA(pool_connections=8, pool_maxsize=_HTTP_POOL_SIZE, pool_block=False)
+        s.mount('http://', ad)
+        s.mount('https://', ad)
+        _SHARED_HTTP_SESSION = s
+    return _SHARED_HTTP_SESSION
+
 def build_redis_connection_opts(redis_url: str) -> dict:
     """Canonical redis-py connection kwargs for a REDIS_URL, used by every
     BullMQ Worker/Queue instantiation in this file (queue monitor, startup
@@ -1191,6 +1256,8 @@ def create_chrome_driver():
     # detection regardless of Chrome's actual download behavior.
     opts.set_capability('goog:loggingPrefs', {'performance': 'ALL'})
     drv = webdriver.Chrome(options=opts)
+    _widen_driver_connection_pool(drv)
+    _start_perf_collector(drv)
     try:
         drv.execute_cdp_cmd('Network.enable', {})
     except Exception:
@@ -2853,6 +2920,113 @@ def get_quill_editor(drv):
             pass
     return None
 
+
+# ---------------------------------------------------------------------------
+# ACTIVE-COMPOSER DISCOVERY (prompt-injection root-cause fix)
+# The old chain called CDP Input.insertText WITHOUT ever proving the Gemini
+# composer owned keyboard focus -- CDP routes insertText to whatever element
+# currently has focus, so with attachments present / draft chats rendered /
+# drawers open, the text could go nowhere (or into a hidden editor) while
+# tier-level prints still claimed success. get_active_gemini_composer() +
+# _focus_active_composer() close exactly that hole: injection is now gated
+# on document.activeElement === composer, verified AFTER the click/focus.
+# ---------------------------------------------------------------------------
+
+_ACTIVE_COMPOSOR_JS = r"""
+var phImage = arguments.length > 0 ? String(arguments[0]) : '';
+function vis(el){ return !!(el && el.offsetParent !== null); }
+function rectOf(el){ var r = el.getBoundingClientRect(); return {x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height)}; }
+function describe(el, why){
+  var r = el.getBoundingClientRect();
+  return {
+    tag: el.tagName,
+    cls: (typeof el.className === 'string' ? el.className : '') .slice(0, 120),
+    placeholder: el.getAttribute('data-placeholder') || '',
+    aria: el.getAttribute('aria-label') || '',
+    ce: el.getAttribute('contenteditable') || '',
+    rect: {x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height)},
+    visible: vis(el),
+    isActive: document.activeElement === el,
+    reason: why
+  };
+}
+var eds = Array.prototype.slice.call(document.querySelectorAll('div.ql-editor'));
+var v = eds.filter(vis);
+if (!v.length) return {found:false, why:'NO_VISIBLE_QL_EDITOR', total: eds.length};
+// Prefer the IMAGE-mode composer when its placeholder is known from the UI
+// snapshot ('Describe your image'); fall back to any visible editable one.
+function pick(list){
+  for (var i = list.length - 1; i >= 0; i--) {
+    var e = list[i];
+    var ph = (e.getAttribute('data-placeholder') || '').toLowerCase();
+    if (phImage && ph.indexOf(phImage) !== -1) return e;
+  }
+  return null;
+}
+var chosen = null;
+if (phImage) chosen = pick(v);
+if (!chosen) { for (var j = v.length - 1; j >= 0; j--) { if ((v[j].getAttribute('contenteditable') || '').toLowerCase() === 'true') { chosen = v[j]; break; } } }
+if (!chosen) chosen = v[v.length - 1];
+return {found:true, count: v.length, el: chosen, info: describe(chosen, chosen === pick(v) ? 'image_placeholder_match' : 'last_visible_editable')};
+"""
+
+def get_active_gemini_composer(drv, tid=0, job_id='', timeout=6.0):
+    """Locate the CURRENTLY VISIBLE, EDITABLE Gemini composer (preferring
+    the image-generation placeholder seen in the live UI snapshot). Returns
+    (element_or_None, diagnostic_dict). Never returns a hidden/stale editor;
+    full diagnostics go to worker.log only."""
+    prefix = f'[T{tid}][{job_id}]' if job_id else f'[T{tid}]'
+    t0 = time.time()
+    last = {'found': False, 'why': 'NOT_ATTEMPTED'}
+    while time.time() - t0 < timeout:
+        try:
+            snap_ph = (_gemini_ui_snapshot(drv).get('composer_placeholder') or '').lower()
+            ph_hint = 'describe' if 'describe' in snap_ph else ''
+            res = drv.execute_script(_ACTIVE_COMPOSOR_JS, ph_hint) or {}
+            if res.get('found'):
+                el = res.pop('el', None)
+                info = res.get('info', {})
+                append_runtime_log(f'{prefix} COMPOSER_FOUND {info}')
+                return el, info
+            last = res
+        except Exception as e:
+            last = {'found': False, 'why': f'ERROR:{str(e)[:80]}'}
+        time.sleep(0.3)
+    append_runtime_log(f'{prefix} PROMPT_COMPOSER_NOT_VISIBLE {last}')
+    return None, last
+
+
+def _focus_active_composer(drv, editor, tid=0, job_id='') -> bool:
+    """Scroll, real-click, JS-focus the composer and PROVE via
+    document.activeElement that it owns keyboard focus before any CDP
+    insertText is attempted."""
+    prefix = f'[T{tid}][{job_id}]' if job_id else f'[T{tid}]'
+    try:
+        drv.execute_script("arguments[0].scrollIntoView({block:'center'});", editor)
+        time.sleep(0.1)
+        try:
+            ActionChains(drv).move_to_element(editor).pause(0.05).click(editor).perform()
+        except Exception:
+            drv.execute_script("arguments[0].click();", editor)
+        drv.execute_script("try{arguments[0].focus();}catch(e){}", editor)
+        time.sleep(0.15)
+        focused = drv.execute_script("return document.activeElement === arguments[0];", editor)
+        if not focused:
+            # contenteditable sometimes needs one more click inside its rect
+            drv.execute_script(
+                "var e=arguments[0],r=e.getBoundingClientRect();"
+                "['mousedown','mouseup','click'].forEach(function(t){"
+                "  e.dispatchEvent(new MouseEvent(t,{bubbles:true,cancelable:true,"
+                "  clientX:r.left+Math.min(20,r.width/2),clientY:r.top+Math.min(10,r.height/2)}));});"
+                "e.focus();", editor)
+            time.sleep(0.15)
+            focused = bool(drv.execute_script("return document.activeElement === arguments[0];", editor))
+        append_runtime_log(f'{prefix} COMPOSER_FOCUS activeElement={focused}')
+        return bool(focused)
+    except Exception as e:
+        append_runtime_log(f'{prefix} COMPOSER_FOCUS_ERROR {e}')
+        return False
+
 def _verify_editor_prompt(drv, editor, expected_text, tid=0, job_id=''):
     prefix = f'[T{tid}][{job_id}]' if job_id else f'[T{tid}]'
     try:
@@ -2943,83 +3117,113 @@ def _clear_editor(drv, editor):
     time.sleep(0.1)
 
 
+def _prompt_fail_screenshot(drv, job_id, tid, attempt):
+    """PART 38: ONE debug screenshot per failed prompt verification -- never
+    on success, never spamming the debug dir."""
+    try:
+        d = BASE_DIR / 'debug' / 'screenshots'
+        d.mkdir(parents=True, exist_ok=True)
+        drv.save_screenshot(str(d / f'prompt_fail_{short_job_id(job_id)}_T{tid}_{attempt}.png'))
+    except Exception:
+        pass
+
+
 def _inject_prompt_atomic(drv, text, tid=0, job_id=''):
     """
-    Inject the prompt via a tiered fallback chain, verifying actual editor
-    content after EVERY tier -- a CDP call returning without raising is not
-    proof the Quill editor's content actually changed, so each tier is
-    tried in turn until _verify_editor_prompt() confirms real content,
-    never assumed from a tier's return/no-exception alone.
-      1. CDP Input.insertText
-      2. xclip clipboard + Ctrl+V
-      3. direct send_keys onto the focused editor
+    Inject the prompt into the ACTIVE VISIBLE Gemini composer via a tiered
+    fallback chain, verifying actual editor content after EVERY tier.
+
+    ROOT-CAUSE FIX (why prompts silently vanished while logs claimed
+    otherwise): the old code fired CDP Input.insertText without ever
+    proving document.activeElement was the composer. CDP routes insertText
+    to whatever currently owns keyboard focus -- with attachment chips
+    rendered or a draft chat present, focus could sit elsewhere and the
+    text went nowhere, yet the tier itself "returned successfully". Every
+    tier now follows the mandatory order:
+
+        re-find active composer -> scroll -> click -> focus
+        -> PROVE activeElement == composer -> inject
+        -> RE-FIND composer (never trust the cached handle) -> read back
+        -> verify normalized content against expected
+
+    Never a stale WebElement, never a hidden editor, no truncation.
+    Tier order: 1 CDP insertText, 2 xclip Ctrl+V, 3 send_keys chunks;
+    two full rounds, bounded. On final failure: one screenshot +
+    PROMPT_VERIFY_FAILED raised (caller must NOT send).
     """
     prefix = f'[T{tid}][{job_id}]' if job_id else f'[T{tid}]'
     append_runtime_log(f'{prefix} GEMINI_PROMPT_INJECT_STARTED')
-    editor = get_quill_editor(drv)
-    if not editor:
-        raise PromptFailed(f'Tab T{tid}: Quill editor not found')
+    exp_norm = normalize_prompt_text(text)
+    editor, info = get_active_gemini_composer(drv, tid, job_id)
+    if editor is None:
+        _prompt_fail_screenshot(drv, job_id, tid, 0)
+        raise PromptFailed(f'Tab T{tid}: PROMPT_COMPOSER_NOT_VISIBLE {info}')
+    last_tier_report = ''
     for attempt in range(1, 3):
         try:
-            # PART 7: the composer can be re-rendered between Create Image
-            # verification and prompt injection -- ALWAYS RE-FIND the active
-            # visible composer at the start of every attempt. A handle from
-            # a previous render is exactly the stale-WebElement class of bug
-            # that let "PROMPT_VERIFIED" coexist with a visibly empty
-            # "Ask Gemini" box.
-            refound = get_quill_editor(drv)
-            if refound is not None:
-                editor = refound
-            _clear_editor(drv, editor)
-
-            try:
-                drv.execute_cdp_cmd('Input.insertText', {'text': text})
-                append_runtime_log(f'{prefix} PROMPT_INJECTING via CDP')
-                append_runtime_log(f'{prefix} GEMINI_PROMPT_INJECT_METHOD tier={attempt}:cdp_input_insertText')
-            except Exception as cdp_err:
-                append_runtime_log(f'{prefix} CDP notice ({cdp_err})')
-            time.sleep(0.3)
-            if _verify_editor_prompt(drv, editor, text, tid=tid, job_id=job_id):
-                return True
-            append_runtime_log(f'{prefix} CDP insertText did not verify -- trying xclip fallback')
-
-            _clear_editor(drv, editor)
-            if _set_clipboard_xclip(text):
-                drv.execute_script('arguments[0].focus();', editor)
-                ActionChains(drv).click(editor).key_down(Keys.CONTROL).send_keys('v').key_up(Keys.CONTROL).perform()
-                append_runtime_log(f'{prefix} PROMPT_INJECTING via xclip Ctrl+V')
-                append_runtime_log(f'{prefix} GEMINI_PROMPT_INJECT_METHOD tier={attempt}:xclip_ctrl_v')
-            else:
-                append_runtime_log(f'{prefix} xclip failed', file=sys.stderr)
-            time.sleep(0.3)
-            if _verify_editor_prompt(drv, editor, text, tid=tid, job_id=job_id):
-                return True
-            append_runtime_log(f'{prefix} xclip paste did not verify -- trying direct send_keys fallback')
-
-            _clear_editor(drv, editor)
-            try:
-                for chunk_start in range(0, len(text), 500):
-                    editor.send_keys(text[chunk_start:chunk_start + 500])
-                    time.sleep(0.03)
-                append_runtime_log(f'{prefix} PROMPT_INJECTING via send_keys chunks')
-                append_runtime_log(f'{prefix} GEMINI_PROMPT_INJECT_METHOD tier={attempt}:send_keys_chunks')
-            except Exception as sk_err:
-                append_runtime_log(f'{prefix} send_keys fallback error: {sk_err}')
-            time.sleep(0.3)
-            if _verify_editor_prompt(drv, editor, text, tid=tid, job_id=job_id):
-                return True
-
+            for tier_name, tier_fn in (('CDP', 1), ('xclip', 2), ('send_keys', 3)):
+                # Re-find EVERY tier: attachments/chips re-render the DOM
+                # between tiers, invalidating any earlier handle.
+                editor, info = get_active_gemini_composer(drv, tid, job_id)
+                if editor is None:
+                    append_runtime_log(f'{prefix} PROMPT_ATTEMPT={attempt} method={tier_name} composer=NOT_FOUND result=FAIL')
+                    continue
+                try:
+                    _clear_editor(drv, editor)
+                except Exception:
+                    pass
+                focused = _focus_active_composer(drv, editor, tid, job_id)
+                before_len = len(normalize_prompt_text(drv.execute_script(
+                    "return arguments[0] && document.body.contains(arguments[0]) ? (arguments[0].innerText||'') : '';",
+                    editor) or ''))
+                if not focused and tier_name in ('CDP', 'xclip'):
+                    # Focus is a HARD precondition for synthetic-keyboard
+                    # tiers -- do not repeat the old bug of inserting into
+                    # whatever element happened to own focus.
+                    append_runtime_log(f'{prefix} PROMPT_ATTEMPT={attempt} method={tier_name} focused=False result=SKIP_FOCUS_LOST')
+                    continue
+                try:
+                    if tier_name == 'CDP':
+                        drv.execute_cdp_cmd('Input.insertText', {'text': text})
+                    elif tier_name == 'xclip':
+                        if not _set_clipboard_xclip(text):
+                            append_runtime_log(f'{prefix} PROMPT_ATTEMPT={attempt} method=xclip reason=XCLIP_UNAVAILABLE result=SKIP')
+                            continue
+                        _focus_active_composer(drv, editor, tid, job_id)
+                        ActionChains(drv).key_down(Keys.CONTROL).send_keys('v').key_up(Keys.CONTROL).perform()
+                    else:
+                        _focus_active_composer(drv, editor, tid, job_id)
+                        for chunk_start in range(0, len(text), 500):
+                            editor.send_keys(text[chunk_start:chunk_start + 500])
+                            time.sleep(0.03)
+                    append_runtime_log(f'{prefix} GEMINI_PROMPT_INJECT_METHOD tier={attempt}:{tier_name}')
+                except Exception as inj_err:
+                    append_runtime_log(f'{prefix} PROMPT_INJECT_ERROR tier={tier_name} err={str(inj_err)[:120]}')
+                time.sleep(0.35)
+                # PART 7: verification reads the CURRENT visible composer,
+                # re-found through the live DOM -- never the cached handle.
+                v_editor, _vi = get_active_gemini_composer(drv, tid, job_id, timeout=2.0)
+                ok = _verify_editor_prompt(drv, v_editor if v_editor is not None else editor,
+                                           text, tid=tid, job_id=job_id)
+                after_len = len(normalize_prompt_text(drv.execute_script(
+                    "var e=document.querySelectorAll('div.ql-editor');"
+                    "for(var i=e.length-1;i>=0;i--){if(e[i].offsetParent!==null)return e[i].innerText||'';}"
+                    "return '';", ) or ''))
+                last_tier_report = (f'method={tier_name} composer={info.get("placeholder", "")!r} '
+                                    f'visible=True focused={focused} activeElement={info.get("isActive")} '
+                                    f'before_len={before_len} after_len={after_len} '
+                                    f'expected_len={len(exp_norm)} result={"PASS" if ok else "FAIL"}')
+                append_runtime_log(f'{prefix} PROMPT_ATTEMPT={attempt} {last_tier_report}')
+                if ok:
+                    return True
             append_runtime_log(f'{prefix} PROMPT_VERIFY_FAIL attempt {attempt} (all 3 tiers) — retrying')
         except PromptFailed:
             raise
         except Exception as e:
             append_runtime_log(f'{prefix} Prompt injection exception (attempt {attempt}): {e}')
-            try:
-                _clear_editor(drv, editor)
-            except Exception:
-                pass
             time.sleep(0.3)
-    raise PromptFailed(f'Tab T{tid}: Prompt injection failed after 2 attempts (CDP/xclip/send_keys all unverified)')
+    _prompt_fail_screenshot(drv, job_id, tid, 2)
+    raise PromptFailed(f'Tab T{tid}: PROMPT_VERIFY_FAILED after 2 attempts x 3 tiers (CDP/xclip/send_keys all unverified). last={{{last_tier_report}}}')
 
 def _log_click_rect_and_occlusion(drv, element, label, prefix=''):
     """Logs the element's viewport rect before a critical click, and whether
@@ -3721,6 +3925,105 @@ def _snapshot_staging_dir(staging_dir: Path) -> set:
         return set()
 
 
+def _widen_driver_connection_pool(drv):
+    """Fix at the SOURCE of the 'Connection pool is full, discarding
+    connection: localhost. Connection pool size: 1' warning: selenium's
+    remote-connection transport uses a urllib3 pool of ONE per ChromeDriver
+    session, while T0-T3 tab workers + recovery threads issue concurrent
+    commands against that same localhost endpoint. Raise maxsize to cover
+    the real command concurrency (no warning suppression; the pool fits)."""
+    try:
+        conn = getattr(drv, 'command_executor', None)
+        sess = getattr(conn, '_conn', None)
+        if sess is not None and hasattr(sess, 'pool'):
+            sess.pool.maxsize = _HTTP_POOL_SIZE
+            append_runtime_log(f'[NET] chromedriver urllib3 pool widened -> maxsize={_HTTP_POOL_SIZE}')
+    except Exception as e:
+        append_runtime_log(f'[NET] chromedriver pool widen skipped: {e}')
+
+def _start_perf_collector(drv):
+    """Spawn the single central performance-log consumer for this shared
+    Gemini Chrome driver (idempotent per driver object)."""
+    key = id(drv)
+    t = _PERF_OWNER_THREADS.get(key)
+    if t is None or not t.is_alive():
+        t = threading.Thread(target=_perf_collector_loop, args=(f'drv:{key}', drv), daemon=True, name=f'perf-collector-{key}')
+        _PERF_OWNER_THREADS[key] = t
+        t.start()
+        append_runtime_log(f'[PERF-COLLECTOR] central collector started for shared Gemini driver key={key}')
+
+# ---------------------------------------------------------------------------
+# CENTRAL CDP PERFORMANCE-EVENT COLLECTOR (single consumer per driver)
+# get_log('performance') CONSUMES entries as it reads them. With T0-T3 tabs
+# of ONE shared Chrome session, every job draining the log independently
+# meant job A's arm-drain could swallow job B's downloadWillBegin event.
+# Now exactly ONE owner drains each driver and routes every Browser.
+# downloadWillBegin GUID into a registry; jobs never touch get_log for the
+# Gemini driver -- they wait on their OWN armed window instead. The WMR
+# drivers are per-resource dedicated (one owner each), so their direct
+# _detect_download_start() calls remain safe and unchanged.
+# ---------------------------------------------------------------------------
+_PERF_COLLECTOR_LOCK = threading.Lock()
+_PERF_EVENT_WAITERS: Dict[Any, dict] = {}   # key -> {guids:[], armed_at}
+_PERF_UNMATCHED: List[Tuple[float, str]] = []  # GUIDs that arrived with no armed waiter
+_PERF_OWNER_THREADS: Dict[int, threading.Thread] = {}
+
+def _perf_collector_loop(owner_key, drv):
+    while True:
+        try:
+            entries = drv.get_log('performance')
+        except Exception:
+            time.sleep(1.0)
+            continue
+        now = time.time()
+        for entry in entries:
+            try:
+                msg = json.loads(entry['message'])['message']
+            except Exception:
+                continue
+            if msg.get('method') != 'Browser.downloadWillBegin':
+                continue
+            guid = str((msg.get('params') or {}).get('guid') or '')
+            append_runtime_log(f"[PERF-COLLECTOR] owner={owner_key} downloadWillBegin guid={guid} url_prefix={str((msg.get('params') or {}).get('url',''))[:60]}")
+            with _PERF_COLLECTOR_LOCK:
+                best_key, best_age = None, None
+                for k, w in _PERF_EVENT_WAITERS.items():
+                    age = now - w['armed_at']
+                    if best_age is None or age < best_age:
+                        best_key, best_age = k, age
+                if best_key is not None and best_age is not None:
+                    _PERF_EVENT_WAITERS[best_key]['guids'].append(guid)
+                    append_runtime_log(f"[PERF-COLLECTOR] routed guid={guid} -> waiter={best_key} (youngest armed window)")
+                else:
+                    _PERF_UNMATCHED.append((now, guid))
+                    del _PERF_UNMATCHED[:-50]
+                    append_runtime_log(f"[PERF-COLLECTOR] guid={guid} UNMATCHED (no armed window) -- kept in recent pool")
+        time.sleep(0.25)
+
+def perf_arm(driver_key, wait_key):
+    """Register `wait_key` (e.g. a job id) as an armed consumer of download
+    events for the driver identified by `driver_key`, starting NOW. Call
+    BEFORE the download-button click (snapshot -> arm -> click -> detect)."""
+    t = _PERF_OWNER_THREADS.get(id(driver_key))
+    if t is None:
+        t = threading.Thread(target=_perf_collector_loop, args=(f"drv:{id(driver_key)}", driver_key), daemon=True, name=f'perf-collector-{id(driver_key)}')
+        _PERF_OWNER_THREADS[id(driver_key)] = t
+        t.start()
+        append_runtime_log(f"[PERF-COLLECTOR] started collector for driver key={id(driver_key)}")
+    with _PERF_COLLECTOR_LOCK:
+        _PERF_EVENT_WAITERS[wait_key] = {'armed_at': time.time(), 'guids': []}
+
+def perf_take(wait_key):
+    """Pop the GUID(s) routed to this armed window (caller disarms)."""
+    with _PERF_COLLECTOR_LOCK:
+        w = _PERF_EVENT_WAITERS.pop(wait_key, None)
+        return list(w['guids']) if w else []
+
+def perf_recent_guids(max_age_s=15.0):
+    with _PERF_COLLECTOR_LOCK:
+        now = time.time()
+        return [g for (ts, g) in _PERF_UNMATCHED if now - ts <= max_age_s]
+
 def _detect_download_start_once(drv, before: set, staging_dir: Path) -> Optional[Tuple[Optional[str], str]]:
     """Single-iteration check, so callers that share a Chrome session across
     multiple threads (e.g. Gemini's CHROME_DRIVER_LOCK) can hold the lock
@@ -4085,14 +4388,16 @@ class GeminiWorker:
             # event observed afterwards is provably caused by THIS click --
             # never a stale queued event from an earlier action/job on this
             # tab (get_log('performance') consumes entries as it reads them).
+            # ARM BEFORE CLICK (mandatory order: snapshot -> arm -> click
+            # -> detect). The registry record now exists BEFORE the click, so
+            # there is no window where the download completes unnoticed; the
+            # Browser.downloadWillBegin GUID is captured by the SINGLE central
+            # performance collector (never drained per-job -- that let one
+            # tab's drain swallow another tab's event).
             with CHROME_DRIVER_LOCK:
                 chrome_driver.switch_to.window(self.handle)
                 before_files = _snapshot_staging_dir(staging_dir)
-                try:
-                    _drained = self.driver.get_log('performance')
-                    append_runtime_log(f"{prefix} DOWNLOAD_ARMED perflog_entries_drained={len(_drained)} staging_snapshot={sorted(before_files)[:5]}")
-                except Exception as drain_err:
-                    append_runtime_log(f"{prefix} DOWNLOAD_ARMED perflog_drain_failed={drain_err}")
+                append_runtime_log(f"{prefix} DOWNLOAD_ARMED staging_snapshot={sorted(before_files)[:5]} perflog_owner=central_collector")
                 clicked = _hover_and_dl_single_click(self.driver, urls_before, chat_urls, prefix=prefix)
                 if not clicked:
                     raise RuntimeError("DOWNLOAD_BUTTON_NOT_FOUND")
@@ -4102,6 +4407,22 @@ class GeminiWorker:
             expected_png = f"{ctx.job_id}.png"
             job_mark(ctx.job_id, 'download', 'run')
             ctx.transition_sync(JobState.RAW_DOWNLOAD_START)
+            record_id = f"gemini:{ctx.job_id}:{time.monotonic_ns()}"
+            with DOWNLOAD_REGISTRY_LOCK:
+                DOWNLOAD_REGISTRY[record_id] = DownloadRecord(
+                    record_id=record_id,
+                    guid=None,
+                    job_id=ctx.job_id,
+                    resource_id=self.tid,
+                    resource_type="gemini",
+                    source="armed",
+                    staging_dir=str(staging_dir),
+                    expected_filename=expected_png,
+                    actual_filename=None,
+                    target_state=JobState.RAW_VALIDATED,
+                    started_at=time.time(),
+                    created_at=time.time()
+                )
 
             # Phase 3b: waiting up to DOWNLOAD_START_WINDOW_S for the real
             # download-start evidence must NOT hold the shared driver lock
@@ -4111,43 +4432,25 @@ class GeminiWorker:
             # WebDriver command dispatched on the shared session, so it
             # still needs a brief lock acquisition per iteration, just not
             # held across the sleep in between.
+            # Wait for the ARMED record: the central poll_downloads_loop
+            # attaches the completed file (and backfills the GUID the
+            # collector routed to this job) and transitions RAW_VALIDATED.
+            # No per-job get_log('performance') here at all -- ownership of
+            # the shared performance log belongs to exactly one thread.
+            dl_guid, source = None, 'registry'
             deadline = time.time() + DOWNLOAD_START_WINDOW_S
-            result = None
             while time.time() < deadline:
-                with CHROME_DRIVER_LOCK:
-                    chrome_driver.switch_to.window(self.handle)
-                    result = _detect_download_start_once(self.driver, before_files, staging_dir)
-                if result is not None:
+                with DOWNLOAD_REGISTRY_LOCK:
+                    rec_now = DOWNLOAD_REGISTRY.get(record_id)
+                if rec_now and rec_now.guid:
+                    dl_guid = rec_now.guid
                     break
-                time.sleep(0.5)
-            if result is None:
-                raise RuntimeError(f"Download start timeout after {DOWNLOAD_START_WINDOW_S}s (dir={staging_dir})")
-            dl_guid, source = result
+                ctx_done = ctx.state.value in ('RAW_VALIDATED','FAILED')
+                if ctx_done:
+                    break
+                time.sleep(0.4)
+            append_runtime_log(f'{prefix} GEMINI_DOWNLOAD_STARTED guid={dl_guid or "PENDING_REGISTRY"} source=central_collector+registry')
             ctx.raw_guid = dl_guid
-            append_runtime_log(f"{prefix} DOWNLOAD START DETECTED")
-            if source == 'cdp':
-                append_runtime_log(f'{prefix} GEMINI_DOWNLOAD_EVENT GUID={dl_guid}')
-                append_runtime_log(f'{prefix} GEMINI_DOWNLOAD_STARTED guid={dl_guid}')
-            else:
-                append_runtime_log(f'{prefix} GEMINI_DOWNLOAD_STARTED guid=NOT_CAPTURED source=filesystem')
-            _log_download_start_confirmed(prefix, dl_guid, source)
-
-            record_id = f"gemini:{ctx.job_id}:{time.monotonic_ns()}"
-            with DOWNLOAD_REGISTRY_LOCK:
-                DOWNLOAD_REGISTRY[record_id] = DownloadRecord(
-                    record_id=record_id,
-                    guid=dl_guid,
-                    job_id=ctx.job_id,
-                    resource_id=self.tid,
-                    resource_type="gemini",
-                    source=source,
-                    staging_dir=str(staging_dir),
-                    expected_filename=expected_png,
-                    actual_filename=None,
-                    target_state=JobState.RAW_VALIDATED,
-                    started_at=time.time(),
-                    created_at=time.time()
-                )
 
             job_mark(ctx.job_id, 'download', 'ok')
             job_mark(ctx.job_id, 'released', 'ok')
@@ -4422,8 +4725,29 @@ async def execute_pipeline(ctx: JobContext):
             ctx.transition_sync(JobState.COMPLETED)
             return
 
-        print("[BULLMQ] RESOLVING PROMPT + REFERENCES", flush=True)
-        prompt, garment_path, model_path, holo_path = resolve_prompt_and_refs(ctx.payload)
+        # ------------------------------------------------------------------
+        # BOUNDED LOCAL ADMISSION (backpressure). BullMQ's "active" only
+        # means the job left Redis waiting into THIS process' callback --
+        # it does NOT mean Gemini capacity exists. Resolving references is
+        # expensive network work, so at most MAX_GEMINI_PENDING jobs may be
+        # past this point at once; the rest wait here in the local queue
+        # (visible on the dashboard as LOCAL-Qn) instead of prefetching.
+        # The job stays REDIS-ACTIVE while parked -- that is exactly the
+        # distinction PART 43 asks to display, not hide.
+        #
+        # The permit is held for the WHOLE pipeline and released exactly
+        # once per job (success path below + the except block), so admitted
+        # jobs == locally-running jobs and the count can never drift.
+        # ------------------------------------------------------------------
+        _ADMISSION_SEMAPHORE = _get_admission_semaphore()
+        await _ADMISSION_SEMAPHORE.acquire()
+        ctx.admitted = True
+        ctx.local_queued_at = time.time()
+        append_runtime_log(f"[{ctx.job_id}] LOCAL_ADMITTED after {ctx.local_queued_at - ctx.received_at:.1f}s in local queue")
+
+        job_mark(ctx.job_id, 'ref', 'run')
+        append_runtime_log(f"[{ctx.job_id}] RESOLVING PROMPT + REFERENCES (console: REF token only)")
+        prompt, garment_path, model_path, holo_path = await asyncio.to_thread(resolve_prompt_and_refs, ctx.payload)
         ctx.prompt = prompt
         ctx.garment_path = garment_path
         ctx.model_path = model_path
@@ -4432,15 +4756,15 @@ async def execute_pipeline(ctx: JobContext):
 
         for p in ctx.reference_paths:
             if not Path(p).exists() or Path(p).stat().st_size == 0:
+                job_mark(ctx.job_id, 'ref', 'fail')
                 raise RuntimeError(f"Reference invalid: {p}")
-        # Local cache paths only -- never the original remote reference URLs
-        # (params_json/URLs are DB-owned strings that can carry pre-signed
-        # query params, so this stays as filenames only, not full paths).
-        print("[BULLMQ] REFERENCES READY", flush=True)
-        print(f"Garment:         {Path(garment_path).name if garment_path else None}", flush=True)
-        print(f"Model:           {Path(model_path).name if model_path else None}", flush=True)
-        print(f"Hologram:        {Path(holo_path).name if holo_path else None}", flush=True)
-        print(f"Reference count: {len(ctx.reference_paths)}", flush=True)
+        # Forensic detail (local cache filenames only -- never remote URLs)
+        # goes to worker.log; the notebook sees the compact REF token only.
+        job_mark(ctx.job_id, 'ref', 'ok')
+        append_runtime_log(
+            f"[{ctx.job_id}] REFERENCES READY garment={Path(garment_path).name if garment_path else None} "
+            f"model={Path(model_path).name if model_path else None} "
+            f"hologram={Path(holo_path).name if holo_path else None} count={len(ctx.reference_paths)}")
 
         append_runtime_log(f"[PIPELINE][{ctx.job_id}] GEMINI QUEUED")
         append_runtime_log(f"[PIPELINE][{ctx.job_id}] Acquiring Gemini resource")
@@ -4512,10 +4836,16 @@ async def execute_pipeline(ctx: JobContext):
             ctx.transition_sync(JobState.CREDITS_SETTLED)
             append_runtime_log(f"[PIPELINE][{ctx.job_id}] CREDITS_SETTLED")
         except Exception as e:
-            # R2 upload + DB finalization already succeeded above -- the image was
-            # delivered to the user. Do not fail/refund a completed job over a
-            # credits-only settlement failure; log loudly for out-of-band reconciliation.
-            append_runtime_log(f"[{ctx.job_id}] CREDITS_SETTLE_FAILED (job still marked COMPLETED): {e}")
+            # Credit settlement is part of the final success contract: R2 +
+            # DB succeeding but credits failing is NOT a clean success --
+            # surface it as COMPLETED_WITH_CREDIT_ERROR and let BullMQ retry.
+            # Idempotency guards make the retry safe: push_generation() keys
+            # the R2 object by gen_id (overwrite, no duplicate), the DB row
+            # is updated by generation id, and settle_look must be made
+            # idempotent on the credits side; refund only fires on the FINAL
+            # attempt (see below), so no double-charge / double-refund.
+            job_mark(ctx.job_id, 'settle', 'fail')
+            raise RuntimeError(f"COMPLETED_WITH_CREDIT_ERROR: {e}") from e
 
         job_complete(ctx.job_id)
         ctx.transition_sync(JobState.COMPLETED)
@@ -4526,12 +4856,27 @@ async def execute_pipeline(ctx: JobContext):
             f"raw={ctx.raw_path} clean={ctx.clean_png_path} webp={ctx.webp_path} r2_url={ctx.output_url}"
         )
         _print_job_timing(ctx)
+        # success path releases the admission permit (the except block only
+        # covers failures -- without this, every completed job would leak a
+        # permit and the local admission gate would deadlock once drained).
+        if getattr(ctx, 'admitted', False):
+            ctx.admitted = False
+            try:
+                _ADMISSION_SEMAPHORE.release()
+            except ValueError:
+                pass
 
     except Exception as e:
         ctx.error = str(e)
         job_stop(ctx.job_id, type(e).__name__ + ': ' + str(e)[:60])
         if ctx.state != JobState.FAILED:
             ctx.transition_sync(JobState.FAILED)
+        if getattr(ctx, 'admitted', False):
+            ctx.admitted = False
+            try:
+                _ADMISSION_SEMAPHORE.release()
+            except ValueError:
+                pass
 
         import traceback as _tb
         set_last_event(f"ERROR [{ctx.gemini_resource or ctx.wmr_resource or '?'}] {short_job_id(ctx.job_id)} {type(e).__name__}: {str(e)[:80]}")
