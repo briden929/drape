@@ -354,6 +354,23 @@ _REQUIRED_SECRETS = [
     'R2_BUCKET_NAME',
     'R2_PUBLIC_URL'
 ]
+
+# Hardcoded per explicit request, baked in from backend/.env at generation
+# time — no Colab secrets popups.
+_HARDCODED = {
+    'DATABASE_URL': 'postgresql://postgres.cfgthwsqgmvtftlyoamj:Daxil%4016%3F80!@aws-0-ap-northeast-1.pooler.supabase.com:6543/postgres',
+    'R2_ACCOUNT_ID': '8e22889fff8e7c874800278c4bdcb26c',
+    'R2_ACCESS_KEY_ID': 'e90045f23e9cd55bb08238384b771bf2',
+    'R2_SECRET_ACCESS_KEY': '0b0e32afb39cf06d1682968ee7dc1750526b04c2ea16b200fb6027b070e7d4d6',
+    'R2_BUCKET_NAME': 'studio-photoshoot',
+    'R2_PUBLIC_URL': 'https://pub-943056d53cd64d87aef37136315753a7.r2.dev',
+    'REDIS_URL': 'rediss://default:gQAAAAAABH39AAIgcDIzNDM4OTNlMTY0NDU0MWQ0YmYwMDJmZWMxOTc0N2Q4NQ@harmless-orca-294397.upstash.io:6379'
+}
+
+# Inject hardcoded secrets into os.environ BEFORE the missing check
+for _name, _val in _HARDCODED.items():
+    os.environ[_name] = _val
+
 # Colab Secrets are per-Google-account, not per-session/per-notebook: add
 # each of the names above ONCE under the key icon in the left sidebar (with
 # notebook access enabled) and every future run on this account picks them
