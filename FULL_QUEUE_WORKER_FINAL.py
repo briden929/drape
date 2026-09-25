@@ -2114,10 +2114,39 @@ def _inject_prompt_atomic(drv, text, tid=0, job_id=''):
             time.sleep(0.3)
     raise PromptFailed(f'Tab T{tid}: Prompt injection failed after 2 atomic attempts')
 
-def _click_send_button(drv):
+def _log_click_rect_and_occlusion(drv, element, label, prefix=''):
+    """Logs the element's viewport rect before a critical click, and whether
+    something else is actually on top of it at that point -- so a failed
+    click shows up in logs as "occluded by X" instead of just "click didn't
+    work", matching this file's DOM-state-verification pattern elsewhere
+    (attachment count, prompt length) applied to click targets too."""
     try:
-        res = drv.execute_script('\n            var sels = [\'mat-icon[fonticon="arrow_upward"]\', \'mat-icon[data-mat-icon-name="arrow_upward"]\',\n                        \'mat-icon[fonticon="send"]\', \'button[aria-label="Send message"]\'];\n            for (var s = 0; s < sels.length; s++) {\n                var els = document.querySelectorAll(sels[s]);\n                for (var i = 0; i < els.length; i++) {\n                    var b = els[i].tagName === \'BUTTON\' ? els[i] : els[i].closest(\'button\');\n                    if (b && !b.disabled && b.offsetParent !== null) { b.click(); return \'OK\'; }\n                }\n            } return \'NO\';\n        ')
-        if res == 'OK':
+        info = drv.execute_script(
+            "var r = arguments[0].getBoundingClientRect();"
+            "var cx = r.x + r.width / 2, cy = r.y + r.height / 2;"
+            "var top = document.elementFromPoint(cx, cy);"
+            "var owns = top === arguments[0] || arguments[0].contains(top) || (top && top.contains(arguments[0]));"
+            "return {x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height),"
+            "        owns: !!owns, topTag: top ? top.tagName : 'NONE'};",
+            element,
+        )
+        if not info:
+            return True  # couldn't inspect -- don't block the click over it
+        log(f"{prefix} {label}_RECT x={info['x']} y={info['y']} w={info['w']} h={info['h']}")
+        if not info['owns']:
+            log(f"{prefix} {label}_OCCLUDED by <{info['topTag']}>")
+        return info['owns']
+    except Exception:
+        return True
+
+def _click_send_button(drv, tid=0, job_id=''):
+    prefix = f'[T{tid}][{job_id}]' if job_id else f'[T{tid}]'
+    try:
+        candidates = drv.execute_script('\n            var sels = [\'mat-icon[fonticon="arrow_upward"]\', \'mat-icon[data-mat-icon-name="arrow_upward"]\',\n                        \'mat-icon[fonticon="send"]\', \'button[aria-label="Send message"]\'];\n            var res = [];\n            for (var s = 0; s < sels.length; s++) {\n                var els = document.querySelectorAll(sels[s]);\n                for (var i = 0; i < els.length; i++) {\n                    var b = els[i].tagName === \'BUTTON\' ? els[i] : els[i].closest(\'button\');\n                    if (b && !b.disabled && b.offsetParent !== null) res.push(b);\n                }\n            } return res;\n        ') or []
+        for btn in candidates:
+            if not _log_click_rect_and_occlusion(drv, btn, 'SEND', prefix):
+                continue
+            drv.execute_script('arguments[0].click();', btn)
             return True
     except Exception:
         pass
@@ -2125,6 +2154,7 @@ def _click_send_button(drv):
         try:
             for btn in drv.find_elements(By.XPATH, xp):
                 if btn.is_displayed() and btn.is_enabled():
+                    _log_click_rect_and_occlusion(drv, btn, 'SEND', prefix)
                     drv.execute_script('arguments[0].click();', btn)
                     return True
         except Exception:
@@ -2802,6 +2832,51 @@ def release_wmr_once(ctx: JobContext):
 from concurrent.futures import ThreadPoolExecutor
 GEMINI_EXECUTOR = ThreadPoolExecutor(max_workers=4)
 
+DEBUG_DIR = Path('debug')
+
+def _dump_gemini_debug_artifacts(tid: str, handle: Optional[str], job_id: str, reason: str):
+    """On a Gemini job failure, capture a screenshot, the page's URL/text,
+    and a DOM geometry dump (every button/input's rect + whatever element
+    actually sits on top of it at that point) into debug/{job_id}/ -- so a
+    failed click shows up as "occluded by X" or "off-screen" in the saved
+    artifacts instead of just a bare exception message. Best-effort only;
+    never raises, since this runs inside an already-failing job's cleanup."""
+    if not handle:
+        return
+    try:
+        if handle not in chrome_driver.window_handles:
+            return
+        chrome_driver.switch_to.window(handle)
+        debug_dir = DEBUG_DIR / job_id
+        debug_dir.mkdir(parents=True, exist_ok=True)
+        (debug_dir / 'reason.txt').write_text(f'[T{tid}] {reason}', encoding='utf-8')
+        chrome_driver.save_screenshot(str(debug_dir / 'error.png'))
+        (debug_dir / 'url.txt').write_text(chrome_driver.current_url, encoding='utf-8')
+        (debug_dir / 'body.txt').write_text(
+            chrome_driver.find_element(By.TAG_NAME, 'body').text, encoding='utf-8'
+        )
+        geom = chrome_driver.execute_script(
+            "var out = {url: window.location.href, buttons: []};"
+            "var els = document.querySelectorAll('button, input, [role=\"menuitem\"], [role=\"dialog\"], .cdk-overlay-pane');"
+            "els.forEach(function(el) {"
+            "  var r = el.getBoundingClientRect();"
+            "  if (r.width === 0 || r.height === 0) return;"
+            "  var cx = r.x + r.width / 2, cy = r.y + r.height / 2;"
+            "  var top = document.elementFromPoint(cx, cy);"
+            "  out.buttons.push({"
+            "    tag: el.tagName, text: (el.innerText || '').slice(0, 30),"
+            "    aria: el.getAttribute('aria-label'),"
+            "    rect: {x: r.x, y: r.y, w: r.width, h: r.height},"
+            "    topElement: top ? (top.tagName + '.' + top.className) : 'NONE'"
+            "  });"
+            "});"
+            "return out;"
+        )
+        (debug_dir / 'geom.json').write_text(json.dumps(geom, indent=2), encoding='utf-8')
+        log(f'[T{tid}][{job_id}] DEBUG_ARTIFACTS_SAVED -> {debug_dir}')
+    except Exception as dump_err:
+        log(f'[T{tid}][{job_id}] DEBUG_ARTIFACT_DUMP_FAILED: {dump_err}')
+
 class GeminiWorker:
     def __init__(self, tid: str):
         self.tid = tid
@@ -2845,7 +2920,8 @@ class GeminiWorker:
                 print(f"{prefix} PROMPT INJECTED", flush=True)
 
                 urls_before = snapshot_urls(self.driver)
-                _click_send_button(self.driver)
+                if not _click_send_button(self.driver, tid_int, ctx.job_id):
+                    raise RuntimeError("SEND_FAILED: Could not click send button")
                 print(f"{prefix} SEND CLICKED", flush=True)
 
                 started = verify_generation_started(self.driver)
@@ -2895,6 +2971,7 @@ class GeminiWorker:
                 ctx.error = str(e)
                 ctx.transition_sync(JobState.FAILED)
                 GEMINI_BROKER.fail(self.tid, str(e))
+                _dump_gemini_debug_artifacts(self.tid, self.handle, ctx.job_id, str(e))
                 try:
                     if self.handle and self.handle in chrome_driver.window_handles:
                         chrome_driver.switch_to.window(self.handle)
