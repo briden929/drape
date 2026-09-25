@@ -3026,115 +3026,162 @@ def _clear_editor(drv, editor):
     time.sleep(0.1)
 
 
-def _inject_prompt_atomic(drv, text, tid=0, job_id=''):
-    """
-    Inject the prompt via a tiered fallback chain, verifying actual editor
-    content after EVERY tier -- a CDP call returning without raising is not
-    proof the Quill editor's content actually changed, so each tier is
-    tried in turn until _verify_editor_prompt() confirms real content,
-    never assumed from a tier's return/no-exception alone.
-      1. CDP Input.insertText
-      2. xclip clipboard + Ctrl+V
-      3. direct send_keys onto the focused editor
-    """
-    prefix = f'[T{tid}][{job_id}]' if job_id else f'[T{tid}]'
-    append_runtime_log(f'{prefix} GEMINI_PROMPT_INJECT_STARTED')
-
-    def _focus_and_verify(editor) -> bool:
-        """PART 17: prove focus landed on the composer before injecting --
-        never run CDP Input.insertText against an element that Selenium
-        merely called .focus() on without confirming document.activeElement
-        actually moved there (Gemini's own JS can steal focus back)."""
+def _focus_and_verify_composer(drv, editor, prefix='') -> bool:
+    """Prove focus landed on the composer before injecting -- never run an
+    injection method against an element that Selenium merely called
+    .focus() on without confirming document.activeElement actually moved
+    there (Gemini's own JS can steal focus back)."""
+    try:
+        drv.execute_script("arguments[0].scrollIntoView({block:'center'});", editor)
+    except Exception:
+        pass
+    try:
+        ok = drv.execute_script(
+            "arguments[0].focus(); return document.activeElement === arguments[0];", editor
+        )
+    except Exception:
+        ok = False
+    if not ok:
+        append_runtime_log(f'{prefix} PROMPT_FOCUS_MISMATCH — retrying focus')
         try:
-            drv.execute_script("arguments[0].scrollIntoView({block:'center'});", editor)
-        except Exception:
-            pass
-        try:
-            ok = drv.execute_script(
-                "arguments[0].focus(); return document.activeElement === arguments[0];", editor
-            )
+            editor.click()
+            ok = drv.execute_script("return document.activeElement === arguments[0];", editor)
         except Exception:
             ok = False
-        if not ok:
-            append_runtime_log(f'{prefix} PROMPT_FOCUS_MISMATCH — retrying focus')
-            try:
-                editor.click()
-                ok = drv.execute_script("return document.activeElement === arguments[0];", editor)
-            except Exception:
-                ok = False
-        return bool(ok)
+    return bool(ok)
 
+
+def _prep_composer_for_tier(drv, tid, job_id, prefix):
+    """Re-find the CURRENT visible composer, clear it, and prove focus --
+    run at the start of every tier so no tier ever operates on a stale
+    WebElement left over from a previous tier's DOM re-render."""
     editor = get_active_gemini_image_composer(drv, tid=tid, job_id=job_id)
     if not editor:
-        raise PromptFailed(f'Tab T{tid}: Quill editor not found')
+        return None
+    _clear_editor(drv, editor)
+    _focus_and_verify_composer(drv, editor, prefix=prefix)
+    return editor
+
+
+def _inject_prompt_clipboard_first(drv, text, tid=0, job_id=''):
+    """TIER 1 (primary): xclip clipboard + Ctrl+V."""
+    prefix = f'[T{tid}][{job_id}]' if job_id else f'[T{tid}]'
+    editor = _prep_composer_for_tier(drv, tid, job_id, prefix)
+    if not editor:
+        return False
+    if not _set_clipboard_xclip(text):
+        append_runtime_log(f'{prefix} PROMPT_CLIPBOARD_SET_FAIL')
+        return False
+    ActionChains(drv).click(editor).key_down(Keys.CONTROL).send_keys('v').key_up(Keys.CONTROL).perform()
+    time.sleep(0.4)
+    verify_editor = get_active_gemini_image_composer(drv, tid=tid, job_id=job_id) or editor
+    return _verify_editor_prompt(drv, verify_editor, text, tid=tid, job_id=job_id)
+
+
+def _inject_prompt_exec_command(drv, text, tid=0, job_id=''):
+    """TIER 2: document.execCommand('insertText') against the editor's own
+    contenteditable editing context -- one atomic JS call, not a Selenium
+    key-event simulation."""
+    prefix = f'[T{tid}][{job_id}]' if job_id else f'[T{tid}]'
+    editor = _prep_composer_for_tier(drv, tid, job_id, prefix)
+    if not editor:
+        return False
+    try:
+        drv.execute_script(
+            "var editor=arguments[0], text=arguments[1];"
+            "editor.focus();"
+            "document.execCommand('selectAll', false, null);"
+            "document.execCommand('delete', false, null);"
+            "document.execCommand('insertText', false, text);"
+            "editor.dispatchEvent(new InputEvent('input', {bubbles:true, inputType:'insertText', data:text}));",
+            editor, text,
+        )
+    except Exception as e:
+        append_runtime_log(f'{prefix} PROMPT_EXECCOMMAND_ERROR: {e}')
+        return False
+    time.sleep(0.4)
+    verify_editor = get_active_gemini_image_composer(drv, tid=tid, job_id=job_id) or editor
+    return _verify_editor_prompt(drv, verify_editor, text, tid=tid, job_id=job_id)
+
+
+def _inject_prompt_send_keys(drv, text, tid=0, job_id=''):
+    """TIER 3: full Selenium send_keys() in ONE call -- no 500-char
+    chunking loop. Chunking exists only to work around WebDriver payload
+    limits that don't apply here; it added latency and extra DOM-mutation
+    surface without being required for correctness."""
+    prefix = f'[T{tid}][{job_id}]' if job_id else f'[T{tid}]'
+    editor = _prep_composer_for_tier(drv, tid, job_id, prefix)
+    if not editor:
+        return False
+    try:
+        editor.send_keys(text)
+    except Exception as e:
+        append_runtime_log(f'{prefix} PROMPT_SENDKEYS_ERROR: {e}')
+        return False
+    time.sleep(0.4)
+    verify_editor = get_active_gemini_image_composer(drv, tid=tid, job_id=job_id) or editor
+    return _verify_editor_prompt(drv, verify_editor, text, tid=tid, job_id=job_id)
+
+
+def _inject_prompt_cdp(drv, text, tid=0, job_id=''):
+    """TIER 4 (last resort): Chrome DevTools Input.insertText. A CDP call
+    returning without raising is NOT proof of success -- only the
+    post-tier _verify_editor_prompt() read of the live composer is."""
+    prefix = f'[T{tid}][{job_id}]' if job_id else f'[T{tid}]'
+    editor = _prep_composer_for_tier(drv, tid, job_id, prefix)
+    if not editor:
+        return False
+    try:
+        drv.execute_cdp_cmd('Input.insertText', {'text': text})
+    except Exception as e:
+        append_runtime_log(f'{prefix} PROMPT_CDP_ERROR: {e}')
+        return False
+    time.sleep(0.4)
+    verify_editor = get_active_gemini_image_composer(drv, tid=tid, job_id=job_id) or editor
+    return _verify_editor_prompt(drv, verify_editor, text, tid=tid, job_id=job_id)
+
+
+_PROMPT_INJECT_TIERS = [
+    ('clipboard', _inject_prompt_clipboard_first),
+    ('execCommand', _inject_prompt_exec_command),
+    ('send_keys', _inject_prompt_send_keys),
+    ('cdp', _inject_prompt_cdp),
+]
+
+
+def _inject_prompt_atomic(drv, text, tid=0, job_id=''):
+    """
+    Inject the prompt via a bounded tier order -- clipboard/Ctrl+V first
+    (matches the proven older browser implementation's primary method),
+    then execCommand, then a single full send_keys call, then CDP
+    Input.insertText as the last resort. Every tier re-finds the CURRENT
+    visible composer, clears it, proves focus landed, and verifies actual
+    visible content afterward -- no tier's return value or lack of
+    exception is ever treated as success on its own.
+    """
+    prefix = f'[T{tid}][{job_id}]' if job_id else f'[T{tid}]'
+    append_runtime_log(f'{prefix} GEMINI_PROMPT_INJECT_STARTED len={len(text)}')
+
+    if get_active_gemini_image_composer(drv, tid=tid, job_id=job_id) is None:
+        raise PromptFailed(f'Tab T{tid}: active image composer not found')
+
     for attempt in range(1, 3):
-        try:
-            # PART 7/19: the composer can be re-rendered between Create
-            # Image verification and prompt injection, and again between
-            # tiers within one attempt -- ALWAYS RE-FIND the active visible
-            # composer, never reuse a WebElement handle across a DOM
-            # transition. A stale handle is exactly the bug class that let
-            # "PROMPT_VERIFIED" coexist with a visibly empty "Ask Gemini" box.
-            refound = get_active_gemini_image_composer(drv, tid=tid, job_id=job_id)
-            if refound is not None:
-                editor = refound
-            _clear_editor(drv, editor)
-            _focus_and_verify(editor)
-
+        for method_name, method in _PROMPT_INJECT_TIERS:
+            emit_live_event(f'job:{job_id}:prompt', f'{prefix} ✏️Prompt:{method_name}')
+            append_runtime_log(f'{prefix} PROMPT_METHOD_START={method_name} attempt={attempt}')
             try:
-                drv.execute_cdp_cmd('Input.insertText', {'text': text})
-                append_runtime_log(f'{prefix} PROMPT_INJECTING via CDP')
-                append_runtime_log(f'{prefix} GEMINI_PROMPT_INJECT_METHOD tier={attempt}:cdp_input_insertText')
-            except Exception as cdp_err:
-                append_runtime_log(f'{prefix} CDP notice ({cdp_err})')
-            time.sleep(0.3)
-            verify_editor = get_active_gemini_image_composer(drv, tid=tid, job_id=job_id) or editor
-            if _verify_editor_prompt(drv, verify_editor, text, tid=tid, job_id=job_id):
-                return True
-            append_runtime_log(f'{prefix} CDP insertText did not verify -- trying xclip fallback')
+                if method(drv, text, tid=tid, job_id=job_id):
+                    append_runtime_log(f'{prefix} PROMPT_METHOD_SUCCESS={method_name}')
+                    emit_live_event(f'job:{job_id}:prompt', f'{prefix} ✅Prompt')
+                    return True
+                append_runtime_log(f'{prefix} PROMPT_METHOD_FAIL={method_name}')
+            except Exception as e:
+                append_runtime_log(f'{prefix} PROMPT_METHOD_EXCEPTION={method_name} {type(e).__name__}: {e}')
+        append_runtime_log(f'{prefix} PROMPT_VERIFY_FAIL attempt {attempt} (all tiers) — retrying')
+        time.sleep(0.3)
 
-            editor = get_active_gemini_image_composer(drv, tid=tid, job_id=job_id) or editor
-            _clear_editor(drv, editor)
-            _focus_and_verify(editor)
-            if _set_clipboard_xclip(text):
-                ActionChains(drv).click(editor).key_down(Keys.CONTROL).send_keys('v').key_up(Keys.CONTROL).perform()
-                append_runtime_log(f'{prefix} PROMPT_INJECTING via xclip Ctrl+V')
-                append_runtime_log(f'{prefix} GEMINI_PROMPT_INJECT_METHOD tier={attempt}:xclip_ctrl_v')
-            else:
-                append_runtime_log(f'{prefix} xclip failed', file=sys.stderr)
-            time.sleep(0.3)
-            verify_editor = get_active_gemini_image_composer(drv, tid=tid, job_id=job_id) or editor
-            if _verify_editor_prompt(drv, verify_editor, text, tid=tid, job_id=job_id):
-                return True
-            append_runtime_log(f'{prefix} xclip paste did not verify -- trying direct send_keys fallback')
-
-            editor = get_active_gemini_image_composer(drv, tid=tid, job_id=job_id) or editor
-            _clear_editor(drv, editor)
-            _focus_and_verify(editor)
-            try:
-                for chunk_start in range(0, len(text), 500):
-                    editor.send_keys(text[chunk_start:chunk_start + 500])
-                    time.sleep(0.03)
-                append_runtime_log(f'{prefix} PROMPT_INJECTING via send_keys chunks')
-                append_runtime_log(f'{prefix} GEMINI_PROMPT_INJECT_METHOD tier={attempt}:send_keys_chunks')
-            except Exception as sk_err:
-                append_runtime_log(f'{prefix} send_keys fallback error: {sk_err}')
-            time.sleep(0.3)
-            verify_editor = get_active_gemini_image_composer(drv, tid=tid, job_id=job_id) or editor
-            if _verify_editor_prompt(drv, verify_editor, text, tid=tid, job_id=job_id):
-                return True
-
-            append_runtime_log(f'{prefix} PROMPT_VERIFY_FAIL attempt {attempt} (all 3 tiers) — retrying')
-        except PromptFailed:
-            raise
-        except Exception as e:
-            append_runtime_log(f'{prefix} Prompt injection exception (attempt {attempt}): {e}')
-            try:
-                _clear_editor(drv, editor)
-            except Exception:
-                pass
-            time.sleep(0.3)
-    raise PromptFailed(f'Tab T{tid}: Prompt injection failed after 2 attempts (CDP/xclip/send_keys all unverified)')
+    emit_live_event(f'job:{job_id}:prompt', f'{prefix} ❌Prompt')
+    raise PromptFailed(f'Tab T{tid}: Prompt injection failed after 2 attempts (all tiers unverified)')
 
 def _log_click_rect_and_occlusion(drv, element, label, prefix=''):
     """Logs the element's viewport rect before a critical click, and whether
@@ -3161,17 +3208,56 @@ def _log_click_rect_and_occlusion(drv, element, label, prefix=''):
     except Exception:
         return True
 
+_SEND_BUTTON_JS = """
+    var editor = arguments[0];
+    var sels = ['mat-icon[fonticon="arrow_upward"]', 'mat-icon[data-mat-icon-name="arrow_upward"]',
+                'mat-icon[fonticon="send"]', 'mat-icon[data-mat-icon-name="send"]',
+                'button[aria-label="Send message"]', "button[data-test-id='send-button']"];
+
+    function collect(root) {
+        var res = [];
+        for (var s = 0; s < sels.length; s++) {
+            var els = root.querySelectorAll(sels[s]);
+            for (var i = 0; i < els.length; i++) {
+                var b = els[i].tagName === 'BUTTON' ? els[i] : els[i].closest('button');
+                if (b && !b.disabled && b.offsetParent !== null) res.push(b);
+            }
+        }
+        return res;
+    }
+
+    // Walk up from the composer looking for an ancestor that already
+    // contains a send-button candidate -- that ancestor is the composer's
+    // real input-area container, so a click found there can't cross-target
+    // another tab/job's send button elsewhere on a shared-driver page.
+    var el = editor;
+    for (var depth = 0; depth < 8 && el; depth++) {
+        var found = collect(el);
+        if (found.length > 0) return {scoped: true, btns: found};
+        el = el.parentElement;
+    }
+    return {scoped: false, btns: collect(document)};
+"""
+
+
 def _click_send_button_once(drv, tid=0, job_id=''):
     prefix = f'[T{tid}][{job_id}]' if job_id else f'[T{tid}]'
-    try:
-        candidates = drv.execute_script('\n            var sels = [\'mat-icon[fonticon="arrow_upward"]\', \'mat-icon[data-mat-icon-name="arrow_upward"]\',\n                        \'mat-icon[fonticon="send"]\', \'button[aria-label="Send message"]\'];\n            var res = [];\n            for (var s = 0; s < sels.length; s++) {\n                var els = document.querySelectorAll(sels[s]);\n                for (var i = 0; i < els.length; i++) {\n                    var b = els[i].tagName === \'BUTTON\' ? els[i] : els[i].closest(\'button\');\n                    if (b && !b.disabled && b.offsetParent !== null) res.push(b);\n                }\n            } return res;\n        ') or []
-        for btn in candidates:
-            if not _log_click_rect_and_occlusion(drv, btn, 'SEND', prefix):
-                continue
-            drv.execute_script('arguments[0].click();', btn)
-            return True
-    except Exception:
-        pass
+    editor = get_active_gemini_image_composer(drv, tid=tid, job_id=job_id)
+    if editor is not None:
+        try:
+            result = drv.execute_script(_SEND_BUTTON_JS, editor)
+            if result:
+                if not result.get('scoped'):
+                    append_runtime_log(f'{prefix} SEND_SCOPE_FALLBACK — no composer-scoped ancestor found, using page-wide scan')
+                for btn in result.get('btns') or []:
+                    if not _log_click_rect_and_occlusion(drv, btn, 'SEND', prefix):
+                        continue
+                    drv.execute_script('arguments[0].click();', btn)
+                    return True
+        except Exception as e:
+            append_runtime_log(f'{prefix} SEND_SCOPE_LOOKUP_ERROR: {e}')
+    else:
+        append_runtime_log(f'{prefix} SEND_ABORT no active composer to scope from')
     for xp in ["//mat-icon[@data-mat-icon-name='arrow_upward']/ancestor::button", "//mat-icon[@fonticon='arrow_upward']/ancestor::button", "//button[@aria-label='Send message']"]:
         try:
             for btn in drv.find_elements(By.XPATH, xp):
@@ -3209,6 +3295,7 @@ def _click_send_button(drv, tid=0, job_id=''):
         pre_len = int(_gemini_ui_snapshot(drv).get('composer_text_len') or -1)
     except Exception:
         pass
+    emit_live_event(f'job:{job_id}:send', f'{prefix} 📤SendTarget')
     clicked = False
     for attempt in range(1, MAX_SEND_RETRIES + 1):
         if _click_send_button_once(drv, tid=tid, job_id=job_id):
@@ -3217,7 +3304,7 @@ def _click_send_button(drv, tid=0, job_id=''):
         time.sleep(SEND_RETRY_GAP_S)
     if not clicked:
         try:
-            editor = get_quill_editor(drv)
+            editor = get_active_gemini_image_composer(drv, tid=tid, job_id=job_id)
             if editor and editor.is_displayed():
                 editor.send_keys(Keys.RETURN)
                 append_runtime_log(f'{prefix} SEND via Enter fallback')
@@ -3225,7 +3312,9 @@ def _click_send_button(drv, tid=0, job_id=''):
         except Exception as e:
             append_runtime_log(f'{prefix} Enter fallback failed: {e}')
     if not clicked:
+        emit_live_event(f'job:{job_id}:send', f'{prefix} ❌SendTarget')
         return False
+    emit_live_event(f'job:{job_id}:send', f'{prefix} 📤SendClick')
     append_runtime_log(f'{prefix} GEMINI_SEND_CLICKED pre_composer_len={pre_len}')
     deadline = time.time() + 8.0
     while time.time() < deadline:
@@ -3238,12 +3327,14 @@ def _click_send_button(drv, tid=0, job_id=''):
                 f"gen_evidence={gen_evidence} composer_len={snap.get('composer_text_len')}"
             )
             append_runtime_log(f'{prefix} SEND_VERIFIED ✅')
+            emit_live_event(f'job:{job_id}:send', f'{prefix} ✅Sent')
             return True
         time.sleep(0.4)
     append_runtime_log(
         f"{prefix} SEND_NOT_CONFIRMED composer did not empty / no generation evidence within 8s "
         f"(last composer_len={_gemini_ui_snapshot(drv).get('composer_text_len')})"
     )
+    emit_live_event(f'job:{job_id}:send', f'{prefix} ❌SendVerify')
     return False
 
 def verify_generation_started(drv, timeout=6.0):
