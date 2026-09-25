@@ -2650,12 +2650,14 @@ class GeminiWorker:
 
                 # T0-T3 are TABS of the single shared, already-authenticated chrome_driver
                 # (see _create_gemini_tab) -- never a second Chrome process on the same profile.
+                print(f"{prefix} OPENING GEMINI", flush=True)
                 if self.handle is None or self.handle not in chrome_driver.window_handles:
                     self.handle = _create_gemini_tab(tid_int)
                     log(f"{prefix} PHYSICAL_TAB_CREATED handle={self.handle}")
                 chrome_driver.switch_to.window(self.handle)
                 self.driver = chrome_driver
 
+                print(f"{prefix} NEW CHAT", flush=True)
                 tab_id_str = open_new_chat_and_reload(self.driver, tid_int, ctx.job_id)
                 if not tab_id_str:
                     raise RuntimeError("Failed to create/find target tab")
@@ -2663,30 +2665,40 @@ class GeminiWorker:
                 job_dir, staging_dir = get_chrome_job_dir(tid_int, ctx.job_id)
                 set_tab_download_dir(self.driver, str(staging_dir))
 
+                print(f"{prefix} CREATE IMAGE MODE", flush=True)
                 ensure_create_image_mode(self.driver, tid_int, ctx.job_id)
 
+                print(f"{prefix} UPLOADING REFERENCES", flush=True)
                 upload_reference_files(self.driver, ctx.reference_paths, tid_int, ctx.job_id)
                 verify_attachment_count(self.driver, expected=len(ctx.reference_paths), tid=tid_int, job_id=ctx.job_id)
+                print(f"{prefix} ATTACHMENTS VERIFIED", flush=True)
 
                 _inject_prompt_atomic(self.driver, ctx.prompt, tid_int, ctx.job_id)
+                print(f"{prefix} PROMPT INJECTED", flush=True)
 
                 urls_before = snapshot_urls(self.driver)
                 _click_send_button(self.driver)
+                print(f"{prefix} SEND CLICKED", flush=True)
 
                 started = verify_generation_started(self.driver)
                 if not started:
                     raise RuntimeError("Generation did not start")
+                print(f"{prefix} GENERATION STARTED", flush=True)
 
                 _has_generated_image(self.driver, urls_before)
+                print(f"{prefix} IMAGE DETECTED", flush=True)
 
                 chat_urls = snapshot_urls(self.driver)
                 _hover_and_dl_single_click(self.driver, urls_before, chat_urls)
+                print(f"{prefix} DOWNLOAD CLICKED", flush=True)
 
                 expected_png = f"{ctx.job_id}.png"
 
                 ctx.transition_sync(JobState.RAW_DOWNLOAD_START)
                 dl_guid, source = _detect_download_start(self.driver, staging_dir, timeout=60)
                 ctx.raw_guid = dl_guid
+                print(f"{prefix} DOWNLOAD START DETECTED", flush=True)
+                print(f"{prefix} REAL CHROME GUID = {dl_guid} (source={source})", flush=True)
 
                 record_id = f"gemini:{ctx.job_id}:{time.monotonic_ns()}"
                 with DOWNLOAD_REGISTRY_LOCK:
@@ -2708,6 +2720,8 @@ class GeminiWorker:
                 release_gemini_once(ctx)
                 ctx.transition_sync(JobState.GEMINI_RELEASED)
                 ctx.transition_sync(JobState.RAW_DOWNLOADING)
+                print(f"{prefix} GEMINI RESOURCE RELEASED", flush=True)
+                print(f"{prefix} RAW DOWNLOAD CONTINUES", flush=True)
 
             except Exception as e:
                 ctx.error = str(e)
@@ -2741,28 +2755,34 @@ class WmrDriverThread(threading.Thread):
                     if self.driver is None:
                         self.driver = create_wmr_chrome_driver(self.resource_id)
                         self.driver.get("https://www.watermarkremover.io/upload")
-                    
+                    print(f"{prefix} DRIVER READY", flush=True)
+                    print(f"{prefix} OPENING WMR", flush=True)
+
                     ctx.transition_sync(JobState.WMR_PROCESSING)
-                    
+
                     staging_dir = Path(WMR_STAGING_BASE) / self.resource_id / ctx.job_id
                     staging_dir.mkdir(parents=True, exist_ok=True)
-                    
+
                     set_tab_download_dir(self.driver, str(staging_dir))
 
+                    print(f"{prefix} UPLOADING RAW PNG", flush=True)
                     _wmr_expose_file_inputs(self.driver)
                     file_input = _wmr_find_file_input(self.driver)
                     file_input.send_keys(str(Path(ctx.raw_path).resolve()))
 
+                    print(f"{prefix} PROCESSING", flush=True)
                     try: _wmr_check_status(self.driver)
-                    except Exception: pass 
-                        
+                    except Exception: pass
+
                     try: _wmr_click_download(self.driver)
                     except Exception: _wmr_click_download(self.driver, attempts=6)
+                    print(f"{prefix} DOWNLOAD CLICKED", flush=True)
 
                     expected_png = f"{ctx.job_id}_clean.png"
                     ctx.transition_sync(JobState.WMR_DOWNLOAD_START)
 
                     dl_guid, source = _detect_download_start(self.driver, staging_dir, timeout=60)
+                    print(f"{prefix} REAL CHROME GUID = {dl_guid} (source={source})", flush=True)
 
                     record_id = f"wmr:{ctx.job_id}:{time.monotonic_ns()}"
                     with DOWNLOAD_REGISTRY_LOCK:
@@ -2783,6 +2803,7 @@ class WmrDriverThread(threading.Thread):
                     
                     release_wmr_once(ctx)
                     ctx.transition_sync(JobState.WMR_RELEASED)
+                    print(f"{prefix} WMR RESOURCE RELEASED", flush=True)
 
                 except Exception as e:
                     ctx.error = str(e)
@@ -2809,33 +2830,43 @@ async def execute_pipeline(ctx: JobContext):
             ctx.transition_sync(JobState.COMPLETED)
             return
 
+        print(f"[JOB] {ctx.job_id}: Resolving references", flush=True)
         prompt, garment_path, model_path, holo_path = resolve_prompt_and_refs(ctx.payload)
         ctx.prompt = prompt
         ctx.garment_path = garment_path
         ctx.model_path = model_path
         ctx.holo_path = holo_path
         ctx.reference_paths = [p for p in (garment_path, holo_path, model_path) if p]
-        
+
         for p in ctx.reference_paths:
             if not Path(p).exists() or Path(p).stat().st_size == 0:
                 raise RuntimeError(f"Reference invalid: {p}")
-        
+        print(f"[JOB] {ctx.job_id}: References ready ({len(ctx.reference_paths)} files)", flush=True)
+
+        print(f"[PIPELINE][{ctx.job_id}] GEMINI QUEUED", flush=True)
+        print(f"[PIPELINE][{ctx.job_id}] Acquiring Gemini resource", flush=True)
         tid = await GEMINI_BROKER.acquire(ctx.job_id)
         ctx.gemini_resource = tid
         ctx.transition_sync(JobState.GEMINI_RESERVED)
-        
+        print(f"[PIPELINE][{ctx.job_id}] Gemini acquired = {tid}", flush=True)
+
         worker = GEMINI_WORKERS[tid]
+        print(f"[PIPELINE][{ctx.job_id}] Gemini execution started", flush=True)
         await ctx.loop.run_in_executor(GEMINI_EXECUTOR, worker.do_execute_sync, ctx)
         await ctx.wait_for_state(JobState.RAW_VALIDATED)
-        
+
         ctx.transition_sync(JobState.WMR_QUEUED)
+        print(f"[PIPELINE][{ctx.job_id}] WMR QUEUED", flush=True)
+        print(f"[PIPELINE][{ctx.job_id}] Acquiring WMR resource", flush=True)
         w_tid = await WMR_BROKER.acquire(ctx.job_id)
         ctx.wmr_resource = w_tid
         ctx.transition_sync(JobState.WMR_RESERVED)
-        
+        print(f"[PIPELINE][{ctx.job_id}] WMR resource acquired = {w_tid}", flush=True)
+
         WMR_THREADS[w_tid].command_queue.put(("EXECUTE", ctx))
         await ctx.wait_for_state(JobState.CLEAN_READY)
-        
+        print(f"[PIPELINE][{ctx.job_id}] CLEAN_READY", flush=True)
+
         webp_path = Path(ctx.clean_png_path).with_suffix('.webp')
         result = subprocess.run(['cwebp', '-q', '80', ctx.clean_png_path, '-o', str(webp_path)], capture_output=True)
         if result.returncode != 0:
@@ -2850,6 +2881,7 @@ async def execute_pipeline(ctx: JobContext):
             raise RuntimeError("WebP validation failed (format/dimensions/size check)")
         ctx.webp_path = str(webp_path)
         ctx.transition_sync(JobState.WEBP_READY)
+        print(f"[PIPELINE][{ctx.job_id}] WEBP_READY", flush=True)
 
         fs = sys.modules["fashion_studio"]
         fs.push_generation(
@@ -2861,13 +2893,16 @@ async def execute_pipeline(ctx: JobContext):
             force=True
         )
         ctx.transition_sync(JobState.R2_READY)
+        print(f"[PIPELINE][{ctx.job_id}] R2_READY (PNG + WebP uploaded)", flush=True)
         ctx.transition_sync(JobState.DB_FINALIZING)
         ctx.transition_sync(JobState.DB_READY)
+        print(f"[PIPELINE][{ctx.job_id}] DB_READY", flush=True)
 
         try:
             crd = sys.modules["credits"]
             crd.settle_look(ctx.job_id)
             ctx.transition_sync(JobState.CREDITS_SETTLED)
+            print(f"[PIPELINE][{ctx.job_id}] CREDITS_SETTLED", flush=True)
         except Exception as e:
             # R2 upload + DB finalization already succeeded above -- the image was
             # delivered to the user. Do not fail/refund a completed job over a
@@ -2875,6 +2910,7 @@ async def execute_pipeline(ctx: JobContext):
             log(f"[{ctx.job_id}] CREDITS_SETTLE_FAILED (job still marked COMPLETED): {e}")
 
         ctx.transition_sync(JobState.COMPLETED)
+        print(f"[PIPELINE][{ctx.job_id}] COMPLETED", flush=True)
 
     except Exception as e:
         ctx.error = str(e)
@@ -2891,16 +2927,19 @@ async def execute_pipeline(ctx: JobContext):
 # DOWNLOAD WATCHER
 # ------------------------------------------------------------------------------
 
+_DOWNLOADS_SEEN_FILE = set()  # dict_key -> already printed "file detected" for this record
+
 async def poll_downloads_loop():
     while True:
         try:
             with DOWNLOAD_REGISTRY_LOCK:
                 items = list(DOWNLOAD_REGISTRY.items())
-            
+
             for dict_key, rec in items:
                 ctx = JOB_CONTEXTS.get(rec.job_id)
                 if not ctx or ctx.state == JobState.FAILED:
                     with DOWNLOAD_REGISTRY_LOCK: DOWNLOAD_REGISTRY.pop(dict_key, None)
+                    _DOWNLOADS_SEEN_FILE.discard(dict_key)
                     continue
 
                 staging = Path(rec.staging_dir)
@@ -2916,6 +2955,13 @@ async def poll_downloads_loop():
                     completed_file = f
                     break
 
+                kind = "RAW" if rec.target_state == JobState.RAW_VALIDATED else "CLEAN"
+                if completed_file and dict_key not in _DOWNLOADS_SEEN_FILE:
+                    _DOWNLOADS_SEEN_FILE.add(dict_key)
+                    print(f"[DOWNLOAD][{rec.job_id}] {kind} DOWNLOAD STARTED", flush=True)
+                    print(f"[DOWNLOAD][{rec.job_id}] waiting for filesystem completion", flush=True)
+                    print(f"[DOWNLOAD][{rec.job_id}] file detected", flush=True)
+
                 if completed_file:
                     size_before = -1
                     stable = False
@@ -2930,8 +2976,10 @@ async def poll_downloads_loop():
                         except Exception: pass
 
                     if stable:
+                        print(f"[DOWNLOAD][{rec.job_id}] file stable", flush=True)
                         try:
                             validate_image_file(str(completed_file))
+                            print(f"[DOWNLOAD][{rec.job_id}] PNG VALIDATED", flush=True)
                             if rec.target_state == JobState.RAW_VALIDATED:
                                 ctx.raw_path = str(completed_file)
                                 ctx.transition_sync(JobState.RAW_READY)
@@ -2939,10 +2987,12 @@ async def poll_downloads_loop():
                                 ctx.clean_png_path = str(completed_file)
 
                             ctx.transition_sync(rec.target_state)
+                            print(f"[DOWNLOAD][{rec.job_id}] {rec.target_state.name}", flush=True)
                             with DOWNLOAD_REGISTRY_LOCK: DOWNLOAD_REGISTRY.pop(dict_key, None)
+                            _DOWNLOADS_SEEN_FILE.discard(dict_key)
                         except Exception as e:
                             print(f"[{rec.job_id}] DOWNLOAD_VALIDATE_FAILED: {e}")
-                            
+
         except Exception as e:
             print(f"[DOWNLOAD_WATCHER_ERROR] {e}")
         await asyncio.sleep(1)
@@ -2953,23 +3003,32 @@ async def poll_downloads_loop():
 
 async def process_bullmq_job(job, job_token):
     generation_id = job.data.get("generationId") or job.data.get("id") or job.id
-    print(f"[{WORKER_ID}] BullMQ job={job.id} generation={generation_id}")
+    print("=" * 60, flush=True)
+    print("BULLMQ JOB RECEIVED", flush=True)
+    print("=" * 60, flush=True)
+    print(f"  job.id:         {job.id}", flush=True)
+    print(f"  job.name:       {job.name}", flush=True)
+    print(f"  generationId:   {generation_id}", flush=True)
 
     existing = JOB_CONTEXTS.get(generation_id)
     if existing is not None and existing.state not in (JobState.COMPLETED, JobState.FAILED):
         log(f"[{generation_id}] DUPLICATE_JOB_REJECTED: already in-flight (state={existing.state.name})")
         raise RuntimeError(f"Duplicate job for generation {generation_id} already in-flight (state={existing.state.name})")
 
+    print(f"[JOB] {generation_id}: Fetching generation from PostgreSQL", flush=True)
     gen = fetch_generation(generation_id)
     if not gen: raise RuntimeError(f"Generation {generation_id} not found in DB.")
+    print(f"[JOB] {generation_id}: Generation loaded", flush=True)
 
     ctx = JobContext(job_id=generation_id, payload=gen, loop=asyncio.get_running_loop())
     JOB_CONTEXTS[generation_id] = ctx
-    
+
+    print(f"[JOB] {generation_id}: Entering execute_pipeline()", flush=True)
     await execute_pipeline(ctx)
 
     if ctx.state == JobState.FAILED:
         raise RuntimeError(ctx.error)
+    print(f"[JOB] {generation_id}: COMPLETED", flush=True)
     return {"status": "success"}
 
 
@@ -3132,97 +3191,123 @@ async def worker_heartbeat_loop():
 
         await asyncio.sleep(10)
 
+REDIS_STARTUP_TIMEOUT_S = float(os.environ.get("REDIS_STARTUP_TIMEOUT_S", "15"))
+
 async def main():
+    print("=" * 80, flush=True)
+    print("RUNTIME MAIN ENTERED", flush=True)
+    print("=" * 80, flush=True)
     try:
         global BULLMQ_WORKER, QUEUE_MONITOR_TASK, HEARTBEAT_TASK, WATCHER_TASK
-        
-        print("STEP 11: REDIS HEALTH")
+
+        print("STEP 11: REDIS HEALTH", flush=True)
         opts = {"connection": os.environ.get("REDIS_URL"), "prefix": os.environ.get("REDIS_KEY_PREFIX")}
+        print("[REDIS] Building connection options", flush=True)
         real_opts = build_redis_connection_opts(opts["connection"])
         QUEUE_NAME = os.environ.get("QUEUE_NAME", "generations")
-        
-        # Redis pre-flight
+
+        # Redis pre-flight -- bounded by a hard timeout so an unreachable
+        # Redis (blocked egress, wrong host, firewalled port) fails loudly
+        # within REDIS_STARTUP_TIMEOUT_S instead of hanging startup forever
+        # (bullmq's own RedisConnection retries certain errors internally).
         try:
+            print("[REDIS] Creating Queue", flush=True)
             _q = Queue(QUEUE_NAME, {"connection": real_opts, "prefix": opts["prefix"]})
-            await _q.getJobCounts()
+            print("[REDIS] PING / getJobCounts starting", flush=True)
+            await asyncio.wait_for(_q.getJobCounts(), timeout=REDIS_STARTUP_TIMEOUT_S)
+            print("[REDIS] getJobCounts completed", flush=True)
             await _q.close()
-            print("[REDIS] CONNECTION = OK")
+            print("[REDIS] CONNECTION = OK", flush=True)
             RUNTIME_HEALTH["redis"] = True
-        except Exception as e:
-            print("[REDIS] CONNECTION = FAILED")
+        except asyncio.TimeoutError:
+            print(f"[REDIS] STARTUP TIMEOUT after {REDIS_STARTUP_TIMEOUT_S}s", flush=True)
+            print("[REDIS] CONNECTION = FAILED", flush=True)
+            raise
+        except Exception:
+            print("[REDIS] CONNECTION = FAILED", flush=True)
+            import traceback
+            traceback.print_exc()
             raise
 
-        print("STEP 12: DATABASE HEALTH")
+        print("STEP 12: DATABASE HEALTH", flush=True)
+        print("[DB] SELECT 1 starting", flush=True)
         db_conn = sys.modules['db'].borrow()
         db_conn.cursor().execute("SELECT 1")
         db_conn.close()
-        print("[DB] CONNECTION = OK")
+        print("[DB] SELECT 1 completed", flush=True)
+        print("[DB] CONNECTION = OK", flush=True)
         RUNTIME_HEALTH["db"] = True
 
-        print("STEP 13: R2 HEALTH")
+        print("STEP 13: R2 HEALTH", flush=True)
+        print("[R2] health check starting", flush=True)
         if fs_configured():
             try:
                 _r2_client().head_bucket(Bucket=R2_BUCKET_NAME)
-                print("[R2] HEALTH = OK")
+                print("[R2] HEALTH = OK", flush=True)
                 RUNTIME_HEALTH["r2"] = True
             except Exception as e:
-                print(f"[R2] HEALTH = FAILED: {type(e).__name__}")
+                print(f"[R2] HEALTH = FAILED: {type(e).__name__}", flush=True)
                 RUNTIME_HEALTH["r2"] = False
                 raise
         else:
-            print("[R2] HEALTH = FAILED: R2 not configured")
+            print("[R2] HEALTH = FAILED: R2 not configured", flush=True)
             RUNTIME_HEALTH["r2"] = False
             raise RuntimeError("R2 required but not configured")
 
-        print("STEP 14: GEMINI BROKER")
+        print("STEP 14: GEMINI BROKER", flush=True)
         run_architecture_self_test()
 
-        print("STEP 15: WMR BROKER")
+        print("STEP 15: WMR BROKER", flush=True)
         initialize_runtime_once()
 
-        print("STEP 16: DOWNLOAD MONITOR")
+        print("STEP 16: DOWNLOAD MONITOR", flush=True)
         WATCHER_TASK = asyncio.create_task(poll_downloads_loop())
         BACKGROUND_TASKS.add(WATCHER_TASK)
         RUNTIME_HEALTH["download_monitor"] = True
+        print("[DOWNLOAD] monitor task created", flush=True)
 
-        print("STEP 17: REDIS QUEUE MONITOR")
+        print("STEP 17: REDIS QUEUE MONITOR", flush=True)
         if QUEUE_MONITOR_TASK and not QUEUE_MONITOR_TASK.done():
-            print("[REDIS MONITOR] Already running")
+            print("[REDIS MONITOR] Already running", flush=True)
         else:
             QUEUE_MONITOR_TASK = asyncio.create_task(redis_queue_monitor_loop())
             BACKGROUND_TASKS.add(QUEUE_MONITOR_TASK)
+        print("[QUEUE] monitor task created", flush=True)
 
-        print("STEP 18: WORKER HEARTBEAT")
+        print("STEP 18: WORKER HEARTBEAT", flush=True)
         if HEARTBEAT_TASK and not HEARTBEAT_TASK.done():
-            print("[HEARTBEAT] Already running")
+            print("[HEARTBEAT] Already running", flush=True)
         else:
             HEARTBEAT_TASK = asyncio.create_task(worker_heartbeat_loop())
             BACKGROUND_TASKS.add(HEARTBEAT_TASK)
+        print("[HEARTBEAT] task created", flush=True)
 
-        print("STEP 19: BULLMQ WORKER")
+        print("STEP 19: BULLMQ WORKER", flush=True)
         # concurrency is BullMQ's own job-admission width, independent of the
         # 4 Gemini / 8 WMR resource counts -- those are enforced separately
         # by GEMINI_BROKER/WMR_BROKER.acquire() backpressure. Leaving this
         # unset falls back to bullmq's library default of 1, which would
         # serialize every job and starve the resource brokers.
+        print("[BULLMQ] Creating Worker", flush=True)
         BULLMQ_WORKER = Worker(QUEUE_NAME, process_bullmq_job, {"connection": real_opts, "prefix": opts["prefix"], "concurrency": BULLMQ_CONCURRENCY})
-        print(f"[BULLMQ] concurrency={BULLMQ_CONCURRENCY}")
+        print(f"[BULLMQ] Worker CREATED (concurrency={BULLMQ_CONCURRENCY})", flush=True)
         RUNTIME_HEALTH["bullmq"] = True
 
-        print("STEP 20: WORKER READY")
-        print("\n============================================================")
-        print("N2N WORKER READY")
-        print("============================================================")
-        
+        print("STEP 20: WORKER READY", flush=True)
+        print("\n============================================================", flush=True)
+        print("N2N WORKER READY", flush=True)
+        print("============================================================", flush=True)
+        print(f"[BULLMQ] Waiting for jobs from queue: {QUEUE_NAME}", flush=True)
+
         while True:
             await asyncio.sleep(3600)
-            
+
     except asyncio.CancelledError:
         raise
     except Exception:
-        print("============================================================")
-        print("[FATAL STARTUP ERROR]")
-        print("============================================================")
+        print("============================================================", flush=True)
+        print("[FATAL STARTUP ERROR]", flush=True)
+        print("============================================================", flush=True)
         import traceback
         traceback.print_exc()
         raise
@@ -3250,48 +3335,114 @@ _RUNTIME_INITIALIZED = False
 def _worker_main_task_done(task):
     global _RUNTIME_INITIALIZED
     if task.cancelled():
-        print("[WORKER] MAIN TASK CANCELLED")
+        print("[WORKER] MAIN TASK CANCELLED", flush=True)
+        _RUNTIME_INITIALIZED = False
         return
 
     exc = task.exception()
     if exc:
-        print("=" * 70)
-        print("[FATAL] WORKER MAIN TASK CRASHED")
-        print("=" * 70)
+        print("=" * 70, flush=True)
+        print("[FATAL] WORKER MAIN TASK CRASHED", flush=True)
+        print("=" * 70, flush=True)
         import traceback
         traceback.print_exception(
             type(exc),
             exc,
             exc.__traceback__,
         )
+    else:
+        # main() is an infinite `while True: await asyncio.sleep(...)` loop
+        # (see STEP 20 onward). It returning at all -- without raising --
+        # means it exited early somewhere before that loop, which must never
+        # happen silently.
+        print("=" * 70, flush=True)
+        print("[FATAL] WORKER MAIN TASK EXITED UNEXPECTEDLY (no exception, but main() returned)", flush=True)
+        print("=" * 70, flush=True)
     _RUNTIME_INITIALIZED = False
 
 def start_worker():
     global WORKER_MAIN_TASK, _RUNTIME_INITIALIZED
-    
+
     if _RUNTIME_INITIALIZED:
-        print("[BOOT] Existing worker already running")
+        print("[BOOT] WORKER ALREADY RUNNING -- returning existing task", flush=True)
         return WORKER_MAIN_TASK
-        
-    try: loop = asyncio.get_running_loop()
-    except RuntimeError: return asyncio.run(main())
-    
+
+    print("[BOOT] STARTING RUNTIME MAIN TASK", flush=True)
+
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        # No loop running (plain `python FULL_QUEUE_WORKER_FINAL.py`) -- this
+        # blocks until main() returns/raises, so all of main()'s own prints
+        # appear normally; nothing further to do here.
+        return asyncio.run(main())
+
     if WORKER_MAIN_TASK and not WORKER_MAIN_TASK.done():
+        print("[BOOT] WORKER ALREADY RUNNING -- returning existing task", flush=True)
         return WORKER_MAIN_TASK
-        
+
     _RUNTIME_INITIALIZED = True
     WORKER_MAIN_TASK = loop.create_task(main())
     WORKER_MAIN_TASK.add_done_callback(_worker_main_task_done)
+    print("[BOOT] WORKER_MAIN_TASK CREATED", flush=True)
+    print(
+        "[BOOT] A loop is already running (Colab/IPython) -- main() now runs "
+        "in the background on that same loop. If this is the LAST statement "
+        "of the cell that ran this file, the cell ends here and none of "
+        "main()'s own STEP 11+ prints will be visible until you explicitly "
+        "await this task. In a NEW cell, run:\n"
+        "      task = launch_worker()\n"
+        "      await task\n"
+        "(launch_worker() is idempotent -- it returns this same task if the "
+        "worker is already running.)",
+        flush=True,
+    )
     return WORKER_MAIN_TASK
 
+def launch_worker():
+    """Public Colab/notebook entrypoint: `task = launch_worker(); await task`
+    in its own cell. Never creates a second main()/Worker/scheduler -- it is
+    a thin wrapper over start_worker(), which already guards against a
+    duplicate runtime via _RUNTIME_INITIALIZED."""
+    return start_worker()
+
 if __name__ == '__main__':
-    # start_worker() already handles both cases: it schedules main() on the
-    # current running loop (Colab/IPython kernel loop) via create_task, or
-    # falls back to asyncio.run() when no loop is running (plain `python
+    print("=" * 80, flush=True)
+    _self_path = globals().get('__file__')
+    if _self_path:
+        print("[BOOT] SOURCE FILE =", os.path.abspath(_self_path), flush=True)
+        try:
+            with open(_self_path, 'r', encoding='utf-8') as _f:
+                print("[BOOT] SOURCE LINE COUNT =", sum(1 for _ in _f), flush=True)
+        except Exception as _e:
+            print("[BOOT] SOURCE LINE COUNT = UNKNOWN:", _e, flush=True)
+        try:
+            _commit = subprocess.run(
+                ['git', 'rev-parse', '--short', 'HEAD'],
+                cwd=os.path.dirname(os.path.abspath(_self_path)),
+                capture_output=True, text=True, timeout=5,
+            )
+            print("[BOOT] SOURCE COMMIT =", _commit.stdout.strip() if _commit.returncode == 0 else "UNKNOWN", flush=True)
+        except Exception:
+            print("[BOOT] SOURCE COMMIT = UNKNOWN", flush=True)
+    else:
+        # Pasted directly into a Colab/notebook cell (not run via `%run` or
+        # `python file.py`) -- there is no __file__ to check in that mode.
+        print("[BOOT] SOURCE FILE = UNKNOWN (no __file__ -- running as a pasted notebook cell, not a script)", flush=True)
+        print("[BOOT] SOURCE LINE COUNT = UNKNOWN (no __file__ in this exec context)", flush=True)
+        print("[BOOT] SOURCE COMMIT = UNKNOWN (no __file__ in this exec context)", flush=True)
+    for _sym in ("main", "start_worker", "launch_worker", "process_bullmq_job", "execute_pipeline"):
+        print(f"[BOOT] {_sym}() =", "PRESENT" if _sym in globals() else "MISSING", flush=True)
+    print("=" * 80, flush=True)
+
+    # start_worker() handles both cases: it schedules main() on the current
+    # running loop (Colab/IPython kernel loop) via create_task, or falls back
+    # to asyncio.run() when no loop is running (plain `python
     # FULL_QUEUE_WORKER_FINAL.py`). Never drive a second loop on top of an
     # already-running one (e.g. via IPython.run_cell("... await ...")) --
     # that is what raised "Cannot run the event loop while another loop is
     # running". When a loop is already running, the returned Task keeps
-    # executing on that same loop after this cell finishes; the launcher
-    # (FULL_QUEUE_WORKER_LAUNCHER.py) is the place to `await` it directly.
+    # executing on that same loop after this cell finishes, but its prints
+    # will not appear until something actually awaits it -- see the
+    # [BOOT] message start_worker() prints above for the exact next step.
     start_worker()
