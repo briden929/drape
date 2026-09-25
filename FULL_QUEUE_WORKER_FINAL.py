@@ -3090,13 +3090,16 @@ def verify_attachment_count(drv, expected: int, tid=0, job_id='', upload_token=N
     preview widgets.
 
     SECONDARY (used only if the tagged input can't be read, e.g. Gemini
-    replaced the input after upload): canonical UI evidence from a single
-    combined query across the known attachment-preview element types,
-    deduplicated by a stable per-element identity (data-id / data-filename
-    / aria-label / text), never by summing separate selector-family counts
-    the way the old implementation did -- that summing is what let one
-    real upload (rendered as several nested wrapper layers) count as
-    several attachments and produce "expected 3, got 5".
+    replaced the input after upload): canonical UI evidence counting only
+    visible <gem-media-attachment> elements. A prior version of this check
+    combined gem-media-attachment + uploader-file-preview +
+    [data-test-id="uploaded-img"] in one query -- but those selectors can
+    each match a DIFFERENT real DOM node for the SAME single attached file
+    (an outer wrapper plus its own nested preview/image node), so summing
+    them produced ATTACHMENT_OVERCOUNT for a real, correctly-sized upload.
+    gem-media-attachment alone is the top-level attachment component and
+    is what a known-working reference implementation of this same check
+    used successfully.
     """
     prefix = f'[T{tid}][{job_id}]' if job_id else f'[T{tid}]'
     if expected <= 0:
@@ -3121,18 +3124,14 @@ def verify_attachment_count(drv, expected: int, tid=0, job_id='', upload_token=N
                     append_runtime_log(f'{prefix} ATTACHMENTS {last_actual}/{expected} ✅ FILELIST EXACT')
                     return (True, last_actual)
                 if last_actual > expected:
-                    raise RuntimeError(f'{prefix} ATTACHMENT_OVERCOUNT: expected {expected}, got {last_actual}')
+                    raise RuntimeError(f'{prefix} ATTACHMENT_OVERCOUNT source=FILELIST: expected {expected}, got {last_actual}')
 
         try:
             result = drv.execute_script(
-                "var selectors = ['gem-media-attachment', 'uploader-file-preview', '[data-test-id=\"uploaded-img\"]'];"
-                "var unique = new Set();"
-                "selectors.forEach(function(sel) {"
-                "  document.querySelectorAll(sel).forEach(function(el) {"
-                "    if (el.offsetParent !== null) unique.add(el);"
-                "  });"
-                "});"
-                "return unique.size;"
+                "var nodes = document.querySelectorAll('gem-media-attachment');"
+                "var count = 0;"
+                "nodes.forEach(function(el) { if (el.offsetParent !== null) count++; });"
+                "return count;"
             )
         except Exception:
             result = None
@@ -3142,7 +3141,7 @@ def verify_attachment_count(drv, expected: int, tid=0, job_id='', upload_token=N
                 append_runtime_log(f'{prefix} ATTACHMENTS {result}/{expected} ✅ CANONICAL UI EXACT')
                 return (True, result)
             if result > expected:
-                raise RuntimeError(f'{prefix} ATTACHMENT_OVERCOUNT: expected {expected}, got {result}')
+                raise RuntimeError(f'{prefix} ATTACHMENT_OVERCOUNT source=CANONICAL_UI: expected {expected}, got {result}')
 
         time.sleep(0.25)
 
