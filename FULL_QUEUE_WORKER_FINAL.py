@@ -2729,6 +2729,11 @@ def record_dead_letter(gen, failed_reason, attempts_made, max_attempts, error_st
 class JobState(Enum):
     QUEUED = "QUEUED"
     GEMINI_RESERVED = "GEMINI_RESERVED"
+    GEMINI_NEW_CHAT = "GEMINI_NEW_CHAT"
+    GEMINI_MODE_SELECT = "GEMINI_MODE_SELECT"
+    GEMINI_UPLOADING = "GEMINI_UPLOADING"
+    GEMINI_PROMPT = "GEMINI_PROMPT"
+    GEMINI_SEND_PENDING = "GEMINI_SEND_PENDING"
     GEMINI_GENERATING = "GEMINI_GENERATING"
     RAW_DOWNLOAD_START = "RAW_DOWNLOAD_START"
     GEMINI_RELEASED = "GEMINI_RELEASED"
@@ -2819,7 +2824,7 @@ class JobContext:
     def _set_state_threadsafe(self, new_state: JobState):
         old = self.state
         self.state = new_state
-        print(f"[STATE][{self.job_id}] {old.name} -> {new_state.name}", flush=True)
+        append_runtime_log(f"[STATE][{self.job_id}] {old.name} -> {new_state.name}")
         _timing_field = self._TIMING_FIELD_BY_STATE.get(new_state)
         if _timing_field is not None and getattr(self, _timing_field) is None:
             setattr(self, _timing_field, time.time())
@@ -3235,7 +3240,15 @@ class GeminiWorker:
         append_runtime_log(f"{prefix} START")
         tid_int = int(self.tid.replace('T', ''))
         try:
-            ctx.transition_sync(JobState.GEMINI_GENERATING)
+            # State was previously set to GEMINI_GENERATING here, before New
+            # Chat/Flash/Create Image/upload/prompt/send even ran -- so the
+            # dashboard could show "GENERATING" for many seconds while the
+            # browser was still sitting on the plain "Where should we
+            # start?" composer. Each state below is only set AFTER the
+            # browser action it names has actually run; GEMINI_GENERATING
+            # itself is now set only once verify_generation_started()
+            # below returns True.
+            ctx.transition_sync(JobState.GEMINI_NEW_CHAT)
 
             # Phase 1: setup (all short Selenium operations) -- held under
             # the lock for its whole duration since these need the shared
@@ -3258,20 +3271,24 @@ class GeminiWorker:
                 job_dir, staging_dir = get_chrome_job_dir(tid_int, ctx.job_id)
                 set_tab_download_dir(self.driver, str(staging_dir))
 
+                ctx.transition_sync(JobState.GEMINI_MODE_SELECT)
                 append_runtime_log(f"{prefix} FLASH MODE")
                 ensure_flash_mode(self.driver, tid_int, ctx.job_id)
 
                 append_runtime_log(f"{prefix} CREATE IMAGE MODE")
                 ensure_create_image_mode(self.driver, tid_int, ctx.job_id)
 
+                ctx.transition_sync(JobState.GEMINI_UPLOADING)
                 append_runtime_log(f"{prefix} UPLOADING REFERENCES")
                 upload_result = upload_reference_files(self.driver, ctx.reference_paths, tid_int, ctx.job_id)
                 verify_attachment_count(self.driver, upload_result["expected"], tid=tid_int, job_id=ctx.job_id, upload_token=upload_result["token"])
                 append_runtime_log(f"{prefix} ATTACHMENTS VERIFIED")
 
+                ctx.transition_sync(JobState.GEMINI_PROMPT)
                 _inject_prompt_atomic(self.driver, ctx.prompt, tid_int, ctx.job_id)
                 append_runtime_log(f"{prefix} PROMPT INJECTED")
 
+                ctx.transition_sync(JobState.GEMINI_SEND_PENDING)
                 urls_before = snapshot_urls(self.driver)
                 if not _click_send_button(self.driver, tid_int, ctx.job_id):
                     raise RuntimeError("SEND_FAILED: Could not click send button")
@@ -3280,6 +3297,7 @@ class GeminiWorker:
                 started = verify_generation_started(self.driver)
                 if not started:
                     raise RuntimeError("Generation did not start")
+                ctx.transition_sync(JobState.GEMINI_GENERATING)
                 append_runtime_log(f"{prefix} GENERATION STARTED")
                 chat_urls = snapshot_urls(self.driver)
 
@@ -4064,6 +4082,11 @@ async def worker_heartbeat_loop():
 
 _GEMINI_DASHBOARD_LABELS = {
     JobState.GEMINI_RESERVED: ("ACQUIRED", "NEW_CHAT"),
+    JobState.GEMINI_NEW_CHAT: ("NEW_CHAT", "MODE_SELECT"),
+    JobState.GEMINI_MODE_SELECT: ("MODE_SELECT", "UPLOAD"),
+    JobState.GEMINI_UPLOADING: ("UPLOADING", "PROMPT"),
+    JobState.GEMINI_PROMPT: ("PROMPT", "SEND"),
+    JobState.GEMINI_SEND_PENDING: ("SEND", "VERIFY"),
     JobState.GEMINI_GENERATING: ("GENERATING", "IMAGE_WAIT"),
     JobState.RAW_DOWNLOAD_START: ("DOWNLOAD", "RELEASE"),
     JobState.FAILED: ("ERROR", "--"),
