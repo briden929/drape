@@ -308,6 +308,26 @@ _REQUIRED_SECRETS = [
     'R2_BUCKET_NAME',
     'R2_PUBLIC_URL'
 ]
+# Colab Secrets are per-Google-account, not per-session/per-notebook: add
+# each of the names above ONCE under the key icon in the left sidebar (with
+# notebook access enabled) and every future run on this account picks them
+# up automatically here -- no separate setup cell, and nothing hardcoded in
+# this tracked file. os.environ is checked first so an explicit env var
+# (e.g. set by a launcher, CI, or `python -m FULL_QUEUE_WORKER_FINAL`)
+# always wins over Colab Secrets.
+try:
+    from google.colab import userdata as _colab_userdata
+    for _k in _REQUIRED_SECRETS:
+        if not os.environ.get(_k):
+            try:
+                _v = _colab_userdata.get(_k)
+                if _v:
+                    os.environ[_k] = _v
+            except Exception:
+                pass
+except Exception:
+    pass  # not running in Colab, or Colab Secrets not configured
+
 _missing = []
 for _k in _REQUIRED_SECRETS:
     if not os.environ.get(_k):
@@ -315,6 +335,7 @@ for _k in _REQUIRED_SECRETS:
 
 if _missing:
     print(f"[FATAL ERROR] Missing required environment variables: {', '.join(_missing)}")
+    print("[FATAL ERROR] Add each one under Colab Secrets (key icon, left sidebar) with notebook access enabled, or set it in os.environ before running this file.")
     sys.exit(1)
 
 os.environ.setdefault('REDIS_KEY_PREFIX', 'vastralook:')
