@@ -3034,6 +3034,45 @@ def upload_reference_files(drv, abs_paths: list, tid=0, job_id='') -> dict:
     append_runtime_log(f'{prefix} UPLOAD_INPUT_DEBUG {json.dumps(debug, default=str)[:1000]}')
     return {'expected': len(valid_paths), 'token': token, 'paths': valid_paths}
 
+def _attachment_dom_forensic(drv, upload_token=None):
+    """Diagnostic-only DOM snapshot taken when verify_attachment_count() is
+    about to give up. Never used as a pass/fail signal itself -- it exists
+    so a real ATTACHMENT_MISMATCH carries enough evidence (which selectors
+    matched what, and the tagged input's own state) to tell whether the
+    canonical UI selectors are stale for the current Gemini DOM, whether
+    the tagged input was replaced/disconnected, or whether the files
+    genuinely never attached."""
+    try:
+        return drv.execute_script(
+            "var token = arguments[0];"
+            "var out = {tagged_input_files_length: null, tagged_input_connected: null,"
+            "  all_file_input_count: 0, candidates: [], candidate_count: 0};"
+            "if (token) {"
+            "  var tagged = document.querySelector('input[type=\"file\"][data-vl-upload-token=\"' + CSS.escape(token) + '\"]');"
+            "  if (tagged) {"
+            "    out.tagged_input_connected = tagged.isConnected;"
+            "    out.tagged_input_files_length = tagged.files ? tagged.files.length : 0;"
+            "  }"
+            "}"
+            "out.all_file_input_count = document.querySelectorAll('input[type=\"file\"]').length;"
+            "var selectors = ['gem-media-attachment', 'uploader-file-preview', '[data-test-id=\"uploaded-img\"]',"
+            "  \"button[aria-label*='Remove']\", \"button[aria-label*='attachment']\"];"
+            "selectors.forEach(function(sel) {"
+            "  document.querySelectorAll(sel).forEach(function(el) {"
+            "    var r = el.getBoundingClientRect();"
+            "    out.candidates.push({selector: sel, tag: el.tagName,"
+            "      aria: el.getAttribute('aria-label'), testid: el.getAttribute('data-test-id'),"
+            "      visible: r.width > 0 && r.height > 0, rect: [Math.round(r.x), Math.round(r.y), Math.round(r.width), Math.round(r.height)]});"
+            "  });"
+            "});"
+            "out.candidate_count = out.candidates.length;"
+            "return out;",
+            upload_token,
+        )
+    except Exception as e:
+        return {'error': str(e)}
+
+
 def verify_attachment_count(drv, expected: int, tid=0, job_id='', upload_token=None, timeout_s=15.0) -> tuple:
     """
     Polls until the attachment count == expected (exact match required).
@@ -3108,7 +3147,14 @@ def verify_attachment_count(drv, expected: int, tid=0, job_id='', upload_token=N
 
         time.sleep(0.25)
 
-    raise RuntimeError(f'{prefix} ATTACHMENT_MISMATCH: expected exactly {expected}, got {last_actual}')
+    forensic = _attachment_dom_forensic(drv, upload_token)
+    append_runtime_log(f'{prefix} ATTACHMENT_DOM_FORENSIC {json.dumps(forensic, default=str)[:8000]}')
+    raise RuntimeError(
+        f'{prefix} ATTACHMENT_MISMATCH: expected exactly {expected}, got {last_actual} '
+        f'(tagged_input={forensic.get("tagged_input_files_length")}, '
+        f'all_file_inputs={forensic.get("all_file_input_count")}, '
+        f'candidate_nodes={forensic.get("candidate_count")})'
+    )
 
 def normalize_prompt_text(text):
     if not text:
@@ -3890,7 +3936,14 @@ def fetch_generation(gen_id):
     finally:
         conn.close()
 
+ALLOW_PROMPT_FALLBACK = os.environ.get('ALLOW_PROMPT_FALLBACK', '0') == '1'
+
 def resolve_prompt_and_refs(gen):
+    db_prompt = gen.get('prompt')
+    if isinstance(db_prompt, str):
+        db_prompt = db_prompt.strip()
+    if not db_prompt and not ALLOW_PROMPT_FALLBACK:
+        raise RuntimeError(f"PROMPT_MISSING_IN_DB: generation {gen['id']} has no prompt (set ALLOW_PROMPT_FALLBACK=1 to allow the generic fallback prompt in development)")
     params = gen.get('params') or {}
     if isinstance(params, str):
         try:
@@ -3907,7 +3960,7 @@ def resolve_prompt_and_refs(gen):
     garment_path = sys.modules['fashion_studio'].download_remote_image(garment_url, REFS_CACHE_DIR)
     model_path = sys.modules['fashion_studio'].download_remote_image(model_img_url, REFS_CACHE_DIR) if model_img_url else None
     holo_path = sys.modules['fashion_studio'].download_remote_image(holo_url, REFS_CACHE_DIR) if holo_url else None
-    prompt = gen.get('prompt') or sys.modules['fashion_studio'].fashion_tryon_prompt(has_model=bool(model_path))
+    prompt = db_prompt or sys.modules['fashion_studio'].fashion_tryon_prompt(has_model=bool(model_path))
     return (prompt, garment_path, model_path, holo_path)
 
 def record_dead_letter(gen, failed_reason, attempts_made, max_attempts, error_stack=None):
