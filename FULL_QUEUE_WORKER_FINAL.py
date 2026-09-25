@@ -2995,9 +2995,9 @@ async def redis_queue_monitor_loop():
     u = urlparse(opts["connection"] or "")
     real_opts = {"host": u.hostname or "localhost", "port": u.port or 6379}
     if u.password: real_opts["password"] = u.password
-    if u.scheme == 'rediss': real_opts["tls"] = {}
+    if u.scheme == 'rediss': real_opts["ssl"] = True
     QUEUE_NAME = os.environ.get("QUEUE_NAME", "generations")
-    
+
     QUEUE_MONITOR = Queue(
         QUEUE_NAME,
         {
@@ -3115,7 +3115,7 @@ async def main():
         u = urlparse(opts["connection"] or "")
         real_opts = {"host": u.hostname or "localhost", "port": u.port or 6379}
         if u.password: real_opts["password"] = u.password
-        if u.scheme == 'rediss': real_opts["tls"] = {}
+        if u.scheme == 'rediss': real_opts["ssl"] = True
         QUEUE_NAME = os.environ.get("QUEUE_NAME", "generations")
         
         # Redis pre-flight
@@ -3256,14 +3256,13 @@ def start_worker():
     return WORKER_MAIN_TASK
 
 if __name__ == '__main__':
-    if "IPython" in sys.modules:
-        import IPython
-        ipy = IPython.get_ipython()
-        if ipy:
-            # Inject await directly into the current cell's execution context
-            # We do this using run_cell with await
-            ipy.run_cell("task = start_worker()\nawait task")
-        else:
-            task = start_worker()
-    else:
-        start_worker()
+    # start_worker() already handles both cases: it schedules main() on the
+    # current running loop (Colab/IPython kernel loop) via create_task, or
+    # falls back to asyncio.run() when no loop is running (plain `python
+    # FULL_QUEUE_WORKER_FINAL.py`). Never drive a second loop on top of an
+    # already-running one (e.g. via IPython.run_cell("... await ...")) --
+    # that is what raised "Cannot run the event loop while another loop is
+    # running". When a loop is already running, the returned Task keeps
+    # executing on that same loop after this cell finishes; the launcher
+    # (FULL_QUEUE_WORKER_LAUNCHER.py) is the place to `await` it directly.
+    start_worker()
