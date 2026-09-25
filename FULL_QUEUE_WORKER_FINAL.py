@@ -1518,28 +1518,67 @@ chrome_lock = asyncio.Lock()
 def _make_tab_state(tid: int, handle=None) -> dict:
     return {'tab_id': tid, 'name': f'T{tid}', 'handle': handle, 'state': S_IDLE, 'job': None, 'job_id': None, 'gen': None, 'prompt': None, 'refs': [], 'start_time': 0.0, 'last_poll': 0.0, 'next_poll': 0.0, 'urls_before': set(), 'chat_urls': set(), 'target_src': None, 'download_started': False, 'stuck_polls': 0, 'future': None, 'attempt': 0}
 
+def _ensure_chrome_alive():
+    """Detect a fully-dead shared chrome_driver PROCESS (not just one closed
+    tab) and relaunch it, clearing every GeminiWorker's stale handle.
+
+    Shared by _create_gemini_tab() (first-time tab creation, e.g. when a job
+    arrives for a slot that never had a physical tab yet) and
+    _recover_gemini_resource() (periodic health-check recovery), so a
+    browser crash self-heals on the very next tab request instead of only
+    once the slower periodic recovery pass happens to run next.
+    """
+    global chrome_driver
+    try:
+        _ = chrome_driver.window_handles
+        return
+    except Exception:
+        pass
+    log("[CHROME] SHARED CHROME PROCESS IS DEAD -- relaunching browser")
+    try:
+        chrome_driver.quit()
+    except Exception:
+        pass
+    chrome_driver = create_chrome_driver()
+    V16_STATE.chrome_driver = chrome_driver
+    for w in GEMINI_WORKERS.values():
+        w.handle = None
+        w.driver = None
+
 def _create_gemini_tab(tid: int) -> str:
     """
     Physically create a new Chrome tab for logical slot T{tid}.
     Always creates a NEW tab so the anchor tab is never consumed.
+    Retries up to 3 times, self-healing via _ensure_chrome_alive() if the
+    whole browser process died between attempts.
     """
-    if not chrome_driver.window_handles:
-        raise RuntimeError('BROWSER_SESSION_DEAD: No anchor window exists. Session is broken.')
-    before = set(chrome_driver.window_handles)
-    chrome_driver.execute_cdp_cmd('Target.createTarget', {'url': GEMINI_APP_URL})
-    deadline = time.time() + 5.0
-    handle = None
-    while time.time() < deadline:
-        diff = set(chrome_driver.window_handles) - before
-        if diff:
-            handle = list(diff)[0]
-            break
-        time.sleep(0.2)
-    if not handle:
-        raise RuntimeError(f'Tab T{tid}: Failed to create physical tab via CDP')
-    chrome_driver.switch_to.window(handle)
-    time.sleep(1.0)
-    return handle
+    last_err = None
+    for attempt in range(1, 4):
+        try:
+            _ensure_chrome_alive()
+            if not chrome_driver.window_handles:
+                raise RuntimeError('BROWSER_SESSION_DEAD: No anchor window exists. Session is broken.')
+            before = set(chrome_driver.window_handles)
+            chrome_driver.execute_cdp_cmd('Target.createTarget', {'url': GEMINI_APP_URL})
+            deadline = time.time() + 5.0
+            handle = None
+            while time.time() < deadline:
+                diff = set(chrome_driver.window_handles) - before
+                if diff:
+                    handle = list(diff)[0]
+                    break
+                time.sleep(0.2)
+            if not handle:
+                raise RuntimeError(f'Tab T{tid}: Failed to create physical tab via CDP (attempt {attempt}/3)')
+            chrome_driver.switch_to.window(handle)
+            time.sleep(1.0)
+            _ = chrome_driver.title  # prove the new tab is actually responsive
+            return handle
+        except Exception as e:
+            last_err = e
+            log(f'[TAB-CREATE][T{tid}] attempt {attempt}/3 failed: {e}')
+            time.sleep(1.0)
+    raise RuntimeError(f'Tab T{tid}: Failed to create physical tab after 3 attempts: {last_err}')
 for _i in range(MAX_CONCURRENT_TABS):
     tab_states.append(_make_tab_state(_i, handle=None))
 print(f'  ✅ {MAX_CONCURRENT_TABS} Gemini tab slots registered (LAZY — physical tabs created on demand).\n')
@@ -2773,42 +2812,23 @@ CHROME_DRIVER_LOCK = threading.RLock()
 
 def _recover_gemini_resource(resource_id: str) -> bool:
     """Recreate this Gemini tab on the shared chrome_driver and prove it responds."""
-    global chrome_driver
     worker = GEMINI_WORKERS.get(resource_id)
     if worker is None:
         return False
     tid_int = int(resource_id.replace('T', ''))
     with CHROME_DRIVER_LOCK:
         try:
-            # Check whether the shared browser PROCESS itself is still alive
-            # BEFORE touching worker.handle -- `worker.handle in
-            # chrome_driver.window_handles` below also calls
-            # chrome_driver.window_handles, so if that call is what's
-            # actually raising "target window already closed" (whole
-            # process dead, not just this tab), checking it only AFTER that
-            # line -- as a prior version of this function did -- means the
-            # exception fires right there and jumps straight to the outer
-            # except below, and this relaunch code never runs at all. That
-            # was the real bug behind the identical stack trace repeating
-            # forever on every recovery attempt.
-            browser_alive = True
-            try:
-                _ = chrome_driver.window_handles
-            except Exception:
-                browser_alive = False
+            # Dead-whole-browser detection/relaunch now lives in the shared
+            # _ensure_chrome_alive() (also used by _create_gemini_tab() for
+            # first-time tab creation) -- called here BEFORE touching
+            # worker.handle, since `worker.handle in
+            # chrome_driver.window_handles` itself calls
+            # chrome_driver.window_handles and would raise first if the
+            # whole process were dead, skipping any relaunch logic placed
+            # after it (the bug in an earlier version of this function).
+            _ensure_chrome_alive()
 
-            if not browser_alive:
-                log(f"[GEMINI BROKER] {resource_id} SHARED CHROME PROCESS IS DEAD -- relaunching browser")
-                try:
-                    chrome_driver.quit()
-                except Exception:
-                    pass
-                chrome_driver = create_chrome_driver()
-                V16_STATE.chrome_driver = chrome_driver
-                for w in GEMINI_WORKERS.values():
-                    w.handle = None
-                    w.driver = None
-            elif worker.handle and worker.handle in chrome_driver.window_handles:
+            if worker.handle and worker.handle in chrome_driver.window_handles:
                 try:
                     chrome_driver.switch_to.window(worker.handle)
                     chrome_driver.close()
