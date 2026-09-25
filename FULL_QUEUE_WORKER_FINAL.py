@@ -929,7 +929,7 @@ def set_tab_download_dir(drv, path):
     except Exception:
         pass
     try:
-        drv.execute_cdp_cmd('Browser.setDownloadBehavior', {'behavior': 'allow', 'downloadPath': ap, 'eventsEnabled': False})
+        drv.execute_cdp_cmd('Browser.setDownloadBehavior', {'behavior': 'allow', 'downloadPath': ap, 'eventsEnabled': True})
     except Exception:
         pass
 
@@ -965,6 +965,12 @@ def create_chrome_driver():
     # failures seen in production.
     prefs = {'download.default_directory': str(CHROME_DL_BASE), 'download.prompt_for_download': False, 'download.directory_upgrade': True, 'safebrowsing.enabled': False, 'safebrowsing.disable_download_protection': True, 'profile.default_content_setting_values.automatic_downloads': 1, 'profile.default_content_setting_values.notifications': 2}
     opts.add_experimental_option('prefs', prefs)
+    # Required for _detect_download_start()'s driver.get_log('performance')
+    # to return anything at all -- without this capability Chrome never
+    # records Browser.downloadWillBegin events, so the "cdp" GUID path was
+    # silently unreachable and every download fell back to filesystem
+    # detection regardless of Chrome's actual download behavior.
+    opts.set_capability('goog:loggingPrefs', {'performance': 'ALL'})
     drv = webdriver.Chrome(options=opts)
     try:
         drv.execute_cdp_cmd('Network.enable', {})
@@ -1002,9 +1008,14 @@ def create_wmr_chrome_driver(resource_id: str) -> webdriver.Chrome:
     opts.add_experimental_option('useAutomationExtension', False)
     prefs = {'download.default_directory': dl_dir_str, 'download.prompt_for_download': False, 'download.directory_upgrade': True, 'safebrowsing.enabled': False, 'safebrowsing.disable_download_protection': True, 'profile.default_content_setting_values.automatic_downloads': 1}
     opts.add_experimental_option('prefs', prefs)
+    opts.set_capability('goog:loggingPrefs', {'performance': 'ALL'})
     drv = webdriver.Chrome(options=opts)
     try:
         drv.execute_cdp_cmd('Page.setDownloadBehavior', {'behavior': 'allow', 'downloadPath': dl_dir_str})
+    except Exception:
+        pass
+    try:
+        drv.execute_cdp_cmd('Browser.setDownloadBehavior', {'behavior': 'allow', 'downloadPath': dl_dir_str, 'eventsEnabled': True})
     except Exception:
         pass
     log(f'[WMR-{resource_id}] Browser = Google Chrome  staging={staging_dir}')
@@ -3019,6 +3030,40 @@ def _log_download_start_confirmed(prefix: str, dl_guid: Optional[str], source: s
     else:
         log(f'{prefix} DOWNLOAD_START_CONFIRMED source=filesystem CDP_GUID=NOT_CAPTURED')
 
+def _snapshot_staging_dir(staging_dir: Path) -> set:
+    try:
+        return {f.name for f in staging_dir.iterdir()} if staging_dir.exists() else set()
+    except Exception:
+        return set()
+
+
+def _detect_download_start_once(drv, before: set, staging_dir: Path) -> Optional[Tuple[Optional[str], str]]:
+    """Single-iteration check, so callers that share a Chrome session across
+    multiple threads (e.g. Gemini's CHROME_DRIVER_LOCK) can hold the lock
+    only around this brief call instead of the whole timeout window."""
+    try:
+        for entry in drv.get_log('performance'):
+            try:
+                msg = json.loads(entry['message'])['message']
+                if msg['method'] == 'Browser.downloadWillBegin':
+                    return (msg['params']['guid'], "cdp")
+            except Exception:
+                pass
+    except Exception:
+        pass
+    try:
+        if staging_dir.exists():
+            for f in staging_dir.iterdir():
+                if f.name in before:
+                    continue
+                if f.name.endswith(('.crdownload', '.tmp', '.part')):
+                    continue
+                return (None, "filesystem")
+    except Exception:
+        pass
+    return None
+
+
 def _detect_download_start(drv, staging_dir: Path, timeout: float = DOWNLOAD_START_WINDOW_S) -> Tuple[Optional[str], str]:
     """
     Detect a download starting inside staging_dir, which must already be scoped
@@ -3030,31 +3075,11 @@ def _detect_download_start(drv, staging_dir: Path, timeout: float = DOWNLOAD_STA
     Raises RuntimeError on timeout; never guesses.
     """
     t0 = time.time()
-    try:
-        before = {f.name for f in staging_dir.iterdir()} if staging_dir.exists() else set()
-    except Exception:
-        before = set()
+    before = _snapshot_staging_dir(staging_dir)
     while time.time() - t0 < timeout:
-        try:
-            for entry in drv.get_log('performance'):
-                try:
-                    msg = json.loads(entry['message'])['message']
-                    if msg['method'] == 'Browser.downloadWillBegin':
-                        return (msg['params']['guid'], "cdp")
-                except Exception:
-                    pass
-        except Exception:
-            pass
-        try:
-            if staging_dir.exists():
-                for f in staging_dir.iterdir():
-                    if f.name in before:
-                        continue
-                    if f.name.endswith(('.crdownload', '.tmp', '.part')):
-                        continue
-                    return (None, "filesystem")
-        except Exception:
-            pass
+        result = _detect_download_start_once(drv, before, staging_dir)
+        if result is not None:
+            return result
         time.sleep(0.5)
     raise RuntimeError(f"Download start timeout after {timeout}s (dir={staging_dir})")
 
@@ -3120,30 +3145,19 @@ def _recover_gemini_resource(resource_id: str) -> bool:
             return False
 
 def _recover_wmr_resource(resource_id: str) -> bool:
-    """Restart this WMR slot's dedicated Chrome process and prove it responds."""
+    """Restart this WMR slot's dedicated Chrome process and prove it responds.
+    Runs on the broker's recovery-timer thread, so the actual driver
+    quit/recreate must happen on the WmrDriverThread that owns it (via the
+    RECOVER command queue), never touched directly from here."""
     thread = WMR_THREADS.get(resource_id)
     if thread is None:
         return False
-    try:
-        if thread.driver is not None:
-            try:
-                thread.driver.quit()
-            except Exception:
-                pass
-            thread.driver = None
-        thread.driver = create_wmr_chrome_driver(resource_id)
-        _ = thread.driver.title
+    ok = request_wmr_recover(thread)
+    if ok:
         log(f"[WMR BROKER] {resource_id} RECOVERY_HEALTH_CHECK = OK")
-        return True
-    except Exception as e:
-        log(f"[WMR BROKER] {resource_id} RECOVERY_HEALTH_CHECK = FAILED: {e}")
-        try:
-            if thread.driver:
-                thread.driver.quit()
-        except Exception:
-            pass
-        thread.driver = None
-        return False
+    else:
+        log(f"[WMR BROKER] {resource_id} RECOVERY_HEALTH_CHECK = FAILED")
+    return ok
 
 GEMINI_BROKER.set_recovery_fn(_recover_gemini_resource)
 WMR_BROKER.set_recovery_fn(_recover_wmr_resource)
@@ -3306,44 +3320,64 @@ class GeminiWorker:
             else:
                 raise RuntimeError(f"Generation timed out after {GENERATION_TIMEOUT_S}s waiting for image (last status={status})")
 
-            # Phase 3: download click + start detection -- short lock again.
+            # Phase 3a: the click itself needs the lock (short DOM operation).
             with CHROME_DRIVER_LOCK:
                 chrome_driver.switch_to.window(self.handle)
                 clicked = _hover_and_dl_single_click(self.driver, urls_before, chat_urls, prefix=prefix)
                 if not clicked:
                     raise RuntimeError("DOWNLOAD_BUTTON_NOT_FOUND")
                 append_runtime_log(f"{prefix} DOWNLOAD CLICKED")
+                before_files = _snapshot_staging_dir(staging_dir)
 
-                expected_png = f"{ctx.job_id}.png"
+            expected_png = f"{ctx.job_id}.png"
+            ctx.transition_sync(JobState.RAW_DOWNLOAD_START)
 
-                ctx.transition_sync(JobState.RAW_DOWNLOAD_START)
-                dl_guid, source = _detect_download_start(self.driver, staging_dir, timeout=DOWNLOAD_START_WINDOW_S)
-                ctx.raw_guid = dl_guid
-                append_runtime_log(f"{prefix} DOWNLOAD START DETECTED")
-                _log_download_start_confirmed(prefix, dl_guid, source)
+            # Phase 3b: waiting up to DOWNLOAD_START_WINDOW_S for the real
+            # download-start evidence must NOT hold the shared driver lock
+            # for the whole window -- that would block T1/T2/T3 exactly the
+            # way the old single-lock generation wait did (see Phase 2's own
+            # fix above). Each get_log()/filesystem check is still a
+            # WebDriver command dispatched on the shared session, so it
+            # still needs a brief lock acquisition per iteration, just not
+            # held across the sleep in between.
+            deadline = time.time() + DOWNLOAD_START_WINDOW_S
+            result = None
+            while time.time() < deadline:
+                with CHROME_DRIVER_LOCK:
+                    chrome_driver.switch_to.window(self.handle)
+                    result = _detect_download_start_once(self.driver, before_files, staging_dir)
+                if result is not None:
+                    break
+                time.sleep(0.5)
+            if result is None:
+                raise RuntimeError(f"Download start timeout after {DOWNLOAD_START_WINDOW_S}s (dir={staging_dir})")
+            dl_guid, source = result
+            ctx.raw_guid = dl_guid
+            append_runtime_log(f"{prefix} DOWNLOAD START DETECTED")
+            _log_download_start_confirmed(prefix, dl_guid, source)
 
-                record_id = f"gemini:{ctx.job_id}:{time.monotonic_ns()}"
-                with DOWNLOAD_REGISTRY_LOCK:
-                    DOWNLOAD_REGISTRY[record_id] = DownloadRecord(
-                        record_id=record_id,
-                        guid=dl_guid,
-                        job_id=ctx.job_id,
-                        resource_id=self.tid,
-                        resource_type="gemini",
-                        source=source,
-                        staging_dir=str(staging_dir),
-                        expected_filename=expected_png,
-                        actual_filename=None,
-                        target_state=JobState.RAW_VALIDATED,
-                        started_at=time.time(),
-                        created_at=time.time()
-                    )
+            record_id = f"gemini:{ctx.job_id}:{time.monotonic_ns()}"
+            with DOWNLOAD_REGISTRY_LOCK:
+                DOWNLOAD_REGISTRY[record_id] = DownloadRecord(
+                    record_id=record_id,
+                    guid=dl_guid,
+                    job_id=ctx.job_id,
+                    resource_id=self.tid,
+                    resource_type="gemini",
+                    source=source,
+                    staging_dir=str(staging_dir),
+                    expected_filename=expected_png,
+                    actual_filename=None,
+                    target_state=JobState.RAW_VALIDATED,
+                    started_at=time.time(),
+                    created_at=time.time()
+                )
 
-                release_gemini_once(ctx)
-                ctx.transition_sync(JobState.GEMINI_RELEASED)
-                ctx.transition_sync(JobState.RAW_DOWNLOADING)
-                append_runtime_log(f"{prefix} GEMINI RESOURCE RELEASED")
-                append_runtime_log(f"{prefix} RAW DOWNLOAD CONTINUES")
+            release_gemini_once(ctx)
+            ctx.transition_sync(JobState.GEMINI_RELEASED)
+            ctx.transition_sync(JobState.RAW_DOWNLOADING)
+            append_runtime_log(f"{prefix} GEMINI RESOURCE RELEASED")
+            append_runtime_log(f"{prefix} RAW DOWNLOAD CONTINUES")
 
         except Exception as e:
             ctx.error = str(e)
@@ -3400,6 +3434,36 @@ class WmrDriverThread(threading.Thread):
                     pass
                 self.command_queue.task_done()
                 return
+            if cmd == "RECOVER":
+                # Same one-owner-thread rule as SHUTDOWN: recreate this
+                # slot's Selenium driver ON THIS THREAD, never from the
+                # broker's recovery-timer thread that requested it.
+                ack = payload
+                ok = False
+                try:
+                    if self.driver is not None:
+                        try:
+                            self.driver.quit()
+                        except Exception:
+                            pass
+                        self.driver = None
+                    self.driver = create_wmr_chrome_driver(self.resource_id)
+                    _ = self.driver.title
+                    ok = True
+                except Exception as e:
+                    append_runtime_log(f"[WMR-{self.resource_id}] RECOVER_FAILED: {e}")
+                    try:
+                        if self.driver:
+                            self.driver.quit()
+                    except Exception:
+                        pass
+                    self.driver = None
+                try:
+                    ack.put_nowait(ok)
+                except queue.Full:
+                    pass
+                self.command_queue.task_done()
+                continue
             ctx = payload
             if cmd == "EXECUTE":
                 prefix = f"[WMR][{self.resource_id}][{ctx.job_id}]"
@@ -3499,6 +3563,21 @@ def request_wmr_shutdown(thread: 'WmrDriverThread', timeout_s: float = 10.0) -> 
     thread.command_queue.put(("SHUTDOWN", ack))
     try:
         return ack.get(timeout=timeout_s)
+    except queue.Empty:
+        return False
+
+
+def request_wmr_recover(thread: 'WmrDriverThread', timeout_s: float = 30.0) -> bool:
+    """Ask a WmrDriverThread to quit + recreate its own Selenium driver ON
+    ITS OWN THREAD and wait for acknowledgment. Recovery must never touch
+    thread.driver from the broker's recovery-timer thread -- that races
+    with whatever this thread's EXECUTE loop is doing with the same
+    driver. Returns True only if the owner thread confirmed the new
+    driver is responsive."""
+    ack = queue.Queue(maxsize=1)
+    thread.command_queue.put(("RECOVER", ack))
+    try:
+        return bool(ack.get(timeout=timeout_s))
     except queue.Empty:
         return False
 
