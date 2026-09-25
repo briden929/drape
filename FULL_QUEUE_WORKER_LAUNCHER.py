@@ -77,15 +77,15 @@ print("[LAUNCHER] Worker module loaded.")
 
 start_worker = _worker_ns["start_worker"]
 
-# --- Step 4/5: start the worker and keep this cell (and therefore the
-# notebook's event loop) alive on it, surfacing any crash loudly. ---
+# --- Step 4/5: start the worker. start_worker() now blocks this cell
+# directly (via nest_asyncio) until main() returns/raises -- it is no
+# longer a background task that needs a separate `await` cell. ---
 print("[LAUNCHER] Starting worker...")
-worker_task = start_worker()
 try:
-    await worker_task
+    start_worker()
 except Exception:
     print("=" * 70)
-    print("[LAUNCHER] WORKER TASK RAISED")
+    print("[LAUNCHER] WORKER RAISED")
     print("=" * 70)
     traceback.print_exc()
     raise

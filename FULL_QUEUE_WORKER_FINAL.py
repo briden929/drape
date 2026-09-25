@@ -3641,128 +3641,103 @@ WORKER_MAIN_TASK = V16_STATE.WORKER_MAIN_TASK
 _RUNTIME_INITIALIZED = V16_STATE.RUNTIME_INITIALIZED
 
 def _worker_main_task_done(task):
+    """Only reached via the compat branch in start_worker() below, when an
+    OLD-style background task (created by a prior version of this file, or
+    still alive across a Runtime > Interrupt) is being awaited instead of a
+    fresh main() call."""
     global _RUNTIME_INITIALIZED
     if task.cancelled():
         print("[WORKER] MAIN TASK CANCELLED", flush=True)
-        _RUNTIME_INITIALIZED = False
-        V16_STATE.RUNTIME_INITIALIZED = False
-        return
-
-    exc = task.exception()
-    if exc:
+    elif task.exception():
+        exc = task.exception()
         print("=" * 70, flush=True)
         print("[FATAL] WORKER MAIN TASK CRASHED", flush=True)
         print("=" * 70, flush=True)
         import traceback
-        traceback.print_exception(
-            type(exc),
-            exc,
-            exc.__traceback__,
-        )
-    else:
-        # main() is an infinite `while True: await asyncio.sleep(...)` loop
-        # (see STEP 20 onward). It returning at all -- without raising --
-        # means it exited early somewhere before that loop, which must never
-        # happen silently.
-        print("=" * 70, flush=True)
-        print("[FATAL] WORKER MAIN TASK EXITED UNEXPECTEDLY (no exception, but main() returned)", flush=True)
-        print("=" * 70, flush=True)
+        traceback.print_exception(type(exc), exc, exc.__traceback__)
     _RUNTIME_INITIALIZED = False
     V16_STATE.RUNTIME_INITIALIZED = False
+    V16_STATE.WORKER_MAIN_TASK = None
 
 def start_worker():
+    """Blocks the calling cell until main() returns or raises, matching the
+    old worker script's behavior: STEP 11+ prints (Redis health, N2N worker
+    ready, job processing, ...) appear directly in this cell, with no
+    separate `await task` cell required.
+
+    Safe from inside Colab/IPython's already-running event loop because it
+    uses nest_asyncio, which patches asyncio to allow legitimate re-entrant
+    run_until_complete() calls. This is NOT the earlier-removed
+    IPython.run_cell() hack (that one crashed with "Cannot run the event
+    loop while another loop is running" because IPython's own cell runner
+    has no re-entrancy support) -- nest_asyncio is a purpose-built library
+    for exactly this.
+
+    Duplicate-run guard: since this call blocks, a second concurrent run is
+    only reachable if a previous run's main() task is still alive from
+    BEFORE this cell was interrupted (Runtime -> Interrupt leaves the
+    Python process, and any asyncio task on its loop, alive). In that case
+    this reuses/awaits the existing task instead of starting a second one.
+    """
     global WORKER_MAIN_TASK, _RUNTIME_INITIALIZED
 
-    # Check the persistent singleton, NOT the plain global -- the plain
-    # global was just reset to V16_STATE's value a few lines above by this
-    # same re-run of the file, but V16_STATE itself only changes when a task
-    # is actually created/finishes, so it correctly reflects whether a
-    # previous run's main() is still alive on this kernel's event loop.
     existing_task = V16_STATE.WORKER_MAIN_TASK
     if V16_STATE.RUNTIME_INITIALIZED and existing_task is not None and not existing_task.done():
         print("[BOOT] WORKER ALREADY RUNNING", flush=True)
-        print("[BOOT] REUSING EXISTING RUNTIME", flush=True)
+        print("[BOOT] REUSING EXISTING RUNTIME -- awaiting it now", flush=True)
         WORKER_MAIN_TASK = existing_task
-        return existing_task
+        try:
+            loop = asyncio.get_running_loop()
+            import nest_asyncio
+            nest_asyncio.apply()
+            return loop.run_until_complete(existing_task)
+        except RuntimeError:
+            return asyncio.run(existing_task)
 
-    print("[BOOT] STARTING RUNTIME MAIN TASK", flush=True)
+    print("[BOOT] STARTING RUNTIME MAIN TASK (blocking mode)", flush=True)
+    _RUNTIME_INITIALIZED = True
+    V16_STATE.RUNTIME_INITIALIZED = True
 
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
-        # No loop running (plain `python FULL_QUEUE_WORKER_FINAL.py`) -- this
-        # blocks until main() returns/raises, so all of main()'s own prints
-        # appear normally; nothing further to do here.
-        return asyncio.run(main())
+        # No loop running (plain `python FULL_QUEUE_WORKER_FINAL.py`).
+        try:
+            return asyncio.run(main())
+        finally:
+            _RUNTIME_INITIALIZED = False
+            V16_STATE.RUNTIME_INITIALIZED = False
 
-    if existing_task is not None and not existing_task.done():
-        print("[BOOT] WORKER ALREADY RUNNING", flush=True)
-        print("[BOOT] REUSING EXISTING RUNTIME", flush=True)
-        WORKER_MAIN_TASK = existing_task
-        return existing_task
-
-    _RUNTIME_INITIALIZED = True
-    V16_STATE.RUNTIME_INITIALIZED = True
-    WORKER_MAIN_TASK = loop.create_task(main())
-    V16_STATE.WORKER_MAIN_TASK = WORKER_MAIN_TASK
-    WORKER_MAIN_TASK.add_done_callback(_worker_main_task_done)
-    print("[BOOT] WORKER_MAIN_TASK CREATED", flush=True)
-    print(
-        "[BOOT] A loop is already running (Colab/IPython) -- main() now runs "
-        "in the background on that same loop. If this is the LAST statement "
-        "of the cell that ran this file, the cell ends here and none of "
-        "main()'s own STEP 11+ prints will be visible until you explicitly "
-        "await this task. In a NEW cell, run:\n"
-        "      task = launch_worker()\n"
-        "      await task\n"
-        "(launch_worker() is idempotent -- it returns this same task if the "
-        "worker is already running.)",
-        flush=True,
-    )
-    return WORKER_MAIN_TASK
-
-def launch_worker():
-    """Public Colab/notebook entrypoint: `task = launch_worker(); await task`
-    in its own cell. Never creates a second main()/Worker/scheduler -- it is
-    a thin wrapper over start_worker(), which already guards against a
-    duplicate runtime via _RUNTIME_INITIALIZED."""
-    return start_worker()
-
-def run_worker_blocking():
-    """Alternate, opt-in entrypoint for the SAME cell you pasted this file
-    into, matching the old worker script's behavior: this call blocks the
-    cell and prints STEP 11+ / the queue status directly, instead of
-    scheduling main() as a background task that needs a separate
-    `launch_worker(); await task` cell.
-
-    Safe to call from inside Colab's already-running event loop because it
-    uses nest_asyncio, which properly patches asyncio for re-entrant
-    asyncio.run() calls -- this is NOT the same as the IPython.run_cell()
-    reentrant-cell hack this file previously removed (that one crashed with
-    "Cannot run the event loop while another loop is running" because
-    IPython's own cell runner has no re-entrancy support; nest_asyncio is
-    a purpose-built library for exactly this).
-
-    Prefer launch_worker() unless you specifically want this file to block
-    the current cell forever like the old script did. Respects the same
-    V16_STATE duplicate-run guard as start_worker() -- it refuses to start
-    a second runtime if one is already active from a previous cell run."""
-    global _RUNTIME_INITIALIZED
-    if V16_STATE.RUNTIME_INITIALIZED and V16_STATE.WORKER_MAIN_TASK is not None and not V16_STATE.WORKER_MAIN_TASK.done():
-        print("[BOOT] WORKER ALREADY RUNNING", flush=True)
-        print("[BOOT] REUSING EXISTING RUNTIME -- run_worker_blocking() only starts a fresh run; Runtime > Restart session first if you want a clean one.", flush=True)
-        return
+    # Colab/IPython: a loop is already running on this thread. nest_asyncio
+    # lets this block on it anyway, so the cell now behaves exactly like the
+    # old worker script.
     try:
         import nest_asyncio
         nest_asyncio.apply()
     except ImportError:
-        print("[BOOT] nest_asyncio not installed -- run `pip install nest_asyncio` first, or use launch_worker() instead.", flush=True)
+        print("[BOOT] nest_asyncio not installed -- run `pip install nest_asyncio` first.", flush=True)
+        _RUNTIME_INITIALIZED = False
+        V16_STATE.RUNTIME_INITIALIZED = False
         raise
-    _RUNTIME_INITIALIZED = True
-    V16_STATE.RUNTIME_INITIALIZED = True
-    print("[BOOT] Starting main() in BLOCKING mode via nest_asyncio -- this cell now runs continuously.", flush=True)
-    print("[BOOT] To stop: Runtime -> Interrupt execution.", flush=True)
-    asyncio.run(main())
+
+    print("[BOOT] Blocking this cell on main() via nest_asyncio -- to stop: Runtime -> Interrupt execution.", flush=True)
+    try:
+        return loop.run_until_complete(main())
+    finally:
+        _RUNTIME_INITIALIZED = False
+        V16_STATE.RUNTIME_INITIALIZED = False
+        V16_STATE.WORKER_MAIN_TASK = None
+        WORKER_MAIN_TASK = None
+
+def launch_worker():
+    """Alias for start_worker() -- kept for existing notebooks/cells that
+    call launch_worker(); it now also blocks the cell, same as
+    start_worker()."""
+    return start_worker()
+
+def run_worker_blocking():
+    """Deprecated alias -- start_worker() itself now blocks by default."""
+    return start_worker()
 
 if __name__ == '__main__':
     print("=" * 80, flush=True)
@@ -3793,20 +3768,9 @@ if __name__ == '__main__':
         print(f"[BOOT] {_sym}() =", "PRESENT" if _sym in globals() else "MISSING", flush=True)
     print("=" * 80, flush=True)
 
-    # Default: start_worker() schedules main() on the current running loop
-    # (Colab/IPython kernel loop) via create_task, or falls back to
-    # asyncio.run() when no loop is running (plain `python
-    # FULL_QUEUE_WORKER_FINAL.py`). When a loop is already running, the
-    # returned Task keeps executing on that same loop after this cell
-    # finishes, but its prints will not appear until something actually
-    # awaits it -- see the [BOOT] message start_worker() prints above for
-    # the exact next step (launch_worker() in a new cell).
-    #
-    # Opt-in: set V16_BLOCKING_MODE=1 to instead block THIS cell forever via
-    # run_worker_blocking() (nest_asyncio-based), matching the old worker
-    # script's single-cell behavior. Off by default so existing notebooks
-    # keep the current, already-verified behavior unless asked for.
-    if os.environ.get("V16_BLOCKING_MODE") == "1":
-        run_worker_blocking()
-    else:
-        start_worker()
+    # start_worker() blocks this cell until main() returns/raises (via
+    # nest_asyncio when a loop is already running, e.g. Colab/IPython, or
+    # asyncio.run() otherwise) -- STEP 11+ prints appear directly here,
+    # matching the old worker script's single-cell behavior. To stop:
+    # Runtime -> Interrupt execution.
+    start_worker()
