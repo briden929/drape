@@ -571,6 +571,22 @@ def append_runtime_log(msg: str):
         pass
 
 
+# ---------------------------------------------------------------------------
+# MICRO-PROGRESS MARKER (V16 real-time micro progress)
+# Helper call sites update the job's ONE live dashboard line IN PLACE via
+# JOB_PROGRESS. This wrapper is defined before every helper that uses it and
+# degrades gracefully if the display layer is unavailable for any reason --
+# a broken token must never break the browser pipeline itself.
+# ---------------------------------------------------------------------------
+def _jmark(job_id, stage, status, detail=''):
+    try:
+        job_mark(job_id, stage, status)
+        if detail and job_id:
+            append_runtime_log(f'[{short_job_id(job_id)}] MICRO {stage}={status} {detail}')
+    except Exception:
+        pass
+
+
 # The ORIGINAL timestamped console logger, kept under its own name for the
 # few genuinely user-facing lines (startup steps, fatal errors). Runtime
 # browser helpers must NEVER print per-action status to the notebook --
@@ -2070,73 +2086,99 @@ def _dismiss_new_chat_dialog(drv):
 
 def open_new_chat_and_reload(drv, tid: int, job_id: str='') -> str:
     """
-    Creates a verified new Gemini chat and returns the new chat URL.
+    V16 SINGLE-TRANSACTION NEW CHAT (duplicate-navigation fix).
 
-    Algorithm:
-    1. Capture old_url
-    2. Click "New chat"
-    3. Handle confirmation dialog
-    4. Wait for URL to change (new_url != old_url, starts with /app/)
-    5. Navigate to exact new_url
-    6. Verify clean composer
+    ROOT CAUSE OF THE RELOAD LOOP: the previous implementation treated a
+    URL CHANGE as the ONLY proof of a new chat. Gemini frequently keeps
+    the tab at exactly https://gemini.google.com/app after clicking
+    "New chat" (the SPA resets in place), so the old code fell through to
+    `drv.get(new_url)` -- a FULL same-URL reload ON EVERY JOB even when
+    the browser was already sitting on a fresh page. Combined with the
+    outer retry loop this produced repeated navigations and surfaced the
+    "Create a new chat and delete this one?" confirm dialog over and over.
 
-    Returns new_chat_url on success. Raises NewChatFailed after retries.
+    NEW CONTRACT (PARTS 9-11):
+      * click New Chat EXACTLY ONCE per successful operation
+      * dismiss the confirm dialog exactly once (affirmative only)
+      * NO driver.get()/refresh() unless a verification actually failed
+      * proof is BROWSER STATE (_verify_clean_composer: empty fresh
+        composer, no stale attachments, no active generation, no prior
+        response) -- NOT url_old != url_new
+      * counters nav_count / refresh_count / new_chat_click_count are
+        logged; more than 1 click or 1 navigation in a normal success is
+        reported as a bug in worker.log
+
+    Notebook shows nothing here; the live line shows
+    🔄NewChat -> ✅NewChat via JOB_PROGRESS tokens.
     """
     prefix = f'[T{tid}][{job_id}]' if job_id else f'[T{tid}]'
+    _jmark(job_id, 'newchat', 'run')
     for attempt in range(1, MAX_NEW_CHAT_RETRIES + 1):
         try:
             old_url = drv.current_url
+            nav_count = 0
+            refresh_count = 0
+            new_chat_click_count = 0
             append_runtime_log(f'{prefix} NEW_CHAT_START (attempt {attempt}) OLD_URL={old_url}')
-            clicked = False
-            res = drv.execute_script('\n                var sels = [\n                    \'a[aria-label="New chat"]\',\n                    \'button[aria-label="New chat"]\',\n                    \'div[aria-label="New chat"]\',\n                    \'[data-test-id="new-chat-button"]\',\n                    \'a[href="/app"]\',\n                ];\n                for (var s = 0; s < sels.length; s++) {\n                    var els = document.querySelectorAll(sels[s]);\n                    for (var i = 0; i < els.length; i++) {\n                        if (els[i].offsetParent !== null) {\n                            els[i].click(); return \'OK:\' + sels[s];\n                        }\n                    }\n                }\n                return \'NO\';\n            ')
+            # 1. Click "New chat" EXACTLY ONCE (never a second time in the
+            #    same attempt -- duplicate clicks were part of the loop).
+            res = drv.execute_script('\n                var sels = [\n                    \'a[aria-label="New chat"]\',\n                    \'button[aria-label="New chat"]\',\n                    \'div[aria-label="New chat"]\',\n                    \'[data-test-id="new-chat-button"]\',\n                ];\n                for (var s = 0; s < sels.length; s++) {\n                    var els = document.querySelectorAll(sels[s]);\n                    for (var i = 0; i < els.length; i++) {\n                        if (els[i].offsetParent !== null) {\n                            els[i].click(); return \'OK:\' + sels[s];\n                        }\n                    }\n                }\n                return \'NO\';\n            ')
             if res and res.startswith('OK:'):
-                clicked = True
+                new_chat_click_count = 1
                 append_runtime_log(f'{prefix} NEW_CHAT_CLICK -> {res}')
+                time.sleep(0.3)
+                # 2. Confirm dialog ("Create a new chat and delete this
+                #    one?") -- affirmative button exactly once.
+                dialog_handled = _dismiss_new_chat_dialog(drv)
+                append_runtime_log(f'{prefix} DIALOG_FOUND={dialog_handled}')
+                if dialog_handled:
+                    time.sleep(0.4)
             else:
+                # No clickable New-chat control at all -> ONE navigation as
+                # the fallback (this is the ONLY path allowed to call get()).
                 drv.get(GEMINI_APP_URL)
-                clicked = True
+                nav_count += 1
                 append_runtime_log(f'{prefix} NEW_CHAT_NAVIGATE -> {GEMINI_APP_URL}')
-            time.sleep(0.3)
-            dialog_handled = _dismiss_new_chat_dialog(drv)
-            if dialog_handled:
-                append_runtime_log(f'{prefix} DIALOG_HANDLED')
-                time.sleep(0.4)
-            url_deadline = time.time() + 8.0
-            new_url = None
-            while time.time() < url_deadline:
+                time.sleep(0.8)
+            # 3. Wait for the SPA to settle. Do NOT re-navigate just because
+            #    the URL did not change: /app is a valid fresh-chat URL.
+            deadline = time.time() + 8.0
+            final_url = drv.current_url
+            while time.time() < deadline:
                 cur = drv.current_url
-                if cur != old_url and 'gemini.google.com/app' in cur and (cur != GEMINI_APP_URL):
-                    new_url = cur
+                if 'gemini.google.com/app' in cur and _verify_clean_composer(drv):
+                    final_url = cur
                     break
-                if 'gemini.google.com/app/' in cur and cur != old_url:
-                    new_url = cur
-                    break
-                time.sleep(0.25)
-            if not new_url:
-                cur = drv.current_url
-                if 'gemini.google.com/app' in cur:
-                    new_url = cur
-                    append_runtime_log(f'{prefix} NEW_CHAT_URL_UNCHANGED — accepting base URL: {new_url}')
-            if not new_url:
-                append_runtime_log(f'{prefix} NEW_CHAT_URL_NOT_CHANGED (attempt {attempt}) — retrying')
-                time.sleep(0.5)
-                continue
-            append_runtime_log(f'{prefix} NEW_CHAT_URL={new_url}')
-            append_runtime_log(f'{prefix} RELOADING NEW CHAT URL')
-            drv.get(new_url)
-            time.sleep(1.0)
-            append_runtime_log(f'{prefix} NEW_CHAT_RELOADED')
-            if _verify_clean_composer(drv):
+                time.sleep(0.3)
+            # 4. Browser-state verification is the PROOF (PART 10).
+            clean = _verify_clean_composer(drv)
+            append_runtime_log(
+                f'{prefix} NEW_CHAT_VERIFY clean={clean} FINAL_URL={final_url} '
+                f'nav_count={nav_count} refresh_count={refresh_count} '
+                f'new_chat_click_count={new_chat_click_count}'
+            )
+            if clean:
+                if nav_count > 1 or refresh_count > 0 or new_chat_click_count > 1:
+                    append_runtime_log(f'{prefix} NEW_CHAT_DUPLICATE_NAVIGATION_BUG nav={nav_count} refresh={refresh_count} clicks={new_chat_click_count}')
                 append_runtime_log(f'{prefix} NEW_CHAT_VERIFIED ✅')
-                return new_url
-            else:
-                append_runtime_log(f'{prefix} NEW_CHAT_COMPOSER_NOT_CLEAN (attempt {attempt}) — retrying')
-                time.sleep(0.5)
-                continue
+                _jmark(job_id, 'newchat', 'ok', f'nav={nav_count} clicks={new_chat_click_count}')
+                return final_url
+            # 5. Verification FAILED -> only now is a single corrective
+            #    navigation justified (bounded: never inside the wait loop).
+            append_runtime_log(f'{prefix} NEW_CHAT_COMPOSER_NOT_CLEAN (attempt {attempt}) — one corrective navigation')
+            drv.get(GEMINI_APP_URL)
+            nav_count += 1
+            time.sleep(1.0)
+            if _verify_clean_composer(drv):
+                append_runtime_log(f'{prefix} NEW_CHAT_VERIFIED ✅ (after corrective nav, nav_count={nav_count})')
+                _jmark(job_id, 'newchat', 'ok', f'corrective_nav=1')
+                return drv.current_url
+            continue
         except Exception as e:
-            append_runtime_log(f'{prefix} NEW_CHAT_EXCEPTION (attempt {attempt}): {e}', file=sys.stderr)
+            append_runtime_log(f'{prefix} NEW_CHAT_EXCEPTION (attempt {attempt}): {e}')
             time.sleep(0.5)
             continue
+    _jmark(job_id, 'newchat', 'fail', 'NEW_CHAT_VERIFY_FAILED')
     raise NewChatFailed(f'Tab T{tid}: Could not create a verified new Gemini chat after {MAX_NEW_CHAT_RETRIES} attempts')
 
 def _verify_clean_composer(drv) -> bool:
@@ -2280,11 +2322,13 @@ def _verify_flash_selected(drv, timeout=3.0):
 
 def ensure_flash_mode(drv, tid=0, job_id=''):
     prefix = f'[T{tid}][{job_id}]' if job_id else f'[T{tid}]'
+    _jmark(job_id, 'flash', 'run')
     append_runtime_log(f'{prefix} GEMINI_FLASH_CHECK')
     current = _get_current_model_text(drv)
     if current and 'flash' in current.lower() and ('lite' not in current.lower()):
         append_runtime_log(f"{prefix} FLASH_VERIFIED (already active: '{current}')")
         append_runtime_log(f"{prefix} GEMINI_FLASH_VERIFIED model_text='{current}'")
+        _jmark(job_id, 'flash', 'ok', f"model='{current}' already_active=True")
         return True
     for attempt in range(1, 4):
         if not _open_model_picker(drv):
@@ -2298,16 +2342,19 @@ def ensure_flash_mode(drv, tid=0, job_id=''):
                 drv.find_element(By.TAG_NAME, 'body').send_keys(Keys.ESCAPE)
             except Exception:
                 pass
+            _jmark(job_id, 'flash', 'fail', 'MODEL_LIMIT_REACHED')
             raise
         if clicked and _verify_flash_selected(drv, timeout=2.5):
             append_runtime_log(f'{prefix} FLASH_VERIFIED ✅')
             append_runtime_log(f"{prefix} GEMINI_FLASH_VERIFIED model_text='{_get_current_model_text(drv)}'")
+            _jmark(job_id, 'flash', 'ok', f"model='{_get_current_model_text(drv)}'")
             return True
         try:
             drv.find_element(By.TAG_NAME, 'body').send_keys(Keys.ESCAPE)
         except Exception:
             pass
         time.sleep(0.3)
+    _jmark(job_id, 'flash', 'fail', 'FLASH_VERIFY_FAILED')
     raise RuntimeError(f'Tab T{tid}: Flash mode could not be verified')
 
 def click_plus_button(drv):
@@ -2489,6 +2536,18 @@ def _gemini_state_snapshot(drv, checkpoint: str, tid=0, job_id='', screenshot=Fa
             append_runtime_log(f"{prefix} SCREENSHOT_SAVED {fname}")
         except Exception as ss_err:
             append_runtime_log(f"{prefix} SCREENSHOT_FAILED {checkpoint}: {ss_err}")
+    # LAST-EVENT feed for the compact dashboard (display-only projection of
+    # this real verified browser checkpoint -- never a second state machine).
+    try:
+        DASHBOARD_STATE['last_event'] = (
+            f"{short_job_id(job_id) if job_id else f'T{tid}'} {checkpoint}: "
+            f"ph='{info.get('composer_placeholder', '')}' "
+            f"len={info.get('composer_text_len', '?')} "
+            f"ask_gemini={info.get('ask_gemini_visible')}"
+        )[:120]
+        DASHBOARD_STATE['last_event_ts'] = time.time()
+    except Exception:
+        pass
     return info
 
 
@@ -2600,6 +2659,7 @@ def ensure_create_image_mode(drv, tid=0, job_id=''):
     STOPS here; upload/prompt/send must never run against a plain chat.
     """
     prefix = f'[T{tid}][{job_id}]' if job_id else f'[T{tid}]'
+    _jmark(job_id, 'createimg', 'run')
     append_runtime_log(f'{prefix} GEMINI_CREATE_IMAGE_REQUESTED')
     _gemini_state_snapshot(drv, 'create_image_before', tid, job_id)
 
@@ -2621,6 +2681,8 @@ def ensure_create_image_mode(drv, tid=0, job_id=''):
         ok, last_snap = _check('precheck')
         if ok:
             append_runtime_log(f'{prefix} GEMINI_CREATE_IMAGE_VERIFIED via=precheck')
+            _jmark(job_id, 'createimg', 'ok', 'via=precheck')
+            _jmark(job_id, 'imgmode', 'ok', f"ph='{last_snap.get('composer_placeholder')}'")
             return True
         time.sleep(0.5)
 
@@ -2699,6 +2761,8 @@ def ensure_create_image_mode(drv, tid=0, job_id=''):
                     ok, last_snap = _check(f'click_attempt_{attempt}')
                     if ok:
                         append_runtime_log(f'{prefix} GEMINI_CREATE_IMAGE_VERIFIED via=click_attempt_{attempt}')
+                        _jmark(job_id, 'createimg', 'ok', f'via=click_a{attempt}')
+                        _jmark(job_id, 'imgmode', 'ok', f"ph='{last_snap.get('composer_placeholder')}'")
                         return True
                     time.sleep(0.5)
             else:
@@ -2711,6 +2775,8 @@ def ensure_create_image_mode(drv, tid=0, job_id=''):
     final_state = _gemini_state_snapshot(drv, 'create_image_failed', tid, job_id, screenshot=True)
     if last_snap:
         final_state.update(last_snap)
+    _jmark(job_id, 'createimg', 'fail', 'CREATE_IMAGE_VERIFY_FAILED')
+    _jmark(job_id, 'imgmode', 'fail', 'CREATE_IMAGE_VERIFY_FAILED')
     raise RuntimeError(f'Tab T{tid}: CREATE_IMAGE_VERIFY_FAILED observed_ui={json.dumps(final_state, default=str)[:1500]}')
 
 def open_upload_drawer(drv, tid=0, job_id='') -> bool:
@@ -2860,10 +2926,17 @@ def verify_attachment_count(drv, expected: int, tid=0, job_id='', upload_token=N
                 actual = None
             if actual is not None and actual >= 0:
                 last_actual = int(actual)
+                if job_id:
+                    try:
+                        job_attach(job_id, last_actual, expected)
+                    except Exception:
+                        pass
                 if last_actual == expected:
                     append_runtime_log(f'{prefix} ATTACHMENTS {last_actual}/{expected} ✅ FILELIST EXACT')
+                    _jmark(job_id, 'attached', 'ok', f'{last_actual}/{expected} via=filelist')
                     return (True, last_actual)
                 if last_actual > expected:
+                    _jmark(job_id, 'attached', 'fail', f'OVERCOUNT {last_actual}/{expected}')
                     raise RuntimeError(f'{prefix} ATTACHMENT_OVERCOUNT: expected {expected}, got {last_actual}')
 
         try:
@@ -2882,14 +2955,22 @@ def verify_attachment_count(drv, expected: int, tid=0, job_id='', upload_token=N
             result = None
         if result is not None:
             last_actual = result
+            if job_id:
+                try:
+                    job_attach(job_id, last_actual, expected)
+                except Exception:
+                    pass
             if result == expected:
                 append_runtime_log(f'{prefix} ATTACHMENTS {result}/{expected} ✅ CANONICAL UI EXACT')
+                _jmark(job_id, 'attached', 'ok', f'{result}/{expected} via=canonical_ui')
                 return (True, result)
             if result > expected:
+                _jmark(job_id, 'attached', 'fail', f'OVERCOUNT {result}/{expected}')
                 raise RuntimeError(f'{prefix} ATTACHMENT_OVERCOUNT: expected {expected}, got {result}')
 
         time.sleep(0.25)
 
+    _jmark(job_id, 'attached', 'fail', f'MISMATCH got={last_actual}')
     raise RuntimeError(f'{prefix} ATTACHMENT_MISMATCH: expected exactly {expected}, got {last_actual}')
 
 def normalize_prompt_text(text):
@@ -3152,12 +3233,15 @@ def _inject_prompt_atomic(drv, text, tid=0, job_id=''):
     PROMPT_VERIFY_FAILED raised (caller must NOT send).
     """
     prefix = f'[T{tid}][{job_id}]' if job_id else f'[T{tid}]'
+    _jmark(job_id, 'prompt', 'run', 'target')
     append_runtime_log(f'{prefix} GEMINI_PROMPT_INJECT_STARTED')
     exp_norm = normalize_prompt_text(text)
     editor, info = get_active_gemini_composer(drv, tid, job_id)
     if editor is None:
         _prompt_fail_screenshot(drv, job_id, tid, 0)
+        _jmark(job_id, 'prompt', 'fail', 'PROMPT_COMPOSER_NOT_VISIBLE')
         raise PromptFailed(f'Tab T{tid}: PROMPT_COMPOSER_NOT_VISIBLE {info}')
+    _jmark(job_id, 'prompt', 'run', f"target='{info.get('placeholder', '')}'")
     last_tier_report = ''
     for attempt in range(1, 3):
         try:
@@ -3181,7 +3265,9 @@ def _inject_prompt_atomic(drv, text, tid=0, job_id=''):
                     # tiers -- do not repeat the old bug of inserting into
                     # whatever element happened to own focus.
                     append_runtime_log(f'{prefix} PROMPT_ATTEMPT={attempt} method={tier_name} focused=False result=SKIP_FOCUS_LOST')
+                    _jmark(job_id, 'prompt', 'run', f'focus:{tier_name}')
                     continue
+                _jmark(job_id, 'prompt', 'run', tier_name)
                 try:
                     if tier_name == 'CDP':
                         drv.execute_cdp_cmd('Input.insertText', {'text': text})
@@ -3215,7 +3301,9 @@ def _inject_prompt_atomic(drv, text, tid=0, job_id=''):
                                     f'expected_len={len(exp_norm)} result={"PASS" if ok else "FAIL"}')
                 append_runtime_log(f'{prefix} PROMPT_ATTEMPT={attempt} {last_tier_report}')
                 if ok:
+                    _jmark(job_id, 'prompt', 'ok', f'{tier_name} len={after_len}')
                     return True
+                _jmark(job_id, 'prompt', 'run', f'fail:{tier_name}')
             append_runtime_log(f'{prefix} PROMPT_VERIFY_FAIL attempt {attempt} (all 3 tiers) — retrying')
         except PromptFailed:
             raise
@@ -3223,6 +3311,7 @@ def _inject_prompt_atomic(drv, text, tid=0, job_id=''):
             append_runtime_log(f'{prefix} Prompt injection exception (attempt {attempt}): {e}')
             time.sleep(0.3)
     _prompt_fail_screenshot(drv, job_id, tid, 2)
+    _jmark(job_id, 'prompt', 'fail', 'PROMPT_VERIFY_FAILED(CDP/XCLIP/KEYS)')
     raise PromptFailed(f'Tab T{tid}: PROMPT_VERIFY_FAILED after 2 attempts x 3 tiers (CDP/xclip/send_keys all unverified). last={{{last_tier_report}}}')
 
 def _log_click_rect_and_occlusion(drv, element, label, prefix=''):
@@ -3291,6 +3380,7 @@ def _click_send_button(drv, tid=0, job_id=''):
     (GEMINI_SEND_VERIFIED in worker.log). A click that leaves the prompt
     sitting in the box returns False -- never a silent True."""
     prefix = f'[T{tid}][{job_id}]' if job_id else f'[T{tid}]'
+    _jmark(job_id, 'send', 'run')
     # Pre-click length of the ACTIVE visible composer (what we expect to
     # disappear once the message is really sent).
     pre_len = -1
@@ -3327,12 +3417,14 @@ def _click_send_button(drv, tid=0, job_id=''):
                 f"gen_evidence={gen_evidence} composer_len={snap.get('composer_text_len')}"
             )
             append_runtime_log(f'{prefix} SEND_VERIFIED ✅')
+            _jmark(job_id, 'send', 'ok', f'composer_emptied={composer_empty} gen_ev={gen_evidence}')
             return True
         time.sleep(0.4)
     append_runtime_log(
         f"{prefix} SEND_NOT_CONFIRMED composer did not empty / no generation evidence within 8s "
         f"(last composer_len={_gemini_ui_snapshot(drv).get('composer_text_len')})"
     )
+    _jmark(job_id, 'send', 'fail', 'SEND_NOT_CONFIRMED')
     return False
 
 def verify_generation_started(drv, timeout=6.0):
@@ -4268,7 +4360,11 @@ class GeminiWorker:
                 if not tab_id_str:
                     raise RuntimeError("Failed to create/find target tab")
                 append_runtime_log(f'{prefix} GEMINI_NEW_CHAT_STARTED')
-                job_mark(ctx.job_id, 'newchat', 'run')
+                # newchat/picker/createimg/imgmode/upload/attached/prompt/send
+                # tokens are updated IN PLACE by the helpers themselves via
+                # _jmark() (micro progress: 🔄 -> ✅/❌ with real evidence).
+                # The call site only re-marks coarse states here so a helper
+                # that succeeded without a token cannot leave a stale ⬜.
                 _gemini_state_snapshot(self.driver, 'after_new_chat', tid_int, ctx.job_id)
                 append_runtime_log(f'{prefix} GEMINI_NEW_CHAT_READY')
                 job_mark(ctx.job_id, 'newchat', 'ok')
@@ -4278,17 +4374,13 @@ class GeminiWorker:
 
                 ctx.transition_sync(JobState.GEMINI_MODE_SELECT)
                 append_runtime_log(f"{prefix} FLASH MODE")
-                job_mark(ctx.job_id, 'flash', 'run')
                 ensure_flash_mode(self.driver, tid_int, ctx.job_id)
-                job_mark(ctx.job_id, 'flash', 'ok')
                 _gemini_state_snapshot(self.driver, 'after_flash', tid_int, ctx.job_id)
 
                 append_runtime_log(f"{prefix} CREATE IMAGE MODE")
                 job_mark(ctx.job_id, 'picker', 'run')
                 ensure_create_image_mode(self.driver, tid_int, ctx.job_id)
                 job_mark(ctx.job_id, 'picker', 'ok')
-                job_mark(ctx.job_id, 'createimg', 'ok')
-                job_mark(ctx.job_id, 'imgmode', 'ok')
                 _gemini_state_snapshot(self.driver, 'after_create_image', tid_int, ctx.job_id)
 
                 ctx.transition_sync(JobState.GEMINI_UPLOADING)
@@ -4300,29 +4392,26 @@ class GeminiWorker:
                 _ok_att, _actual_att = verify_attachment_count(self.driver, upload_result["expected"], tid=tid_int, job_id=ctx.job_id, upload_token=upload_result["token"])
                 job_attach(ctx.job_id, _actual_att, upload_result["expected"])
                 job_mark(ctx.job_id, 'upload', 'ok')
+                job_mark(ctx.job_id, 'attached', 'ok')
                 append_runtime_log(f"{prefix} ATTACHMENTS VERIFIED")
                 append_runtime_log(f"{prefix} GEMINI_ATTACHMENTS_VERIFIED count={upload_result['expected']}")
                 _gemini_state_snapshot(self.driver, 'after_attachments', tid_int, ctx.job_id)
 
                 ctx.transition_sync(JobState.GEMINI_PROMPT)
-                job_mark(ctx.job_id, 'prompt', 'run')
                 _inject_prompt_atomic(self.driver, ctx.prompt, tid_int, ctx.job_id)
-                job_mark(ctx.job_id, 'prompt', 'ok')
                 append_runtime_log(f"{prefix} PROMPT INJECTED")
                 _gemini_state_snapshot(self.driver, 'after_prompt', tid_int, ctx.job_id)
 
                 ctx.transition_sync(JobState.GEMINI_SEND_PENDING)
-                job_mark(ctx.job_id, 'send', 'run')
                 urls_before = snapshot_urls(self.driver)
                 append_runtime_log(f'{prefix} GEMINI_SEND_REQUESTED')
                 if not _click_send_button(self.driver, tid_int, ctx.job_id):
-                    job_mark(ctx.job_id, 'send', 'fail')
                     raise RuntimeError("SEND_FAILED: Could not click send button")
-                job_mark(ctx.job_id, 'send', 'ok')
                 append_runtime_log(f"{prefix} SEND CLICKED")
                 append_runtime_log(f'{prefix} GEMINI_SEND_CLICKED')
                 _gemini_state_snapshot(self.driver, 'after_send', tid_int, ctx.job_id)
 
+                job_mark(ctx.job_id, 'genstart', 'run')
                 started = verify_generation_started(self.driver)
                 if not started:
                     _gemini_state_snapshot(self.driver, 'generation_start_failed', tid_int, ctx.job_id, screenshot=True)
