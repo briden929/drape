@@ -266,7 +266,7 @@ if _V16_STATE_KEY not in sys.modules:
 V16_STATE = sys.modules[_V16_STATE_KEY]
 
 def bootstrap_dependencies():
-    pkg_map = {'selenium': 'selenium', 'bullmq': 'bullmq', 'boto3': 'boto3', 'psycopg2': 'psycopg2-binary', 'PIL': 'Pillow', 'websockets': 'websockets', 'undetected_chromedriver': 'undetected-chromedriver', 'pyvirtualdisplay': 'pyvirtualdisplay'}
+    pkg_map = {'selenium': 'selenium', 'bullmq': 'bullmq', 'boto3': 'boto3', 'psycopg2': 'psycopg2-binary', 'PIL': 'Pillow', 'websockets': 'websockets', 'undetected_chromedriver': 'undetected-chromedriver', 'pyvirtualdisplay': 'pyvirtualdisplay', 'nest_asyncio': 'nest_asyncio', 'webdriver_manager': 'webdriver-manager', 'numpy': 'numpy', 'requests': 'requests'}
     missing = []
     for mod, pkg in pkg_map.items():
         if importlib.util.find_spec(mod) is None:
@@ -507,8 +507,7 @@ def run_cmd(cmd, desc='', timeout=120):
         if desc:
             print(f'  ⚠️ Error during {desc}: {e}')
         return False
-print('  Installing Python packages...')
-run_cmd('pip install -q bullmq psycopg2-binary boto3 selenium Pillow websockets nest_asyncio undetected-chromedriver webdriver-manager pyvirtualdisplay setuptools numpy requests', 'pip install')
+print('  Python packages already checked/installed by bootstrap_dependencies() above (only-if-missing) -- not reinstalling here.')
 print('  ✅ Python packages ready.')
 print('  Installing system packages...')
 run_cmd('apt-get update -qq && apt-get install -y -qq wget curl xvfb x11vnc novnc websockify fluxbox net-tools procps unzip zip xclip xsel dbus-x11 python3-numpy python3-websockify', 'system packages')
@@ -2055,20 +2054,33 @@ def verify_attachment_count(drv, expected: int, tid=0, job_id='') -> tuple:
     Returns (verified: bool, actual_count: int).
     FAIL on count < expected OR count > expected.
     If not verified within timeout, returns (False, actual_count).
+
+    Uses exactly ONE canonical selector for the count, not a union of
+    several. Gemini renders one uploaded file as several NESTED DOM layers
+    at once (an outer gem-media-attachment container, an inner preview
+    wrapper, its own close button, ...), and `id(el)` on the WebElement
+    Python wrapper does NOT deduplicate these -- each find_elements() call
+    returns fresh wrapper objects with distinct Python ids even for the
+    same underlying DOM node. Summing matches across 5 selector families
+    was counting one real upload as up to 5 "attachments", producing the
+    "expected 3, got 5" mismatches seen in production. gem-media-attachment
+    is the single outermost container Gemini renders once per uploaded
+    file; uploader-file-preview is used only as a fallback if that
+    selector ever renders nothing (never unioned with it).
     """
     prefix = f'[T{tid}][{job_id}]' if job_id else f'[T{tid}]'
     t0 = time.time()
     chip_count = 0
     while time.time() - t0 < 15.0:
-        chips = []
-        for sel in ["button[aria-label='close attachment']", 'gem-media-attachment', 'uploader-file-preview', '.attachment-preview-wrapper', "div[data-test-id='uploaded-img']"]:
+        try:
+            chip_count = len([el for el in drv.find_elements(By.CSS_SELECTOR, 'gem-media-attachment') if el.is_displayed()])
+        except Exception:
+            chip_count = 0
+        if chip_count == 0 and expected > 0:
             try:
-                for el in drv.find_elements(By.CSS_SELECTOR, sel):
-                    if el.is_displayed():
-                        chips.append(id(el))
+                chip_count = len([el for el in drv.find_elements(By.CSS_SELECTOR, 'uploader-file-preview') if el.is_displayed()])
             except Exception:
                 pass
-        chip_count = len(set(chips))
         if chip_count == expected:
             log(f'{prefix} ATTACHMENTS {chip_count}/{expected} ✅ (exact match)')
             return (True, chip_count)
@@ -3613,7 +3625,7 @@ async def worker_heartbeat_loop():
             print("\nBullMQ:")
             print("RUNNING" if RUNTIME_HEALTH["bullmq"] else "FAILED")
 
-            print("\nQueue:")
+            print("\nQueue (BullMQ, whole queue -- may include other workers/retries):")
             print(f"{LAST_QUEUE_COUNTS.get('_queue_name', QUEUE_NAME)}")
             print(f"Waiting:   {LAST_QUEUE_COUNTS.get('waiting', 'n/a')}")
             print(f"Active:    {LAST_QUEUE_COUNTS.get('active', 'n/a')}")
@@ -3641,8 +3653,8 @@ async def worker_heartbeat_loop():
             print("\nWMR broker:")
             print("HEALTHY" if any(r["state"] != ResourceState.DEAD.value for r in wmr_states.values()) else "DEGRADED")
 
-            print("\nJobs:")
-            print(f"ACTIVE = {active_jobs}")
+            print("\nJobs (this worker process only, distinct from the queue-wide Active count above):")
+            print(f"LOCAL_ACTIVE = {active_jobs}")
 
             print("\nWorker:")
             print("ALIVE")
