@@ -1049,20 +1049,22 @@ def download_remote_image(url, dest_dir):
     if dest.exists() and dest.stat().st_size > 0:
         return str(dest)
     req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+    PERMANENT_HTTP_STATUS = {400, 401, 403, 404, 410}
     last_err = None
     for attempt in range(1, 5):
         try:
             with urllib.request.urlopen(req, timeout=15) as resp:
                 dest.write_bytes(resp.read())
             return str(dest)
+        except urllib.error.HTTPError as e:
+            last_err = e
+            if e.code in PERMANENT_HTTP_STATUS:
+                raise RuntimeError(f'REF_HTTP_PERMANENT_FAILURE status={e.code}: {e}') from e
+            time.sleep(2 ** attempt)
         except Exception as e:
             last_err = e
             time.sleep(2 ** attempt)
     raise RuntimeError(f'REF_DOWNLOAD_FAILED (exhausted 4 retries): {last_err}')
-    req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-    with urllib.request.urlopen(req, timeout=25) as resp:
-        dest.write_bytes(resp.read())
-    return str(dest)
 
 def push_generation(image_path, prompt, user_id=None, params=None, gen_id=None, webp_path=None, force=False):
     if not fs_configured():
