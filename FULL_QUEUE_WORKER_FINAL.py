@@ -3053,12 +3053,39 @@ def run_architecture_self_test():
     ):
         assert _name in globals(), f"PREFLIGHT_MISSING_SYMBOL: {_name}"
 
-BACKGROUND_TASKS = set()
-BULLMQ_WORKER = None
-QUEUE_MONITOR = None
-QUEUE_MONITOR_TASK = None
-HEARTBEAT_TASK = None
-WATCHER_TASK = None
+# This whole file is designed to be pasted into and re-run inside a single
+# long-lived Colab/notebook cell. A plain module global (`WORKER_MAIN_TASK =
+# None`, `_RUNTIME_INITIALIZED = False`, ...) gets reset to that literal
+# value every time the cell re-executes -- but a PREVIOUS run's main() task
+# (with its own live BULLMQ_WORKER and Redis Queue client) keeps running on
+# the same persistent kernel event loop, since nothing ever cancelled it.
+# Without this, every re-run (without a full Runtime > Restart) silently
+# spawned ANOTHER concurrent BullMQ Worker pulling from the same queue,
+# while the orphaned previous one's Redis client eventually surfaced as an
+# "Unclosed Redis client" asyncio warning when garbage collected. Stashing
+# the runtime singleton in sys.modules -- which, unlike a plain global,
+# survives this file being re-executed in the same kernel -- lets
+# start_worker() detect and reuse the still-running previous task instead.
+_V16_STATE_KEY = "__v16_runtime_singleton__"
+if _V16_STATE_KEY not in sys.modules:
+    _v16_state = types.ModuleType(_V16_STATE_KEY)
+    _v16_state.BACKGROUND_TASKS = set()
+    _v16_state.BULLMQ_WORKER = None
+    _v16_state.QUEUE_MONITOR = None
+    _v16_state.QUEUE_MONITOR_TASK = None
+    _v16_state.HEARTBEAT_TASK = None
+    _v16_state.WATCHER_TASK = None
+    _v16_state.WORKER_MAIN_TASK = None
+    _v16_state.RUNTIME_INITIALIZED = False
+    sys.modules[_V16_STATE_KEY] = _v16_state
+V16_STATE = sys.modules[_V16_STATE_KEY]
+
+BACKGROUND_TASKS = V16_STATE.BACKGROUND_TASKS
+BULLMQ_WORKER = V16_STATE.BULLMQ_WORKER
+QUEUE_MONITOR = V16_STATE.QUEUE_MONITOR
+QUEUE_MONITOR_TASK = V16_STATE.QUEUE_MONITOR_TASK
+HEARTBEAT_TASK = V16_STATE.HEARTBEAT_TASK
+WATCHER_TASK = V16_STATE.WATCHER_TASK
 
 RUNTIME_HEALTH = {
     "redis": False,
@@ -3091,6 +3118,7 @@ async def redis_queue_monitor_loop():
             "prefix": opts["prefix"],
         },
     )
+    V16_STATE.QUEUE_MONITOR = QUEUE_MONITOR
 
     while True:
         try:
@@ -3262,6 +3290,7 @@ async def main():
 
         print("STEP 16: DOWNLOAD MONITOR", flush=True)
         WATCHER_TASK = asyncio.create_task(poll_downloads_loop())
+        V16_STATE.WATCHER_TASK = WATCHER_TASK
         BACKGROUND_TASKS.add(WATCHER_TASK)
         RUNTIME_HEALTH["download_monitor"] = True
         print("[DOWNLOAD] monitor task created", flush=True)
@@ -3271,6 +3300,7 @@ async def main():
             print("[REDIS MONITOR] Already running", flush=True)
         else:
             QUEUE_MONITOR_TASK = asyncio.create_task(redis_queue_monitor_loop())
+            V16_STATE.QUEUE_MONITOR_TASK = QUEUE_MONITOR_TASK
             BACKGROUND_TASKS.add(QUEUE_MONITOR_TASK)
         print("[QUEUE] monitor task created", flush=True)
 
@@ -3279,6 +3309,7 @@ async def main():
             print("[HEARTBEAT] Already running", flush=True)
         else:
             HEARTBEAT_TASK = asyncio.create_task(worker_heartbeat_loop())
+            V16_STATE.HEARTBEAT_TASK = HEARTBEAT_TASK
             BACKGROUND_TASKS.add(HEARTBEAT_TASK)
         print("[HEARTBEAT] task created", flush=True)
 
@@ -3290,6 +3321,7 @@ async def main():
         # serialize every job and starve the resource brokers.
         print("[BULLMQ] Creating Worker", flush=True)
         BULLMQ_WORKER = Worker(QUEUE_NAME, process_bullmq_job, {"connection": real_opts, "prefix": opts["prefix"], "concurrency": BULLMQ_CONCURRENCY})
+        V16_STATE.BULLMQ_WORKER = BULLMQ_WORKER
         print(f"[BULLMQ] Worker CREATED (concurrency={BULLMQ_CONCURRENCY})", flush=True)
         RUNTIME_HEALTH["bullmq"] = True
 
@@ -3329,14 +3361,18 @@ async def shutdown_worker():
     
     print("[SHUTDOWN] Worker stopped cleanly.")
 
-WORKER_MAIN_TASK = None
-_RUNTIME_INITIALIZED = False
+# Source of truth is V16_STATE (persists across this file being re-run in
+# the same kernel); these plain globals are kept as a synced mirror only
+# because other code (e.g. shutdown_worker() above) reads them directly.
+WORKER_MAIN_TASK = V16_STATE.WORKER_MAIN_TASK
+_RUNTIME_INITIALIZED = V16_STATE.RUNTIME_INITIALIZED
 
 def _worker_main_task_done(task):
     global _RUNTIME_INITIALIZED
     if task.cancelled():
         print("[WORKER] MAIN TASK CANCELLED", flush=True)
         _RUNTIME_INITIALIZED = False
+        V16_STATE.RUNTIME_INITIALIZED = False
         return
 
     exc = task.exception()
@@ -3359,13 +3395,21 @@ def _worker_main_task_done(task):
         print("[FATAL] WORKER MAIN TASK EXITED UNEXPECTEDLY (no exception, but main() returned)", flush=True)
         print("=" * 70, flush=True)
     _RUNTIME_INITIALIZED = False
+    V16_STATE.RUNTIME_INITIALIZED = False
 
 def start_worker():
     global WORKER_MAIN_TASK, _RUNTIME_INITIALIZED
 
-    if _RUNTIME_INITIALIZED:
-        print("[BOOT] WORKER ALREADY RUNNING -- returning existing task", flush=True)
-        return WORKER_MAIN_TASK
+    # Check the persistent singleton, NOT the plain global -- the plain
+    # global was just reset to V16_STATE's value a few lines above by this
+    # same re-run of the file, but V16_STATE itself only changes when a task
+    # is actually created/finishes, so it correctly reflects whether a
+    # previous run's main() is still alive on this kernel's event loop.
+    existing_task = V16_STATE.WORKER_MAIN_TASK
+    if V16_STATE.RUNTIME_INITIALIZED and existing_task is not None and not existing_task.done():
+        print("[BOOT] WORKER ALREADY RUNNING (from a previous run of this cell in this same kernel) -- reusing it instead of starting a duplicate BullMQ Worker.", flush=True)
+        WORKER_MAIN_TASK = existing_task
+        return existing_task
 
     print("[BOOT] STARTING RUNTIME MAIN TASK", flush=True)
 
@@ -3377,12 +3421,15 @@ def start_worker():
         # appear normally; nothing further to do here.
         return asyncio.run(main())
 
-    if WORKER_MAIN_TASK and not WORKER_MAIN_TASK.done():
-        print("[BOOT] WORKER ALREADY RUNNING -- returning existing task", flush=True)
-        return WORKER_MAIN_TASK
+    if existing_task is not None and not existing_task.done():
+        print("[BOOT] WORKER ALREADY RUNNING (from a previous run of this cell in this same kernel) -- reusing it instead of starting a duplicate BullMQ Worker.", flush=True)
+        WORKER_MAIN_TASK = existing_task
+        return existing_task
 
     _RUNTIME_INITIALIZED = True
+    V16_STATE.RUNTIME_INITIALIZED = True
     WORKER_MAIN_TASK = loop.create_task(main())
+    V16_STATE.WORKER_MAIN_TASK = WORKER_MAIN_TASK
     WORKER_MAIN_TASK.add_done_callback(_worker_main_task_done)
     print("[BOOT] WORKER_MAIN_TASK CREATED", flush=True)
     print(
