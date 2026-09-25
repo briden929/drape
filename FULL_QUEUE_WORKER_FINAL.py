@@ -3160,6 +3160,9 @@ class GeminiWorker:
                 job_dir, staging_dir = get_chrome_job_dir(tid_int, ctx.job_id)
                 set_tab_download_dir(self.driver, str(staging_dir))
 
+                append_runtime_log(f"{prefix} FLASH MODE")
+                ensure_flash_mode(self.driver, tid_int, ctx.job_id)
+
                 append_runtime_log(f"{prefix} CREATE IMAGE MODE")
                 ensure_create_image_mode(self.driver, tid_int, ctx.job_id)
 
