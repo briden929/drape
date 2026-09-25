@@ -268,6 +268,8 @@ if _V16_STATE_KEY not in sys.modules:
     _v16_state.cf_proc = None
     _v16_state.tunnel_url = None
     _v16_state.DASHBOARD_TASK = None
+    _v16_state.LIVE_DISPLAY_BORN = set()
+    _v16_state.LIVE_LAST_TEXT = {}
     sys.modules[_V16_STATE_KEY] = _v16_state
 V16_STATE = sys.modules[_V16_STATE_KEY]
 
@@ -561,6 +563,19 @@ PROGRESS_STAGES = ['newchat', 'flash', 'picker', 'createimg', 'imgmode',
 
 JOB_PROGRESS: Dict[str, dict] = {}
 
+JOB_SEQUENCE_LOCK = threading.Lock()
+JOB_SEQUENCE = 0
+
+
+def allocate_job_sequence() -> int:
+    """Display-only monotonic G1/G2/G3... counter -- never written to DB,
+    never used for correctness, purely so the live line can show a short
+    human-friendly job number instead of only a resource tag."""
+    global JOB_SEQUENCE
+    with JOB_SEQUENCE_LOCK:
+        JOB_SEQUENCE += 1
+        return JOB_SEQUENCE
+
 
 def _job_display_name(job_id: str) -> str:
     """Compact human label for a job line: DB title/prompt head + ref count."""
@@ -591,8 +606,10 @@ JOB_PROGRESS_RETENTION_S = float(os.environ.get('JOB_PROGRESS_RETENTION_S', '120
 
 def job_progress_init(job_id: str):
     prev = JOB_PROGRESS.get(job_id) or {}
+    prev_seq = (prev.get('details') or {}).get('seq')
     JOB_PROGRESS[job_id] = {
         'stages': {},          # stage -> 'run' | 'ok' | 'fail'
+        'details': {'seq': prev_seq or allocate_job_sequence()},
         'attach': None,        # (actual, expected)
         'error': None,         # STOP reason shown on the job line
         'resource': None,      # T0..T3
@@ -622,6 +639,27 @@ def prune_job_progress():
         JOB_PROGRESS.pop(jid, None)
 
 
+def progress_detail(job_id: str, key: str, value):
+    """A browser helper NEVER prints directly -- it only records what it
+    verified here, and the single persistent per-job display line picks
+    it up. This is the ONLY way qualifiers like flash_current/
+    prompt_method/file_input_count reach the notebook."""
+    p = JOB_PROGRESS.get(job_id)
+    if p is None:
+        return
+    p.setdefault('details', {})[key] = value
+    refresh_job_line(job_id)
+
+
+def refresh_job_line(job_id: str):
+    """Re-render this job's current full state and push it to its ONE
+    persistent display slot (job:<job_id>) -- never a new notebook line,
+    just an update to the same one."""
+    line = render_job_line(job_id)
+    if line:
+        emit_live_event(f'job:{job_id}', line)
+
+
 def job_mark(job_id: str, stage: str, status: str):
     """Update one stage token on the job's single live line. Only called
     with status='ok' from call sites AFTER real browser verification."""
@@ -632,6 +670,7 @@ def job_mark(job_id: str, stage: str, status: str):
     if status == 'fail':
         p['failed'] = True
         p.setdefault('failed_ts', time.time())
+    refresh_job_line(job_id)
 
 
 def job_stop(job_id: str, reason: str):
@@ -647,68 +686,154 @@ def job_stop(job_id: str, reason: str):
     p['error'] = reason[:120]
     p['failed'] = True
     p.setdefault('failed_ts', time.time())
+    refresh_job_line(job_id)
 
 
 def job_complete(job_id: str):
     p = JOB_PROGRESS.get(job_id)
     if p is not None:
         p['completed_at'] = time.time()
+        refresh_job_line(job_id)
 
 
 def job_attach(job_id: str, actual, expected):
     p = JOB_PROGRESS.get(job_id)
-    if p is not None:
-        p['attach'] = (actual, expected)
+    if p is None:
+        return
+    p['attach'] = (actual, expected)
+    d = p.setdefault('details', {})
+    d['file_input_count'] = actual
+    d['file_input_expected'] = expected
+    if expected is not None and actual >= expected:
+        d['attached'] = True
+    refresh_job_line(job_id)
 
 
 _STAGE_ICONS = {'run': '🔄', 'ok': '✅', 'fail': '❌'}
 
 
 def render_job_line(job_id: str) -> str:
+    """ONE physical line per job, rebuilt from JOB_PROGRESS every time
+    anything about this job changes. `details` (set only via
+    progress_detail()/job_attach(), only after a browser helper actually
+    verified something) drives the qualifier-bearing tokens
+    (SwitchFlash/Picker/Flash(role)/FileInput(n)/Paste/etc); `stages`
+    (set only via job_mark(), also only after real verification) drives
+    the plain run/ok/fail tokens for stages that don't need a qualifier.
+    Never truncated -- only the human title is capped."""
     p = JOB_PROGRESS.get(job_id)
     if p is None:
         return ''
     stages = p['stages']
+    d = p.get('details') or {}
     tokens = []
-    for st in PROGRESS_STAGES:
-        if st == 'done':
-            continue
-        if st == 'attached':
-            if p.get('attach'):
-                a, e = p['attach']
-                ok = (e is not None and a >= e)
-                tokens.append(f"{'✅' if ok else '📎'}{a}/{e}")
-            elif 'upload' in stages:
-                tokens.append('📎0/?')
-            continue
-        if st == 'image':
-            if p.get('image_at'):
-                tokens.append(f"🖼️{int(time.time() - p['image_at'])}s")
-            elif st in stages:
-                tokens.append(_STAGE_ICONS[stages[st]] + 'Image')
-            continue
-        if st == 'download':
-            if 'dlraw' in stages or p.get('dl_bytes'):
-                continue
-            tokens.append(_STAGE_ICONS[stages[st]] + 'DL')
-            continue
-        if st == 'dlraw':
-            if p.get('dl_bytes'):
-                tokens.append(f"⬇️{p['dl_bytes'] // 1024}KB")
-            else:
-                tokens.append(_STAGE_ICONS[stages[st]] + 'DL-Raw')
-            continue
-        if st == 'dlclean':
-            if p.get('dlclean_bytes'):
-                tokens.append(f"➜{p['dlclean_bytes'] // 1024}KB")
-            elif st in stages:
-                tokens.append(_STAGE_ICONS[stages[st]] + 'DL-Clean')
-            continue
-        if st in stages:
-            label = {'wmr': 'WMR', 'webp': 'WebP', 'settle': 'Settle'}.get(st, st.capitalize())
-            tokens.append(_STAGE_ICONS[stages[st]] + label)
+
+    # NEW CHAT
+    if stages.get('newchat') == 'run':
+        tokens.append('🔄NewChat')
+    elif stages.get('newchat') == 'ok':
+        tokens.append('✅NewChat')
+    elif stages.get('newchat') == 'fail':
+        tokens.append('❌NewChat')
+
+    # FLASH
+    if d.get('flash_verified'):
+        tokens.append('✅SwitchFlash')
+    elif stages.get('flash') == 'run':
+        cur = d.get('flash_current') or '?'
+        tokens.append(f'🔄SwitchFlash(cur:{cur})')
+    elif stages.get('flash') == 'fail':
+        tokens.append('❌Flash')
+    if d.get('flash_picker'):
+        tokens.append('🔽Picker(btn)')
+    if d.get('flash_role'):
+        tokens.append('✅Flash(role)')
+    if d.get('flash_verified'):
+        tokens.append('✅Flash(verified)')
+
+    # CREATE IMAGE
+    if d.get('createimg') or stages.get('createimg') == 'ok':
+        tokens.append('✅CreateImg')
+    elif stages.get('createimg') == 'run':
+        tokens.append('🔄CreateImg')
+    elif stages.get('createimg') == 'fail':
+        tokens.append('❌CreateImg')
+    if d.get('imgmode') or stages.get('imgmode') == 'ok':
+        tokens.append('✅ImgMode(confirmed)')
+
+    # UPLOAD
+    if d.get('upload_files'):
+        tokens.append('📁UploadFiles')
+    fi = d.get('file_input_count')
+    if fi is not None:
+        expected = d.get('file_input_expected')
+        tokens.append(f'📎FileInput({fi}/{expected})' if expected else f'📎FileInput({fi})')
+    if d.get('attached'):
+        tokens.append('✅Attached')
+
+    # PROMPT
+    prompt_method = d.get('prompt_method')
+    if prompt_method:
+        label = 'Paste' if prompt_method.lower() in ('clipboard', 'paste') else prompt_method
+        tokens.append(f'✏️{label}✅')
+    elif stages.get('prompt') == 'run':
+        tokens.append('✏️Prompt…')
+    elif stages.get('prompt') == 'fail':
+        tokens.append('❌Prompt')
+
+    # SEND
+    if d.get('sent'):
+        tokens.append('✅Sent')
+    elif stages.get('send') == 'run':
+        tokens.append('📤Sending…')
+    elif stages.get('send') == 'fail':
+        tokens.append('❌Send')
+
+    # GENERATION
+    if stages.get('genstart') == 'ok':
+        tokens.append('🧠Generating')
+    elif d.get('waiting_generation'):
+        tokens.append('→ Waiting gen…')
+
+    # IMAGE
+    if p.get('image_at'):
+        tokens.append(f"🖼️{int(time.time() - p['image_at'])}s")
+    elif d.get('image_detected'):
+        tokens.append('🖼️Image')
+
+    # RAW DOWNLOAD / RELEASE
+    if p.get('dl_bytes'):
+        tokens.append(f"⬇️DL({p['dl_bytes'] // 1024}KB)")
+    elif stages.get('dlraw') == 'run':
+        tokens.append('⬇️DL…')
+    if d.get('gemini_released') or stages.get('released') == 'ok':
+        tokens.append('✅Released')
+
+    # WMR
+    if d.get('wmr_resource'):
+        tokens.append(f"🧼WMR[{d['wmr_resource']}]")
+    if d.get('wmr_done') or stages.get('wmr') == 'ok':
+        tokens.append('✅WMR')
+    elif stages.get('wmr') == 'run':
+        tokens.append('🔄WMR')
+
+    # CLEAN DOWNLOAD / FINALIZE
+    if p.get('dlclean_bytes'):
+        tokens.append(f"⬇️Clean({p['dlclean_bytes'] // 1024}KB)")
+    if d.get('webp') or stages.get('webp') == 'ok':
+        tokens.append('✅WebP')
+    if d.get('r2') or stages.get('r2') == 'ok':
+        tokens.append('✅R2')
+    if d.get('db') or stages.get('db') == 'ok':
+        tokens.append('✅DB')
+    if d.get('credits_failed'):
+        tokens.append('⚠️Credits')
+    elif d.get('credits') or stages.get('settle') == 'ok':
+        tokens.append('✅Credits')
+
     if p.get('completed_at'):
         tokens.append('🎉DONE')
+
     if p.get('failed'):
         head = '🔴'
     elif p.get('completed_at'):
@@ -718,8 +843,9 @@ def render_job_line(job_id: str) -> str:
     res = p.get('resource') or '--'
     wres = p.get('wmr_resource')
     tag = f"{res}" + (f"/{wres}" if wres else "")
-    # ONE physical line: tokens are never truncated -- only the human title.
-    line = f"{head} [{tag}] {short_job_id(job_id)} {_job_display_name(job_id)} | " + ' | '.join(tokens)
+    seq = d.get('seq')
+    seq_tag = f"G{seq}/{tag}" if seq else tag
+    line = f"{head} [{seq_tag}] {_job_display_name(job_id)} | " + ' | '.join(tokens)
     if p.get('error'):
         line += f" | STOP {p['error']}"
     return line
@@ -2252,14 +2378,17 @@ def ensure_flash_mode(drv, tid=0, job_id=''):
     prefix = f'[T{tid}][{job_id}]' if job_id else f'[T{tid}]'
     append_runtime_log(f'{prefix} GEMINI_FLASH_CHECK')
     current = _get_current_model_text(drv)
+    progress_detail(job_id, 'flash_current', current or 'unknown')
     if current and 'flash' in current.lower() and ('lite' not in current.lower()):
         append_runtime_log(f"{prefix} FLASH_VERIFIED (already active: '{current}')")
         append_runtime_log(f"{prefix} GEMINI_FLASH_VERIFIED model_text='{current}'")
+        progress_detail(job_id, 'flash_verified', True)
         return True
     for attempt in range(1, 4):
         if not _open_model_picker(drv):
             time.sleep(0.4)
             continue
+        progress_detail(job_id, 'flash_picker', True)
         time.sleep(0.3)
         try:
             clicked = _click_flash_in_picker(drv)
@@ -2269,9 +2398,12 @@ def ensure_flash_mode(drv, tid=0, job_id=''):
             except Exception:
                 pass
             raise
+        if clicked:
+            progress_detail(job_id, 'flash_role', True)
         if clicked and _verify_flash_selected(drv, timeout=2.5):
             append_runtime_log(f'{prefix} FLASH_VERIFIED ✅')
             append_runtime_log(f"{prefix} GEMINI_FLASH_VERIFIED model_text='{_get_current_model_text(drv)}'")
+            progress_detail(job_id, 'flash_verified', True)
             return True
         try:
             drv.find_element(By.TAG_NAME, 'body').send_keys(Keys.ESCAPE)
@@ -2591,6 +2723,8 @@ def ensure_create_image_mode(drv, tid=0, job_id=''):
         ok, last_snap = _check('precheck')
         if ok:
             append_runtime_log(f'{prefix} GEMINI_CREATE_IMAGE_VERIFIED via=precheck')
+            progress_detail(job_id, 'createimg', True)
+            progress_detail(job_id, 'imgmode', 'confirmed')
             return True
         time.sleep(0.5)
 
@@ -2669,6 +2803,8 @@ def ensure_create_image_mode(drv, tid=0, job_id=''):
                     ok, last_snap = _check(f'click_attempt_{attempt}')
                     if ok:
                         append_runtime_log(f'{prefix} GEMINI_CREATE_IMAGE_VERIFIED via=click_attempt_{attempt}')
+                        progress_detail(job_id, 'createimg', True)
+                        progress_detail(job_id, 'imgmode', 'confirmed')
                         return True
                     time.sleep(0.5)
             else:
@@ -3190,6 +3326,7 @@ def _inject_prompt_atomic(drv, text, tid=0, job_id=''):
             try:
                 if method(drv, text, tid=tid, job_id=job_id):
                     append_runtime_log(f'{prefix} PROMPT_METHOD_SUCCESS={method_name}')
+                    progress_detail(job_id, 'prompt_method', method_name)
                     return True
                 append_runtime_log(f'{prefix} PROMPT_METHOD_FAIL={method_name}')
             except Exception as e:
@@ -3257,32 +3394,32 @@ _SEND_BUTTON_JS = """
 
 
 def _click_send_button_once(drv, tid=0, job_id=''):
+    """Fail-closed by design: with T0-T3 sharing one Chrome driver, a
+    page-wide Send scan risks clicking a button that doesn't actually
+    belong to THIS job's verified composer. If the composer can't be
+    found, or no send button is found scoped to it, this returns False
+    rather than falling back to an unscoped page-wide click."""
     prefix = f'[T{tid}][{job_id}]' if job_id else f'[T{tid}]'
     editor = get_active_gemini_image_composer(drv, tid=tid, job_id=job_id)
-    if editor is not None:
-        try:
-            result = drv.execute_script(_SEND_BUTTON_JS, editor)
-            if result:
-                if not result.get('scoped'):
-                    append_runtime_log(f'{prefix} SEND_SCOPE_FALLBACK — no composer-scoped ancestor found, using page-wide scan')
-                for btn in result.get('btns') or []:
-                    if not _log_click_rect_and_occlusion(drv, btn, 'SEND', prefix):
-                        continue
-                    drv.execute_script('arguments[0].click();', btn)
-                    return True
-        except Exception as e:
-            append_runtime_log(f'{prefix} SEND_SCOPE_LOOKUP_ERROR: {e}')
-    else:
+    if editor is None:
         append_runtime_log(f'{prefix} SEND_ABORT no active composer to scope from')
-    for xp in ["//mat-icon[@data-mat-icon-name='arrow_upward']/ancestor::button", "//mat-icon[@fonticon='arrow_upward']/ancestor::button", "//button[@aria-label='Send message']"]:
-        try:
-            for btn in drv.find_elements(By.XPATH, xp):
-                if btn.is_displayed() and btn.is_enabled():
-                    _log_click_rect_and_occlusion(drv, btn, 'SEND', prefix)
-                    drv.execute_script('arguments[0].click();', btn)
-                    return True
-        except Exception:
+        return False
+    try:
+        result = drv.execute_script(_SEND_BUTTON_JS, editor)
+    except Exception as e:
+        append_runtime_log(f'{prefix} SEND_SCOPE_LOOKUP_ERROR: {e}')
+        return False
+    if not result:
+        append_runtime_log(f'{prefix} SEND_SCOPE_FAILED no send button found in composer scope')
+        return False
+    if not result.get('scoped'):
+        append_runtime_log(f'{prefix} SEND_SCOPE_FAILED no composer-scoped ancestor found (not falling back to page-wide)')
+        return False
+    for btn in result.get('btns') or []:
+        if not _log_click_rect_and_occlusion(drv, btn, 'SEND', prefix):
             continue
+        drv.execute_script('arguments[0].click();', btn)
+        return True
     return False
 
 
@@ -3344,6 +3481,8 @@ def _click_send_button(drv, tid=0, job_id=''):
                 f"gen_evidence={gen_evidence} composer_len={snap.get('composer_text_len')}"
             )
             append_runtime_log(f'{prefix} SEND_VERIFIED ✅')
+            progress_detail(job_id, 'sent', True)
+            progress_detail(job_id, 'waiting_generation', True)
             return True
         time.sleep(0.4)
     append_runtime_log(
@@ -4182,11 +4321,12 @@ class GeminiWorker:
                 self.driver = chrome_driver
 
                 append_runtime_log(f"{prefix} NEW CHAT")
-                tab_id_str = open_new_chat_and_reload(self.driver, tid_int, ctx.job_id)
-                if not tab_id_str:
-                    raise RuntimeError("Failed to create/find target tab")
                 append_runtime_log(f'{prefix} GEMINI_NEW_CHAT_STARTED')
                 job_mark(ctx.job_id, 'newchat', 'run')
+                tab_id_str = open_new_chat_and_reload(self.driver, tid_int, ctx.job_id)
+                if not tab_id_str:
+                    job_mark(ctx.job_id, 'newchat', 'fail')
+                    raise RuntimeError("Failed to create/find target tab")
                 _gemini_state_snapshot(self.driver, 'after_new_chat', tid_int, ctx.job_id)
                 append_runtime_log(f'{prefix} GEMINI_NEW_CHAT_READY')
                 job_mark(ctx.job_id, 'newchat', 'ok')
@@ -4213,6 +4353,7 @@ class GeminiWorker:
                 append_runtime_log(f"{prefix} UPLOADING REFERENCES")
                 append_runtime_log(f'{prefix} GEMINI_UPLOAD_STARTED n_refs={len(ctx.reference_paths)}')
                 job_mark(ctx.job_id, 'upload', 'run')
+                progress_detail(ctx.job_id, 'upload_files', True)
                 upload_result = upload_reference_files(self.driver, ctx.reference_paths, tid_int, ctx.job_id)
                 append_runtime_log(f"{prefix} GEMINI_UPLOAD_COMPLETED files={upload_result['expected']}")
                 _ok_att, _actual_att = verify_attachment_count(self.driver, upload_result["expected"], tid=tid_int, job_id=ctx.job_id, upload_token=upload_result["token"])
@@ -4643,7 +4784,8 @@ async def execute_pipeline(ctx: JobContext):
             ctx.transition_sync(JobState.COMPLETED)
             return
 
-        print("[BULLMQ] RESOLVING PROMPT + REFERENCES", flush=True)
+        progress_detail(ctx.job_id, 'refs_state', 'resolving')
+        append_runtime_log(f"[{ctx.job_id}] RESOLVING PROMPT + REFERENCES")
         prompt, garment_path, model_path, holo_path = resolve_prompt_and_refs(ctx.payload)
         ctx.prompt = prompt
         ctx.garment_path = garment_path
@@ -4657,11 +4799,14 @@ async def execute_pipeline(ctx: JobContext):
         # Local cache paths only -- never the original remote reference URLs
         # (params_json/URLs are DB-owned strings that can carry pre-signed
         # query params, so this stays as filenames only, not full paths).
-        print("[BULLMQ] REFERENCES READY", flush=True)
-        print(f"Garment:         {Path(garment_path).name if garment_path else None}", flush=True)
-        print(f"Model:           {Path(model_path).name if model_path else None}", flush=True)
-        print(f"Hologram:        {Path(holo_path).name if holo_path else None}", flush=True)
-        print(f"Reference count: {len(ctx.reference_paths)}", flush=True)
+        append_runtime_log(
+            f"[{ctx.job_id}] REFERENCES READY garment={Path(garment_path).name if garment_path else None} "
+            f"model={Path(model_path).name if model_path else None} "
+            f"hologram={Path(holo_path).name if holo_path else None} "
+            f"count={len(ctx.reference_paths)}"
+        )
+        progress_detail(ctx.job_id, 'refs_count', len(ctx.reference_paths))
+        progress_detail(ctx.job_id, 'refs_state', 'ready')
 
         append_runtime_log(f"[PIPELINE][{ctx.job_id}] GEMINI QUEUED")
         append_runtime_log(f"[PIPELINE][{ctx.job_id}] Acquiring Gemini resource")
@@ -4830,9 +4975,9 @@ async def poll_downloads_loop():
                 kind = "RAW" if rec.target_state == JobState.RAW_VALIDATED else "CLEAN"
                 if completed_file and dict_key not in _DOWNLOADS_SEEN_FILE:
                     _DOWNLOADS_SEEN_FILE.add(dict_key)
-                    print(f"[DOWNLOAD][{rec.job_id}] {kind} DOWNLOAD STARTED", flush=True)
-                    print(f"[DOWNLOAD][{rec.job_id}] waiting for filesystem completion", flush=True)
-                    print(f"[DOWNLOAD][{rec.job_id}] file detected", flush=True)
+                    append_runtime_log(f"[DOWNLOAD][{rec.job_id}] {kind} DOWNLOAD STARTED")
+                    append_runtime_log(f"[DOWNLOAD][{rec.job_id}] waiting for filesystem completion")
+                    append_runtime_log(f"[DOWNLOAD][{rec.job_id}] file detected")
 
                 if completed_file:
                     size_before = -1
@@ -4848,10 +4993,10 @@ async def poll_downloads_loop():
                         except Exception: pass
 
                     if stable:
-                        print(f"[DOWNLOAD][{rec.job_id}] file stable", flush=True)
+                        append_runtime_log(f"[DOWNLOAD][{rec.job_id}] file stable")
                         try:
                             validate_image_file(str(completed_file))
-                            print(f"[DOWNLOAD][{rec.job_id}] PNG VALIDATED", flush=True)
+                            append_runtime_log(f"[DOWNLOAD][{rec.job_id}] PNG VALIDATED")
                             _sz = completed_file.stat().st_size
                             _jp = JOB_PROGRESS.get(rec.job_id)
                             if rec.target_state == JobState.RAW_VALIDATED:
@@ -4867,11 +5012,11 @@ async def poll_downloads_loop():
                                 job_mark(rec.job_id, 'dlclean', 'ok')
 
                             ctx.transition_sync(rec.target_state)
-                            print(f"[DOWNLOAD][{rec.job_id}] {rec.target_state.name}", flush=True)
+                            append_runtime_log(f"[DOWNLOAD][{rec.job_id}] {rec.target_state.name}")
                             with DOWNLOAD_REGISTRY_LOCK: DOWNLOAD_REGISTRY.pop(dict_key, None)
                             _DOWNLOADS_SEEN_FILE.discard(dict_key)
                         except Exception as e:
-                            print(f"[{rec.job_id}] DOWNLOAD_VALIDATE_FAILED: {e}")
+                            append_runtime_log(f"[{rec.job_id}] DOWNLOAD_VALIDATE_FAILED: {e}")
 
         except Exception as e:
             print(f"[DOWNLOAD_WATCHER_ERROR] {e}")
@@ -5192,10 +5337,27 @@ def render_dashboard_html() -> str:
 # rendering code is kept.
 # --------------------------------------------------------------------------
 
+import html as _html_module
+
+
+def html_escape(value) -> str:
+    return _html_module.escape(str(value))
+
+
 _LIVE_PRINT_LOCK = threading.Lock()
-_LAST_PRINTED_LINE: Dict[str, str] = {}
-_LIVE_DISPLAY_BORN: set = set()
 _IPY_DISPLAY_AVAILABLE = (ipy_display is not print)
+
+# Bookkeeping for which display_id slots already exist and what they last
+# showed lives on V16_STATE (sys.modules-backed, survives a Colab cell
+# re-run in the same kernel) rather than a plain module global -- a fresh
+# module global on every re-run would forget every already-born slot and
+# start creating duplicate output regions instead of updating the
+# existing ones. getattr fallbacks guard a kernel that ran an older
+# version of this file before these attributes existed.
+if not hasattr(V16_STATE, 'LIVE_DISPLAY_BORN'):
+    V16_STATE.LIVE_DISPLAY_BORN = set()
+if not hasattr(V16_STATE, 'LIVE_LAST_TEXT'):
+    V16_STATE.LIVE_LAST_TEXT = {}
 
 
 def emit_live_event(key: str, line: str):
@@ -5212,20 +5374,22 @@ def emit_live_event(key: str, line: str):
     output cell to refresh in place anyway. All updates go through one
     lock so concurrent Gemini/WMR threads can't interleave a partial
     line."""
+    born = V16_STATE.LIVE_DISPLAY_BORN
+    last_text = V16_STATE.LIVE_LAST_TEXT
     with _LIVE_PRINT_LOCK:
-        if _LAST_PRINTED_LINE.get(key) == line:
+        if last_text.get(key) == line:
             return
-        _LAST_PRINTED_LINE[key] = line
+        last_text[key] = line
         text = f"[{time.strftime('%H:%M:%S')}] {line}"
         if not _IPY_DISPLAY_AVAILABLE:
             print(text, flush=True)
             return
         safe_key = re.sub(r'[^a-zA-Z0-9_:.-]', '_', key)
-        html = HTML(f'<pre style="font-family:monospace;font-size:13px;margin:0;white-space:pre-wrap;">{text}</pre>')
-        if safe_key in _LIVE_DISPLAY_BORN:
+        html = HTML(f'<pre style="font-family:monospace;font-size:13px;margin:0;white-space:pre-wrap;">{html_escape(text)}</pre>')
+        if safe_key in born:
             update_display(html, display_id=safe_key)
         else:
-            _LIVE_DISPLAY_BORN.add(safe_key)
+            born.add(safe_key)
             ipy_display(html, display_id=safe_key)
 
 
