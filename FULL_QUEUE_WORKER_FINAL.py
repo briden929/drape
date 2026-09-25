@@ -262,6 +262,11 @@ if _V16_STATE_KEY not in sys.modules:
     _v16_state.WMR_BROKER = None
     _v16_state.GEMINI_WORKERS = None
     _v16_state.WMR_THREADS = None
+    _v16_state.display_obj = None
+    _v16_state.x11vnc_proc = None
+    _v16_state.novnc_proc = None
+    _v16_state.cf_proc = None
+    _v16_state.tunnel_url = None
     sys.modules[_V16_STATE_KEY] = _v16_state
 V16_STATE = sys.modules[_V16_STATE_KEY]
 
@@ -729,59 +734,109 @@ def _kill_port(port):
         pass
     time.sleep(0.3)
 
+def _proc_alive(proc):
+    return proc is not None and proc.poll() is None
+
+def _xdisplay_healthy(display_name):
+    try:
+        if shutil.which('xdpyinfo'):
+            env = dict(os.environ)
+            env['DISPLAY'] = display_name
+            result = subprocess.run(['xdpyinfo'], env=env, capture_output=True, text=True, timeout=5)
+            return result.returncode == 0
+        return os.path.exists(f"/tmp/.X11-unix/X{display_name.lstrip(':')}")
+    except Exception:
+        return False
+
 def start_display():
+    """Reuses a healthy X display across cell re-runs in the same Colab
+    kernel instead of pkilling and recreating Xvfb every time -- this file
+    is one giant pasted cell that gets re-executed, and a healthy Xvfb
+    costs nothing to keep. Only creates a new one if none is alive."""
     global _display_obj
-    run_cmd('pkill -f Xvfb', 'pkill xvfb')
-    time.sleep(0.3)
+    existing_display = os.environ.get('DISPLAY')
+    if existing_display and _xdisplay_healthy(existing_display) and _proc_alive(V16_STATE.display_obj):
+        _display_obj = V16_STATE.display_obj
+        print(f'  ♻️  Reusing healthy X display {existing_display}.')
+        return existing_display
     try:
         _display_obj = Display(visible=0, size=(SCREEN_W, SCREEN_H))
         _display_obj.start()
-        os.environ['DISPLAY'] = f':{_display_obj.display}'
-        print(f'  ✅ Display :{_display_obj.display} running at {SCREEN_W}x{SCREEN_H}.')
+        display_name = f':{_display_obj.display}'
+        os.environ['DISPLAY'] = display_name
+        if _xdisplay_healthy(display_name):
+            V16_STATE.display_obj = _display_obj
+            print(f'  ✅ Display {display_name} running at {SCREEN_W}x{SCREEN_H}.')
+            return display_name
     except Exception as e:
         print(f'  ⚠️ pyvirtualdisplay fallback: {e}')
-        subprocess.Popen(['Xvfb', ':99', '-screen', '0', f'{SCREEN_W}x{SCREEN_H}x24', '-ac'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        os.environ['DISPLAY'] = ':99'
-        time.sleep(1.0)
-        print('  ✅ Display :99 running.')
+    display_name = ':99'
+    if not _xdisplay_healthy(display_name):
+        subprocess.Popen(['Xvfb', display_name, '-screen', '0', f'{SCREEN_W}x{SCREEN_H}x24', '-ac'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            if _xdisplay_healthy(display_name):
+                break
+            time.sleep(0.25)
+    os.environ['DISPLAY'] = display_name
+    print(f'  ✅ Display {display_name} running.')
+    return display_name
 
 def start_vnc():
+    """Reuses healthy x11vnc/websockify across cell re-runs instead of
+    pkilling them every time -- a live, working VNC stack should never be
+    torn down just because the pasted cell ran again."""
     global _x11vnc_proc, _novnc_proc
     disp = os.environ.get('DISPLAY', ':99')
-    run_cmd('pkill -f x11vnc', 'pkill x11vnc')
-    run_cmd('pkill -f websockify', 'pkill websockify')
-    run_cmd('pkill -f fluxbox', 'pkill fluxbox')
-    _kill_port(VNC_PORT)
-    _kill_port(NOVNC_PORT)
-    time.sleep(0.5)
-    subprocess.Popen(['fluxbox'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    time.sleep(0.4)
-    _x11vnc_proc = subprocess.Popen(['x11vnc', '-display', disp, '-forever', '-nopw', '-quiet', '-rfbport', str(VNC_PORT), '-shared'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    time.sleep(1.0)
-    _wait_for_port(VNC_PORT, 'x11vnc', max_wait=10)
-    novnc_web_dir = None
-    for p in ['/usr/share/novnc', '/usr/share/noVNC', '/opt/novnc', '/opt/noVNC', '/usr/local/share/novnc']:
-        if os.path.isfile(os.path.join(p, 'vnc.html')) or os.path.isfile(os.path.join(p, 'vnc_lite.html')):
-            novnc_web_dir = p
-            break
-    if novnc_web_dir:
-        vnc_html = os.path.join(novnc_web_dir, 'vnc.html')
-        vnc_lite = os.path.join(novnc_web_dir, 'vnc_lite.html')
-        if not os.path.isfile(vnc_html) and os.path.isfile(vnc_lite):
-            shutil.copy(vnc_lite, vnc_html)
-    cmd = ['websockify', '--web', novnc_web_dir, str(NOVNC_PORT), f'localhost:{VNC_PORT}'] if novnc_web_dir else ['websockify', str(NOVNC_PORT), f'localhost:{VNC_PORT}']
-    _novnc_proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    time.sleep(1.0)
-    _wait_for_port(NOVNC_PORT, 'noVNC/websockify', max_wait=10)
+
+    if _port_open(VNC_PORT) and _proc_alive(V16_STATE.x11vnc_proc):
+        _x11vnc_proc = V16_STATE.x11vnc_proc
+        print('  ♻️  Reusing healthy x11vnc.')
+    elif _port_open(VNC_PORT):
+        print('  ♻️  x11vnc port already healthy; reusing existing service.')
+    else:
+        subprocess.Popen(['fluxbox'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        time.sleep(0.4)
+        _x11vnc_proc = subprocess.Popen(['x11vnc', '-display', disp, '-forever', '-nopw', '-quiet', '-rfbport', str(VNC_PORT), '-shared'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        V16_STATE.x11vnc_proc = _x11vnc_proc
+        _wait_for_port(VNC_PORT, 'x11vnc', max_wait=10)
+
+    if _port_open(NOVNC_PORT) and _proc_alive(V16_STATE.novnc_proc):
+        _novnc_proc = V16_STATE.novnc_proc
+        print('  ♻️  Reusing healthy noVNC/websockify.')
+    elif _port_open(NOVNC_PORT):
+        print('  ♻️  noVNC port already healthy; reusing existing service.')
+    else:
+        novnc_web_dir = None
+        for p in ['/usr/share/novnc', '/usr/share/noVNC', '/opt/novnc', '/opt/noVNC', '/usr/local/share/novnc']:
+            if os.path.isfile(os.path.join(p, 'vnc.html')) or os.path.isfile(os.path.join(p, 'vnc_lite.html')):
+                novnc_web_dir = p
+                break
+        if novnc_web_dir:
+            vnc_html = os.path.join(novnc_web_dir, 'vnc.html')
+            vnc_lite = os.path.join(novnc_web_dir, 'vnc_lite.html')
+            if not os.path.isfile(vnc_html) and os.path.isfile(vnc_lite):
+                shutil.copy(vnc_lite, vnc_html)
+        cmd = ['websockify', '--web', novnc_web_dir, str(NOVNC_PORT), f'localhost:{VNC_PORT}'] if novnc_web_dir else ['websockify', str(NOVNC_PORT), f'localhost:{VNC_PORT}']
+        _novnc_proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        V16_STATE.novnc_proc = _novnc_proc
+        _wait_for_port(NOVNC_PORT, 'noVNC/websockify', max_wait=10)
 
 def start_novnc_tunnel():
+    """Reuses an existing Cloudflare tunnel across cell re-runs -- a live
+    tunnel URL stays valid, so pkilling cloudflared just to mint a brand
+    new (different) public URL on every re-run is pure churn."""
     global _cf_proc
     local_url = f'http://localhost:{NOVNC_PORT}'
+
+    if _proc_alive(V16_STATE.cf_proc) and V16_STATE.tunnel_url:
+        _cf_proc = V16_STATE.cf_proc
+        print(f'  ♻️  Reusing existing Cloudflare tunnel: {V16_STATE.tunnel_url}')
+        return V16_STATE.tunnel_url
+
     cf_bin = '/usr/local/bin/cloudflared'
     if os.path.exists(cf_bin):
         try:
-            run_cmd('pkill -f cloudflared', 'pkill cloudflared')
-            time.sleep(0.5)
             _cf_proc = subprocess.Popen([cf_bin, 'tunnel', '--url', local_url], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
             deadline = time.time() + 30
             while time.time() < deadline:
@@ -799,6 +854,8 @@ def start_novnc_tunnel():
                     except Exception:
                         pass
                     print(f'  🌐 noVNC Public Link: {vnc_url}')
+                    V16_STATE.cf_proc = _cf_proc
+                    V16_STATE.tunnel_url = tb
                     return tb
         except Exception as e:
             print(f'  ⚠️ noVNC tunnel notice: {e}')
@@ -2031,62 +2088,107 @@ def find_file_input_strict(drv, tid=0, job_id=''):
             return fi
     raise FileInputMissing(f'Tab T{tid}: file input not found after {3} drawer-open attempts')
 
-def upload_reference_files(drv, abs_paths: list, tid=0, job_id='') -> bool:
-    """Send file paths to the file input. Returns True on success."""
+def _tag_upload_input(drv, file_input, job_id: str) -> str:
+    """Marks the exact <input type=file> element used for this upload with
+    a unique token, so verify_attachment_count() can later read that same
+    element's real `.files.length` -- the actual browser-side ground truth
+    for how many files this input holds -- instead of inferring a count
+    from unrelated DOM preview elements."""
+    token = f'vl-upload-{job_id}-{uuid.uuid4().hex[:8]}'
+    drv.execute_script("arguments[0].setAttribute('data-vl-upload-token', arguments[1]);", file_input, token)
+    return token
+
+def upload_reference_files(drv, abs_paths: list, tid=0, job_id='') -> dict:
+    """Send file paths to the file input. Returns {expected, token, paths}.
+    Zero valid reference files is ALWAYS a hard failure -- a job with no
+    references was previously treated as a successful upload (UPLOAD_SKIPPED
+    -> return True), silently proceeding to prompt a Gemini chat with no
+    attachments at all."""
     prefix = f'[T{tid}][{job_id}]' if job_id else f'[T{tid}]'
-    valid_paths = [p for p in abs_paths if p and os.path.exists(p)]
+    valid_paths = [str(Path(p).resolve()) for p in abs_paths if p and os.path.exists(p)]
     if not valid_paths:
-        log(f'{prefix} UPLOAD_SKIPPED: No valid reference paths')
-        return True
-    try:
-        fi = find_file_input_strict(drv, tid, job_id)
-        fi.send_keys('\n'.join(valid_paths))
-        return True
-    except FileInputMissing:
-        raise
-    except Exception as e:
-        log(f'{prefix} UPLOAD_FAILED: send_keys error: {e}', file=sys.stderr)
-        return False
+        raise RuntimeError(f'{prefix} UPLOAD_FAILED: no valid reference files')
+    fi = find_file_input_strict(drv, tid, job_id)
+    token = _tag_upload_input(drv, fi, job_id)
+    fi.send_keys('\n'.join(valid_paths))
+    log(f'{prefix} UPLOAD_SENT files={len(valid_paths)}')
+    return {'expected': len(valid_paths), 'token': token, 'paths': valid_paths}
 
-def verify_attachment_count(drv, expected: int, tid=0, job_id='') -> tuple:
+def verify_attachment_count(drv, expected: int, tid=0, job_id='', upload_token=None, timeout_s=15.0) -> tuple:
     """
-    Polls until attachment chip count == expected (exact match required).
-    Returns (verified: bool, actual_count: int).
-    FAIL on count < expected OR count > expected.
-    If not verified within timeout, returns (False, actual_count).
+    Polls until the attachment count == expected (exact match required).
+    Returns (True, actual_count) on success; RAISES RuntimeError otherwise
+    -- it never returns a bare False for the caller to accidentally ignore,
+    which is exactly what happened before: the call site printed
+    "ATTACHMENTS VERIFIED" unconditionally after calling this function,
+    regardless of what it returned, so a real "expected 3, got 5" mismatch
+    logged a MISMATCH line and then proceeded anyway.
 
-    Uses exactly ONE canonical selector for the count, not a union of
-    several. Gemini renders one uploaded file as several NESTED DOM layers
-    at once (an outer gem-media-attachment container, an inner preview
-    wrapper, its own close button, ...), and `id(el)` on the WebElement
-    Python wrapper does NOT deduplicate these -- each find_elements() call
-    returns fresh wrapper objects with distinct Python ids even for the
-    same underlying DOM node. Summing matches across 5 selector families
-    was counting one real upload as up to 5 "attachments", producing the
-    "expected 3, got 5" mismatches seen in production. gem-media-attachment
-    is the single outermost container Gemini renders once per uploaded
-    file; uploader-file-preview is used only as a fallback if that
-    selector ever renders nothing (never unioned with it).
+    PRIMARY evidence: `.files.length` read directly off the exact
+    <input type=file> element used for the upload (tagged by
+    upload_reference_files() via upload_token) -- the real browser-side
+    fact of how many files that input holds, not an inference from DOM
+    preview widgets.
+
+    SECONDARY (used only if the tagged input can't be read, e.g. Gemini
+    replaced the input after upload): canonical UI evidence from a single
+    combined query across the known attachment-preview element types,
+    deduplicated by a stable per-element identity (data-id / data-filename
+    / aria-label / text), never by summing separate selector-family counts
+    the way the old implementation did -- that summing is what let one
+    real upload (rendered as several nested wrapper layers) count as
+    several attachments and produce "expected 3, got 5".
     """
     prefix = f'[T{tid}][{job_id}]' if job_id else f'[T{tid}]'
-    t0 = time.time()
-    chip_count = 0
-    while time.time() - t0 < 15.0:
-        try:
-            chip_count = len([el for el in drv.find_elements(By.CSS_SELECTOR, 'gem-media-attachment') if el.is_displayed()])
-        except Exception:
-            chip_count = 0
-        if chip_count == 0 and expected > 0:
+    if expected <= 0:
+        raise RuntimeError(f'{prefix} ATTACHMENT_VERIFY_FAILED: expected={expected}')
+
+    deadline = time.time() + timeout_s
+    last_actual = None
+    while time.time() < deadline:
+        if upload_token:
             try:
-                chip_count = len([el for el in drv.find_elements(By.CSS_SELECTOR, 'uploader-file-preview') if el.is_displayed()])
+                actual = drv.execute_script(
+                    "var el = document.querySelector('input[type=\"file\"][data-vl-upload-token=\"' + CSS.escape(arguments[0]) + '\"]');"
+                    "if (!el) return -1;"
+                    "return el.files ? el.files.length : 0;",
+                    upload_token,
+                )
             except Exception:
-                pass
-        if chip_count == expected:
-            log(f'{prefix} ATTACHMENTS {chip_count}/{expected} ✅ (exact match)')
-            return (True, chip_count)
-        time.sleep(0.35)
-    log(f'{prefix} ATTACHMENT_MISMATCH: expected exactly {expected}, got {chip_count} (must be exact — not >= or >)', file=sys.stderr)
-    return (False, chip_count)
+                actual = None
+            if actual is not None and actual >= 0:
+                last_actual = int(actual)
+                if last_actual == expected:
+                    log(f'{prefix} ATTACHMENTS {last_actual}/{expected} ✅ FILELIST EXACT')
+                    return (True, last_actual)
+                if last_actual > expected:
+                    raise RuntimeError(f'{prefix} ATTACHMENT_OVERCOUNT: expected {expected}, got {last_actual}')
+
+        try:
+            result = drv.execute_script(
+                "var selectors = ['gem-media-attachment', 'uploader-file-preview', '[data-test-id=\"uploaded-img\"]'];"
+                "var nodes = [];"
+                "selectors.forEach(function(sel) { document.querySelectorAll(sel).forEach(function(el) { nodes.push(el); }); });"
+                "var unique = new Map();"
+                "nodes.forEach(function(el) {"
+                "  var key = el.getAttribute('data-id') || el.getAttribute('data-file-id') || el.getAttribute('data-filename') || el.getAttribute('aria-label') || el.textContent.trim();"
+                "  if (key) unique.set(key, el);"
+                "});"
+                "return unique.size;"
+            )
+        except Exception:
+            result = None
+        if result is not None:
+            last_actual = result
+            if result == expected:
+                log(f'{prefix} ATTACHMENTS {result}/{expected} ✅ CANONICAL UI EXACT')
+                return (True, result)
+            if result > expected:
+                raise RuntimeError(f'{prefix} ATTACHMENT_OVERCOUNT: expected {expected}, got {result}')
+
+        time.sleep(0.25)
+
+    raise RuntimeError(f'{prefix} ATTACHMENT_MISMATCH: expected exactly {expected}, got {last_actual}')
 
 def normalize_prompt_text(text):
     if not text:
@@ -2530,6 +2632,15 @@ class JobContext:
     error: Optional[str] = None
     completed_at: Optional[float] = None
 
+    # BullMQ's own retry bookkeeping for THIS job, copied from the Job
+    # object in process_bullmq_job -- used to decide whether a failure here
+    # is final (mark DB failed + refund) or merely this attempt's failure
+    # with BullMQ retries still remaining (leave DB/credits alone and let
+    # the next attempt run). attempts_made is 0-based (BullMQ's own
+    # job.attemptsMade before this attempt); max_attempts is job.attempts.
+    attempts_made: int = 0
+    max_attempts: int = 1
+
     # Timing checkpoints for the JOB TIMING report printed at completion --
     # each set once, the first time execution reaches the corresponding
     # state, from _set_state_threadsafe's _TIMING_FIELD_BY_STATE map.
@@ -2763,7 +2874,17 @@ class FirstFreeBroker:
         with self._condition:
             return [rid for rid, rec in self._records.items() if rec.state == ResourceState.AVAILABLE]
 
-def _detect_download_start(drv, staging_dir: Path, timeout: float = 60.0) -> Tuple[Optional[str], str]:
+def _log_download_start_confirmed(prefix: str, dl_guid: Optional[str], source: str):
+    """Never call a filesystem-only detection a 'REAL CHROME GUID' -- that
+    was misleading (dl_guid is None on the filesystem path, so the old
+    print literally read "REAL CHROME GUID = None (source=filesystem)").
+    Log what's actually true for each source."""
+    if source == 'cdp' and dl_guid:
+        log(f'{prefix} DOWNLOAD_START_CONFIRMED source=cdp CDP_GUID={dl_guid}')
+    else:
+        log(f'{prefix} DOWNLOAD_START_CONFIRMED source=filesystem CDP_GUID=NOT_CAPTURED')
+
+def _detect_download_start(drv, staging_dir: Path, timeout: float = DOWNLOAD_START_WINDOW_S) -> Tuple[Optional[str], str]:
     """
     Detect a download starting inside staging_dir, which must already be scoped
     exclusively to one job/resource (never a shared directory).
@@ -2989,8 +3110,8 @@ class GeminiWorker:
                 ensure_create_image_mode(self.driver, tid_int, ctx.job_id)
 
                 print(f"{prefix} UPLOADING REFERENCES", flush=True)
-                upload_reference_files(self.driver, ctx.reference_paths, tid_int, ctx.job_id)
-                verify_attachment_count(self.driver, expected=len(ctx.reference_paths), tid=tid_int, job_id=ctx.job_id)
+                upload_result = upload_reference_files(self.driver, ctx.reference_paths, tid_int, ctx.job_id)
+                verify_attachment_count(self.driver, upload_result["expected"], tid=tid_int, job_id=ctx.job_id, upload_token=upload_result["token"])
                 print(f"{prefix} ATTACHMENTS VERIFIED", flush=True)
 
                 _inject_prompt_atomic(self.driver, ctx.prompt, tid_int, ctx.job_id)
@@ -3016,10 +3137,10 @@ class GeminiWorker:
                 expected_png = f"{ctx.job_id}.png"
 
                 ctx.transition_sync(JobState.RAW_DOWNLOAD_START)
-                dl_guid, source = _detect_download_start(self.driver, staging_dir, timeout=60)
+                dl_guid, source = _detect_download_start(self.driver, staging_dir, timeout=DOWNLOAD_START_WINDOW_S)
                 ctx.raw_guid = dl_guid
                 print(f"{prefix} DOWNLOAD START DETECTED", flush=True)
-                print(f"{prefix} REAL CHROME GUID = {dl_guid} (source={source})", flush=True)
+                _log_download_start_confirmed(prefix, dl_guid, source)
 
                 record_id = f"gemini:{ctx.job_id}:{time.monotonic_ns()}"
                 with DOWNLOAD_REGISTRY_LOCK:
@@ -3078,7 +3199,27 @@ class WmrDriverThread(threading.Thread):
 
     def run(self):
         while True:
-            cmd, ctx = self.command_queue.get()
+            cmd, payload = self.command_queue.get()
+            if cmd == "SHUTDOWN":
+                # Selenium quit() must happen on THIS thread -- it's the
+                # sole owner of self.driver. shutdown_worker() previously
+                # called thread.driver.quit() directly from the asyncio
+                # thread, racing with this thread's own cleanup and
+                # violating the one-owner-thread-per-driver invariant this
+                # class exists to enforce.
+                ack = payload
+                try:
+                    if self.driver is not None:
+                        self.driver.quit()
+                finally:
+                    self.driver = None
+                try:
+                    ack.put_nowait(True)
+                except queue.Full:
+                    pass
+                self.command_queue.task_done()
+                return
+            ctx = payload
             if cmd == "EXECUTE":
                 prefix = f"[WMR][{self.resource_id}][{ctx.job_id}]"
                 print(f"{prefix} START", flush=True)
@@ -3112,8 +3253,8 @@ class WmrDriverThread(threading.Thread):
                     expected_png = f"{ctx.job_id}_clean.png"
                     ctx.transition_sync(JobState.WMR_DOWNLOAD_START)
 
-                    dl_guid, source = _detect_download_start(self.driver, staging_dir, timeout=60)
-                    print(f"{prefix} REAL CHROME GUID = {dl_guid} (source={source})", flush=True)
+                    dl_guid, source = _detect_download_start(self.driver, staging_dir, timeout=DOWNLOAD_START_WINDOW_S)
+                    _log_download_start_confirmed(prefix, dl_guid, source)
 
                     record_id = f"wmr:{ctx.job_id}:{time.monotonic_ns()}"
                     with DOWNLOAD_REGISTRY_LOCK:
@@ -3148,6 +3289,19 @@ class WmrDriverThread(threading.Thread):
                     self.command_queue.task_done()
             else:
                 self.command_queue.task_done()
+
+def request_wmr_shutdown(thread: 'WmrDriverThread', timeout_s: float = 10.0) -> bool:
+    """Ask a WmrDriverThread to quit its own Selenium driver ON ITS OWN
+    THREAD and wait for acknowledgment, instead of touching thread.driver
+    from the caller's thread. Returns True if the thread acknowledged
+    within timeout_s, False otherwise (the thread may be stuck on a
+    long-running Selenium call; the caller decides how to log that)."""
+    ack = queue.Queue(maxsize=1)
+    thread.command_queue.put(("SHUTDOWN", ack))
+    try:
+        return ack.get(timeout=timeout_s)
+    except queue.Empty:
+        return False
 
 # V16: Only initialize at runtime. Reuse the previous run's WmrDriverThread
 # instances -- each owns a live WMR Chrome driver in its own thread;
@@ -3310,10 +3464,25 @@ async def execute_pipeline(ctx: JobContext):
         print(f"Download GUID:   raw={ctx.raw_guid} wmr={ctx.wmr_guid}", flush=True)
 
         print("[BULLMQ] FAILURE CLEANUP START", flush=True)
-        try:
-            sys.modules["credits"].refund_look(ctx.job_id, str(e)[:500])
-        except Exception:
-            pass
+        # Only mark the DB row failed + refund credits on BullMQ's FINAL
+        # attempt for this job. Doing this unconditionally on every attempt
+        # (the previous behavior) marked the generation 'failed' and
+        # refunded credits on attempt 1's transient browser/download/WMR
+        # error even when BullMQ still had retries left -- exactly the
+        # "Attempt: 2, DB status: failed" pattern seen in production. A
+        # later successful attempt's push_generation() unconditionally
+        # overwrites status back to 'done', so the DB itself self-heals,
+        # but the premature refund_look does not: a job that ultimately
+        # succeeds on attempt 2 would have already refunded the user's
+        # credits for attempt 1's failure, for free.
+        is_final_attempt = (ctx.attempts_made + 1) >= ctx.max_attempts
+        if is_final_attempt:
+            try:
+                sys.modules["credits"].refund_look(ctx.job_id, str(e)[:500])
+            except Exception as refund_err:
+                log(f"[{ctx.job_id}] REFUND_FAILED (final attempt): {refund_err}")
+        else:
+            log(f"[{ctx.job_id}] TRANSIENT_FAILURE_WILL_RETRY attempt={ctx.attempts_made + 1}/{ctx.max_attempts} -- DB/credits left untouched, BullMQ will retry")
         release_gemini_once(ctx)
         release_wmr_once(ctx)
         print("[BULLMQ] FAILURE CLEANUP COMPLETE", flush=True)
@@ -3343,12 +3512,24 @@ async def poll_downloads_loop():
                 # staging is exclusively owned by this one job/resource (see get_chrome_job_dir /
                 # WMR per-resource staging dirs), so ownership is proven by directory scoping --
                 # never by guessing a filename or GUID-prefix Chrome doesn't actually produce.
+                # get_chrome_job_dir()/get_wmr_job_dir() never clear a job's incoming/ dir between
+                # attempts, so a BullMQ retry that reuses the same job_id can still find a stale
+                # leftover file from a prior failed attempt sitting there. Picking the FIRST
+                # non-temp file (directory iteration order, not creation order) could grab that
+                # stale file immediately instead of waiting for the real new download -- prefer
+                # rec.expected_filename if present, else the newest file created at/after this
+                # record's own started_at.
+                candidates = [f for f in staging.iterdir() if not f.name.endswith((".crdownload", ".tmp", ".part"))]
                 completed_file = None
-                for f in staging.iterdir():
-                    if f.name.endswith((".crdownload", ".tmp", ".part")):
-                        continue
-                    completed_file = f
-                    break
+                if rec.expected_filename:
+                    for f in candidates:
+                        if f.name == rec.expected_filename:
+                            completed_file = f
+                            break
+                if completed_file is None:
+                    fresh = [f for f in candidates if f.stat().st_mtime >= rec.started_at]
+                    if fresh:
+                        completed_file = max(fresh, key=lambda f: f.stat().st_mtime)
 
                 kind = "RAW" if rec.target_state == JobState.RAW_VALIDATED else "CLEAN"
                 if completed_file and dict_key not in _DOWNLOADS_SEEN_FILE:
@@ -3426,6 +3607,8 @@ async def process_bullmq_job(job, job_token):
     print(f"User ID:         {gen.get('user_id')}", flush=True)
 
     ctx = JobContext(job_id=generation_id, payload=gen, loop=asyncio.get_running_loop())
+    ctx.attempts_made = job.attemptsMade
+    ctx.max_attempts = getattr(job, "attempts", None) or job.opts.get("attempts", 1)
     JOB_CONTEXTS[generation_id] = ctx
 
     await execute_pipeline(ctx)
@@ -3815,14 +3998,17 @@ async def shutdown_worker():
         await QUEUE_MONITOR.close()
         print("[SHUTDOWN] Redis Queue client closed.", flush=True)
 
-    # 7. release/close WMR drivers
+    # 7. release/close WMR drivers -- via the owning thread's own command
+    # queue (request_wmr_shutdown), never by calling thread.driver.quit()
+    # from this asyncio thread. Selenium drivers here are owned exclusively
+    # by their WmrDriverThread; quitting from another thread races with
+    # that thread's own cleanup and violates the one-owner-per-driver
+    # design this whole class exists to enforce.
     for rid, thread in list(WMR_THREADS.items()):
-        try:
-            if thread.driver is not None:
-                thread.driver.quit()
-                print(f"[SHUTDOWN] WMR driver {rid} closed.", flush=True)
-        except Exception as e:
-            print(f"[SHUTDOWN] WMR driver {rid} close failed: {e}", flush=True)
+        if request_wmr_shutdown(thread):
+            print(f"[SHUTDOWN] WMR owner thread {rid} closed.", flush=True)
+        else:
+            print(f"[SHUTDOWN] WMR owner thread {rid} did not acknowledge shutdown.", flush=True)
 
     # 8. close Gemini browser resources (the single shared chrome_driver)
     try:
