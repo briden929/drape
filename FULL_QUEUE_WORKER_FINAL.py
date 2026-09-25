@@ -2848,7 +2848,35 @@ def click_upload_files_in_drawer(drv):
         pass
     return False
 
-def _poll_for_file_input(drv, timeout: float):
+def _snapshot_file_inputs(drv):
+    """Identity set for every <input type=file> currently in the DOM, used
+    to detect which one is NEW after opening the upload drawer -- Gemini's
+    page can have more than one file input (other upload entry points,
+    leftover ones from earlier UI states), so grabbing querySelectorAll(...)
+    [0] unconditionally can silently tag and send files to the WRONG
+    input. Identity is the element reference itself (via a WeakSet-unsafe
+    but good-enough per-element marker attribute), not index, since index
+    can also shift under DOM mutation."""
+    try:
+        return set(drv.execute_script(
+            "var out=[];"
+            "document.querySelectorAll('input[type=\"file\"]').forEach(function(el, i){"
+            "  var m = el.getAttribute('data-vl-input-marker');"
+            "  if (!m) { m = 'm' + Date.now() + '_' + i + '_' + Math.random().toString(36).slice(2); el.setAttribute('data-vl-input-marker', m); }"
+            "  out.push(m);"
+            "});"
+            "return out;"
+        ) or [])
+    except Exception:
+        return set()
+
+
+def _poll_for_file_input(drv, timeout: float, before_markers=None):
+    """Prefer a file input that appeared AFTER before_markers was snapshotted
+    (i.e. the one Gemini just created/exposed for the upload action that was
+    just clicked) over blindly taking the first input on the page -- the
+    real cause of tagging/sending files to an unrelated input and then
+    verify_attachment_count() timing out at expected=3, actual!=3."""
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
@@ -2857,6 +2885,17 @@ def _poll_for_file_input(drv, timeout: float):
             pass
         inputs = drv.find_elements(By.CSS_SELECTOR, "input[type='file']")
         if inputs:
+            if before_markers:
+                for el in inputs:
+                    try:
+                        marker = drv.execute_script(
+                            "var m = arguments[0].getAttribute('data-vl-input-marker');"
+                            "if (!m) { m = 'm' + Date.now() + '_' + Math.random().toString(36).slice(2); "
+                            "arguments[0].setAttribute('data-vl-input-marker', m); } return m;", el)
+                    except Exception:
+                        marker = None
+                    if marker and marker not in before_markers:
+                        return el
             return inputs[0]
         time.sleep(0.3)
     return None
@@ -2875,7 +2914,17 @@ def find_file_input_strict(drv, tid=0, job_id=''):
     up to 3 times before raising.
     """
     prefix = f'[T{tid}][{job_id}]' if job_id else f'[T{tid}]'
-    fi = _poll_for_file_input(drv, timeout=1.5)
+    # PART 1/2 (attachment-mismatch root cause): grabbing
+    # querySelectorAll('input[type="file"]')[0] with no regard for WHICH
+    # input Gemini just exposed for THIS click can tag/send files to an
+    # unrelated (possibly stale/hidden) input elsewhere on the page --
+    # the actual attachment UI never receives them, and
+    # verify_attachment_count() then polls forever at
+    # expected=3/actual!=3. Snapshot existing inputs BEFORE doing
+    # anything, so every subsequent poll can prefer one that's new since
+    # this call started.
+    before_markers = _snapshot_file_inputs(drv)
+    fi = _poll_for_file_input(drv, timeout=1.5, before_markers=before_markers)
     if fi:
         return fi
     for attempt in range(1, 4):
@@ -2891,7 +2940,7 @@ def find_file_input_strict(drv, tid=0, job_id=''):
                 pass
             time.sleep(0.5)
             continue
-        fi = _poll_for_file_input(drv, timeout=3.0)
+        fi = _poll_for_file_input(drv, timeout=3.0, before_markers=before_markers)
         if fi:
             return fi
     raise FileInputMissing(f'Tab T{tid}: file input not found after {3} drawer-open attempts')
@@ -2906,6 +2955,31 @@ def _tag_upload_input(drv, file_input, job_id: str) -> str:
     drv.execute_script("arguments[0].setAttribute('data-vl-upload-token', arguments[1]);", file_input, token)
     return token
 
+def _attachment_input_debug(drv, upload_token, tid=0, job_id=''):
+    """Full forensic snapshot of the exact tagged <input type=file> right
+    after send_keys() -- goes to worker.log only. Answers "did the files
+    actually land on the input we think they did" directly, instead of
+    inferring it from whether verify_attachment_count() eventually times
+    out."""
+    try:
+        return drv.execute_script(
+            "var token = arguments[0];"
+            "var el = document.querySelector('input[type=\"file\"][data-vl-upload-token=\"' + CSS.escape(token) + '\"]');"
+            "if (!el) return {exists: false};"
+            "return {"
+            "  exists: true,"
+            "  connected: el.isConnected,"
+            "  files_length: el.files ? el.files.length : 0,"
+            "  files: el.files ? Array.from(el.files).map(function(f){return {name:f.name, size:f.size, type:f.type};}) : [],"
+            "  displayed: !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length),"
+            "  outer: el.outerHTML.slice(0, 300)"
+            "};",
+            upload_token,
+        )
+    except Exception as e:
+        return {'exists': False, 'error': str(e)}
+
+
 def upload_reference_files(drv, abs_paths: list, tid=0, job_id='') -> dict:
     """Send file paths to the file input. Returns {expected, token, paths}.
     Zero valid reference files is ALWAYS a hard failure -- a job with no
@@ -2918,8 +2992,14 @@ def upload_reference_files(drv, abs_paths: list, tid=0, job_id='') -> dict:
         raise RuntimeError(f'{prefix} UPLOAD_FAILED: no valid reference files')
     fi = find_file_input_strict(drv, tid, job_id)
     token = _tag_upload_input(drv, fi, job_id)
+    append_runtime_log(
+        f'{prefix} UPLOAD_ARMED window={drv.current_window_handle} url={drv.current_url} '
+        f'expected_count={len(valid_paths)} upload_token={token} paths={valid_paths}'
+    )
     fi.send_keys('\n'.join(valid_paths))
     append_runtime_log(f'{prefix} UPLOAD_SENT files={len(valid_paths)}')
+    debug = _attachment_input_debug(drv, token, tid, job_id)
+    append_runtime_log(f'{prefix} UPLOAD_INPUT_DEBUG {json.dumps(debug, default=str)[:1000]}')
     return {'expected': len(valid_paths), 'token': token, 'paths': valid_paths}
 
 def verify_attachment_count(drv, expected: int, tid=0, job_id='', upload_token=None, timeout_s=15.0) -> tuple:
