@@ -2188,7 +2188,15 @@ def open_new_chat_and_reload(drv, tid: int, job_id: str='') -> str:
             if dialog_handled:
                 append_runtime_log(f'{prefix} DIALOG_HANDLED')
                 time.sleep(0.4)
-            url_deadline = time.time() + 8.0
+            # A tab already sitting on the bare GEMINI_APP_URL (its first
+            # use, right after _create_gemini_tab()) clicking "New chat"
+            # produces no URL change at all -- there is nothing to wait
+            # for. Polling the full 8s here every time was pure wasted
+            # time on every T-slot's first job, re-searching for a URL
+            # change that structurally cannot happen from that starting
+            # point; a short poll is enough to still catch it if Gemini's
+            # behavior ever changes.
+            url_deadline = time.time() + (1.5 if old_url == GEMINI_APP_URL else 8.0)
             new_url = None
             while time.time() < url_deadline:
                 cur = drv.current_url
