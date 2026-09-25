@@ -5086,20 +5086,74 @@ def render_dashboard_html() -> str:
 # rendering code is kept.
 # --------------------------------------------------------------------------
 
+_LIVE_PRINT_LOCK = threading.Lock()
+_LAST_PRINTED_LINE: Dict[str, str] = {}
+
+
+def emit_live_event(key: str, line: str):
+    """Print ONE complete line atomically, but only if it actually changed
+    since the last print for this key -- keeps the notebook append-only
+    (nothing is ever erased or reprinted unchanged) while still limiting
+    output to real state changes, not a full redraw every tick. All
+    printing goes through this single lock so concurrent Gemini/WMR
+    threads can never interleave partial fragments into one garbled line."""
+    with _LIVE_PRINT_LOCK:
+        if _LAST_PRINTED_LINE.get(key) == line:
+            return
+        _LAST_PRINTED_LINE[key] = line
+        print(f"[{time.strftime('%H:%M:%S')}] {line}", flush=True)
+
+
 async def dashboard_loop():
-    """The ONE live dashboard task. Refreshes an in-place output region
-    roughly once per second via clear_output(wait=True) + display(HTML(...))
-    -- never print(), which would accumulate a new copy of the table on
-    every tick. Stored on V16_STATE.DASHBOARD_TASK so a Colab cell re-run
-    reuses the existing task instead of starting a second one."""
+    """Append-only live progress: NEVER clears or redraws prior notebook
+    output. Each tick prints only the job lines and the queue/resource
+    summary that actually changed since the previous tick (emit_live_event
+    dedupes on content per key) -- so the notebook accumulates a compact
+    history of real state transitions instead of a table being redrawn in
+    place. Stored on V16_STATE.DASHBOARD_TASK so a Colab cell re-run reuses
+    the existing task instead of starting a second one."""
     while True:
         try:
-            html = render_dashboard_html()
-            clear_output(wait=True)
-            ipy_display(HTML(html))
+            prune_job_progress()
+            active = [jid for jid, p in JOB_PROGRESS.items()
+                      if not p.get('completed_at') and not p.get('failed')]
+            finished = [(jid, p.get('completed_at') or p.get('failed_ts') or 0)
+                        for jid, p in JOB_PROGRESS.items()
+                        if p.get('completed_at') or p.get('failed')]
+            finished.sort(key=lambda x: x[1])
+            ordered = active + [jid for jid, _ in finished][-6:]
+            for jid in ordered:
+                line = render_job_line(jid)
+                if line:
+                    emit_live_event(f'job:{jid}', line)
+
+            q = DASHBOARD_STATE['queue']
+            uptime_s = int(time.time() - DASHBOARD_STATE['start_time'])
+            gemini_state = get_gemini_dashboard_state()
+            wmr_state = get_wmr_dashboard_state()
+            gemini_running = sum(1 for r in gemini_state.values() if r['job_id'])
+            wmr_running = sum(1 for r in wmr_state.values() if r['job_id'])
+            summary = (
+                f"▒ LIVE | WAIT={q['waiting']} ACTIVE={q['active']} LOCAL={q['local_active']} "
+                f"GEMINI={gemini_running}/4 WMR={wmr_running}/8 DONE={q['completed']} "
+                f"FAIL={q['failed']} UP={uptime_s // 3600:02d}:{(uptime_s % 3600) // 60:02d}:{uptime_s % 60:02d}"
+            )
+            emit_live_event('summary', summary)
+
+            gemini_line = 'GEMINI ' + ' | '.join(
+                f"{rid}:{short_job_id(gemini_state[rid]['job_id'])}" if gemini_state[rid]['job_id'] else f"{rid}:FREE"
+                for rid in ["T0", "T1", "T2", "T3"]
+            )
+            emit_live_event('gemini_row', gemini_line)
+
+            wmr_line = 'WMR ' + ' | '.join(
+                f"{rid}:{short_job_id(wmr_state[rid]['job_id'])}" if wmr_state[rid]['job_id'] else f"{rid}:FREE"
+                for rid in [f"W{i}-T{j}" for i in range(4) for j in range(2)]
+            )
+            emit_live_event('wmr_row', wmr_line)
         except Exception as e:
             append_runtime_log(f"DASHBOARD_ERROR: {type(e).__name__}: {e}")
-        await asyncio.sleep(2)
+        await asyncio.sleep(1)
 
 REDIS_STARTUP_TIMEOUT_S = float(os.environ.get("REDIS_STARTUP_TIMEOUT_S", "15"))
 
