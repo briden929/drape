@@ -2017,17 +2017,23 @@ def open_new_chat_and_reload(drv, tid: int, job_id: str='') -> str:
     """
     prefix = f'[T{tid}][{job_id}]' if job_id else f'[T{tid}]'
     for attempt in range(1, MAX_NEW_CHAT_RETRIES + 1):
+        # Counters proving this is a single transaction, not a click/reload
+        # loop -- a normal successful new-chat should show
+        # new_chat_click_count=1 nav_count<=1 refresh_count=0. Logged once
+        # at the end of the attempt so a regression shows up immediately.
+        new_chat_click_count = 0
+        nav_count = 0
+        refresh_count = 0
         try:
             old_url = drv.current_url
             append_runtime_log(f'{prefix} NEW_CHAT_START (attempt {attempt}) OLD_URL={old_url}')
-            clicked = False
             res = drv.execute_script('\n                var sels = [\n                    \'a[aria-label="New chat"]\',\n                    \'button[aria-label="New chat"]\',\n                    \'div[aria-label="New chat"]\',\n                    \'[data-test-id="new-chat-button"]\',\n                    \'a[href="/app"]\',\n                ];\n                for (var s = 0; s < sels.length; s++) {\n                    var els = document.querySelectorAll(sels[s]);\n                    for (var i = 0; i < els.length; i++) {\n                        if (els[i].offsetParent !== null) {\n                            els[i].click(); return \'OK:\' + sels[s];\n                        }\n                    }\n                }\n                return \'NO\';\n            ')
             if res and res.startswith('OK:'):
-                clicked = True
+                new_chat_click_count += 1
                 append_runtime_log(f'{prefix} NEW_CHAT_CLICK -> {res}')
             else:
                 drv.get(GEMINI_APP_URL)
-                clicked = True
+                nav_count += 1
                 append_runtime_log(f'{prefix} NEW_CHAT_NAVIGATE -> {GEMINI_APP_URL}')
             time.sleep(0.3)
             dialog_handled = _dismiss_new_chat_dialog(drv)
@@ -2055,10 +2061,26 @@ def open_new_chat_and_reload(drv, tid: int, job_id: str='') -> str:
                 time.sleep(0.5)
                 continue
             append_runtime_log(f'{prefix} NEW_CHAT_URL={new_url}')
-            append_runtime_log(f'{prefix} RELOADING NEW CHAT URL')
-            drv.get(new_url)
-            time.sleep(1.0)
-            append_runtime_log(f'{prefix} NEW_CHAT_RELOADED')
+            # PART 8/9 fix: this used to unconditionally drv.get(new_url)
+            # here even when the browser was ALREADY on new_url (e.g. the
+            # NEW_CHAT_URL_UNCHANGED case just above, right after already
+            # navigating there) -- a redundant second full-page reload on
+            # top of the click/navigate above, which is exactly the kind of
+            # repeated navigation that can surface Gemini's "Create a new
+            # chat and delete this one?" dialog a second time. Only reload
+            # if the browser isn't already there.
+            if drv.current_url != new_url:
+                append_runtime_log(f'{prefix} RELOADING NEW CHAT URL')
+                drv.get(new_url)
+                refresh_count += 1
+                time.sleep(1.0)
+                append_runtime_log(f'{prefix} NEW_CHAT_RELOADED')
+            else:
+                append_runtime_log(f'{prefix} NEW_CHAT_ALREADY_AT_URL — skipping redundant reload')
+            append_runtime_log(
+                f'{prefix} NEW_CHAT_NAV_COUNTERS click={new_chat_click_count} '
+                f'nav={nav_count} refresh={refresh_count}'
+            )
             if _verify_clean_composer(drv):
                 append_runtime_log(f'{prefix} NEW_CHAT_VERIFIED ✅')
                 return new_url
@@ -2843,15 +2865,76 @@ def _set_clipboard_xclip(text):
     except Exception:
         return False
 
+_COMPOSER_VISIBILITY_JS = """
+    function visible(el) {
+        if (!el) return false;
+        var r = el.getBoundingClientRect();
+        if (r.width <= 0 || r.height <= 0) return false;
+        var cs = window.getComputedStyle(el);
+        if (cs.visibility === 'hidden' || cs.display === 'none') return false;
+        if (parseFloat(cs.opacity) === 0) return false;
+        return el.offsetParent !== null;
+    }
+    var groups = [
+        ["div.ql-editor[data-placeholder='Describe your image']", 1],
+        ["div.ql-editor[contenteditable='true']", 2],
+        ["rich-textarea div[contenteditable='true']", 3],
+        ["div[contenteditable='true']", 4],
+    ];
+    for (var g = 0; g < groups.length; g++) {
+        var els = document.querySelectorAll(groups[g][0]);
+        for (var i = 0; i < els.length; i++) {
+            if (visible(els[i])) {
+                var el = els[i];
+                var r = el.getBoundingClientRect();
+                return {
+                    el: el,
+                    prio: groups[g][1],
+                    placeholder: el.getAttribute('data-placeholder') || '',
+                    tag: el.tagName,
+                    cls: (el.className || '').toString().slice(0, 80),
+                    rect: [Math.round(r.x), Math.round(r.y), Math.round(r.width), Math.round(r.height)],
+                };
+            }
+        }
+    }
+    return null;
+"""
+
+
+def get_active_gemini_image_composer(drv, tid=0, job_id=''):
+    """Locate the ONE currently-visible active Gemini image-generation
+    composer -- never a hidden/detached/background editor. Priority order:
+    (1) exact "Describe your image" placeholder, (2) any visible ql-editor,
+    (3) rich-textarea contenteditable, (4) any visible contenteditable.
+    Visibility is proven via boundingClientRect size, computed style, and
+    offsetParent -- not just Selenium's own is_displayed() heuristic.
+    Logs which candidate was chosen (forensic detail only, never to
+    console) so a composer-targeting regression is diagnosable from
+    worker.log alone. Returns the WebElement, or None if nothing visible
+    matched."""
+    prefix = f'[T{tid}][{job_id}]' if job_id else f'[T{tid}]'
+    try:
+        result = drv.execute_script(_COMPOSER_VISIBILITY_JS)
+    except Exception as e:
+        append_runtime_log(f'{prefix} PROMPT_COMPOSER_LOOKUP_ERROR: {e}')
+        return None
+    if not result:
+        append_runtime_log(f'{prefix} PROMPT_COMPOSER_NOT_FOUND')
+        return None
+    append_runtime_log(
+        f"{prefix} PROMPT_COMPOSER_FOUND prio={result['prio']} placeholder='{result['placeholder']}' "
+        f"tag={result['tag']} class='{result['cls']}' rect={result['rect']}"
+    )
+    return result['el']
+
+
 def get_quill_editor(drv):
-    for sel in ["div.ql-editor[data-placeholder='Describe your image']", "div.ql-editor[contenteditable='true']", "rich-textarea div[contenteditable='true']", "div[contenteditable='true']"]:
-        try:
-            for el in drv.find_elements(By.CSS_SELECTOR, sel):
-                if el.is_displayed():
-                    return el
-        except Exception:
-            pass
-    return None
+    """Backward-compatible name kept for the few callers that just need
+    *a* composer (e.g. the Enter-key send fallback); prefer
+    get_active_gemini_image_composer() wherever the choice is logged and
+    matters for verification."""
+    return get_active_gemini_image_composer(drv)
 
 def _verify_editor_prompt(drv, editor, expected_text, tid=0, job_id=''):
     prefix = f'[T{tid}][{job_id}]' if job_id else f'[T{tid}]'
@@ -2956,21 +3039,47 @@ def _inject_prompt_atomic(drv, text, tid=0, job_id=''):
     """
     prefix = f'[T{tid}][{job_id}]' if job_id else f'[T{tid}]'
     append_runtime_log(f'{prefix} GEMINI_PROMPT_INJECT_STARTED')
-    editor = get_quill_editor(drv)
+
+    def _focus_and_verify(editor) -> bool:
+        """PART 17: prove focus landed on the composer before injecting --
+        never run CDP Input.insertText against an element that Selenium
+        merely called .focus() on without confirming document.activeElement
+        actually moved there (Gemini's own JS can steal focus back)."""
+        try:
+            drv.execute_script("arguments[0].scrollIntoView({block:'center'});", editor)
+        except Exception:
+            pass
+        try:
+            ok = drv.execute_script(
+                "arguments[0].focus(); return document.activeElement === arguments[0];", editor
+            )
+        except Exception:
+            ok = False
+        if not ok:
+            append_runtime_log(f'{prefix} PROMPT_FOCUS_MISMATCH — retrying focus')
+            try:
+                editor.click()
+                ok = drv.execute_script("return document.activeElement === arguments[0];", editor)
+            except Exception:
+                ok = False
+        return bool(ok)
+
+    editor = get_active_gemini_image_composer(drv, tid=tid, job_id=job_id)
     if not editor:
         raise PromptFailed(f'Tab T{tid}: Quill editor not found')
     for attempt in range(1, 3):
         try:
-            # PART 7: the composer can be re-rendered between Create Image
-            # verification and prompt injection -- ALWAYS RE-FIND the active
-            # visible composer at the start of every attempt. A handle from
-            # a previous render is exactly the stale-WebElement class of bug
-            # that let "PROMPT_VERIFIED" coexist with a visibly empty
-            # "Ask Gemini" box.
-            refound = get_quill_editor(drv)
+            # PART 7/19: the composer can be re-rendered between Create
+            # Image verification and prompt injection, and again between
+            # tiers within one attempt -- ALWAYS RE-FIND the active visible
+            # composer, never reuse a WebElement handle across a DOM
+            # transition. A stale handle is exactly the bug class that let
+            # "PROMPT_VERIFIED" coexist with a visibly empty "Ask Gemini" box.
+            refound = get_active_gemini_image_composer(drv, tid=tid, job_id=job_id)
             if refound is not None:
                 editor = refound
             _clear_editor(drv, editor)
+            _focus_and_verify(editor)
 
             try:
                 drv.execute_cdp_cmd('Input.insertText', {'text': text})
@@ -2979,24 +3088,29 @@ def _inject_prompt_atomic(drv, text, tid=0, job_id=''):
             except Exception as cdp_err:
                 append_runtime_log(f'{prefix} CDP notice ({cdp_err})')
             time.sleep(0.3)
-            if _verify_editor_prompt(drv, editor, text, tid=tid, job_id=job_id):
+            verify_editor = get_active_gemini_image_composer(drv, tid=tid, job_id=job_id) or editor
+            if _verify_editor_prompt(drv, verify_editor, text, tid=tid, job_id=job_id):
                 return True
             append_runtime_log(f'{prefix} CDP insertText did not verify -- trying xclip fallback')
 
+            editor = get_active_gemini_image_composer(drv, tid=tid, job_id=job_id) or editor
             _clear_editor(drv, editor)
+            _focus_and_verify(editor)
             if _set_clipboard_xclip(text):
-                drv.execute_script('arguments[0].focus();', editor)
                 ActionChains(drv).click(editor).key_down(Keys.CONTROL).send_keys('v').key_up(Keys.CONTROL).perform()
                 append_runtime_log(f'{prefix} PROMPT_INJECTING via xclip Ctrl+V')
                 append_runtime_log(f'{prefix} GEMINI_PROMPT_INJECT_METHOD tier={attempt}:xclip_ctrl_v')
             else:
                 append_runtime_log(f'{prefix} xclip failed', file=sys.stderr)
             time.sleep(0.3)
-            if _verify_editor_prompt(drv, editor, text, tid=tid, job_id=job_id):
+            verify_editor = get_active_gemini_image_composer(drv, tid=tid, job_id=job_id) or editor
+            if _verify_editor_prompt(drv, verify_editor, text, tid=tid, job_id=job_id):
                 return True
             append_runtime_log(f'{prefix} xclip paste did not verify -- trying direct send_keys fallback')
 
+            editor = get_active_gemini_image_composer(drv, tid=tid, job_id=job_id) or editor
             _clear_editor(drv, editor)
+            _focus_and_verify(editor)
             try:
                 for chunk_start in range(0, len(text), 500):
                     editor.send_keys(text[chunk_start:chunk_start + 500])
@@ -3006,7 +3120,8 @@ def _inject_prompt_atomic(drv, text, tid=0, job_id=''):
             except Exception as sk_err:
                 append_runtime_log(f'{prefix} send_keys fallback error: {sk_err}')
             time.sleep(0.3)
-            if _verify_editor_prompt(drv, editor, text, tid=tid, job_id=job_id):
+            verify_editor = get_active_gemini_image_composer(drv, tid=tid, job_id=job_id) or editor
+            if _verify_editor_prompt(drv, verify_editor, text, tid=tid, job_id=job_id):
                 return True
 
             append_runtime_log(f'{prefix} PROMPT_VERIFY_FAIL attempt {attempt} (all 3 tiers) — retrying')
