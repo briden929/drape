@@ -1,0 +1,2001 @@
+<USER_REQUEST>
+============================================================
+MASTER INSTRUCTION
+BUILD A REAL N2N FULL QUEUE WORKER
+NOT A TESTING SCAFFOLD
+============================================================
+
+You are the primary implementation engineer.
+
+I do NOT want another architecture mockup.
+
+I do NOT want:
+- DummyDriver
+- fake Selenium
+- simulated downloads
+- asyncio.sleep() pretending generation happened
+- fake GUIDs
+- fake WMR processing
+- fake R2 success
+- fake DB success
+- hardcoded PASS test output
+- placeholder functions
+- TODO functions
+- "implementation omitted"
+- simplified browser logic
+- pseudocode
+- architecture-only code
+
+I need ONE REAL END-TO-END Python source file that can actually run in Google Colab and perform the complete pipeline.
+
+The purpose of this build is:
+
+N2N REAL PIPELINE TESTING.
+
+It must use the actual browser automation methods already proven in my previous source files.
+
+============================================================
+1. FINAL OBJECTIVE
+============================================================
+
+Build:
+
+FULL_QUEUE_WORKER_V14_N2N_TEST.py
+
+The source must implement the real pipeline:
+
+BullMQ job
+    ->
+JobContext
+    ->
+Gemini resource assignment
+    ->
+Google login/session verification
+    ->
+Gemini
+    ->
+new chat
+    ->
+Flash/Create Image
+    ->
+reference upload
+    ->
+attachment verification
+    ->
+prompt
+    ->
+send
+    ->
+generation detection
+    ->
+generated image detection
+    ->
+exact generated-image download
+    ->
+CDP download GUID detection
+    ->
+Gemini resource release immediately at DOWNLOAD START
+    ->
+raw download completion
+    ->
+raw PNG validation
+    ->
+WMR queue
+    ->
+WMR FIRST-FREE resource
+    ->
+Chrome WMR
+    ->
+file upload
+    ->
+processing detection
+    ->
+exact Download PNG
+    ->
+CDP GUID
+    ->
+WMR resource release immediately at DOWNLOAD START
+    ->
+clean PNG completion
+    ->
+PIL validation
+    ->
+WebP
+    ->
+R2 upload
+    ->
+DB update
+    ->
+credits settlement
+    ->
+BullMQ job completion
+
+EVERY stage must be real.
+
+============================================================
+2. SOURCE FILES ARE AUTHORITATIVE
+============================================================
+
+Use the following files as the actual implementation references.
+
+SOURCE A:
+C:\Users\PC\Downloads\google login.py
+
+Purpose:
+Google login/session implementation.
+
+Study it carefully.
+
+Extract and reuse its real:
+- Google login navigation
+- email entry
+- password entry
+- verification handling
+- cookies/session persistence
+- already-logged-in detection
+- Google account state detection
+- Chrome profile handling
+
+Do NOT invent a new simplified login implementation if this source already contains working logic.
+
+------------------------------------------------------------
+
+SOURCE B:
+C:\Users\PC\Downloads\copy_of_ecom_combo_photoshoot_order.py
+
+Purpose:
+REAL browser-operation reference.
+
+This is extremely important.
+
+Use it to reproduce the actual:
+- Gemini navigation
+- model selection
+- Flash selection
+- Create Image mode
+- new chat
+- file input detection
+- reference image upload
+- attachment verification
+- prompt insertion
+- send button
+- generation waiting
+- image result detection
+- exact image download
+- WMR navigation
+- WMR file upload
+- WMR processing detection
+- WMR result detection
+- exact Download PNG button
+- download handling
+
+Do not replace these operations with fake functions.
+
+------------------------------------------------------------
+
+SOURCE C:
+C:\Users\PC\Downloads\GEMINI QUEUE WORKER (1).ipynb
+
+Purpose:
+Original real queue-worker/Colab runtime.
+
+Study:
+- BullMQ connection
+- Redis
+- job format
+- generation payload
+- database lookup
+- reference resolution
+- Colab startup
+- Chrome startup
+- VNC/noVNC if present
+- worker lifecycle
+- queue processing
+
+Reuse proven behavior.
+
+------------------------------------------------------------
+
+SOURCE D:
+C:\Users\PC\Downloads\FULL_QUEUE_WORKER_V11.py
+
+Purpose:
+PRIMARY FULL PIPELINE IMPLEMENTATION REFERENCE.
+
+This is NOT merely conceptual.
+
+Use the actual working methods from V11.
+
+Especially inspect:
+- comprehensive_login_check()
+- handle_google_login_fast()
+- open_new_chat_and_reload()
+- ensure_flash_mode()
+- ensure_create_image_mode()
+- perform_robust_upload()
+- verify_attachment_count()
+- _click_send_button()
+- nb_check_image()
+- generated image detection
+- _hover_and_dl_single_click()
+- download monitoring
+- WMR file input detection
+- _wmr_check_status()
+- _wmr_click_download()
+- WmrWorker
+- WmrWorkerPool
+- process_bullmq_job()
+- finalization
+- WebP
+- R2
+- DB
+- credits
+
+DO NOT rewrite these browser operations from memory.
+
+Read the source and transplant the real implementation.
+
+============================================================
+3. SCRATCH DIRECTORY
+============================================================
+
+Also inspect:
+
+C:\Users\PC\.gemini\antigravity\scratch
+
+There are many historical files here.
+
+Use scratch for:
+- previous bugs
+- failed approaches
+- architecture decisions
+- test results
+- previous V12/V13/V14 changes
+- known runtime errors
+- previous fixes
+
+IMPORTANT:
+
+Scratch files are NOT authoritative source code.
+
+Do NOT concatenate scratch patch scripts.
+
+Do NOT copy:
+gen_v14_clean.py
+fix_*.py
+update_*.py
+check_*.py
+ast_val.py
+temporary builders
+
+into production code.
+
+Instead:
+understand why previous attempts failed
+then implement one clean source.
+
+============================================================
+4. CURRENT FULL_QUEUE_WORKER_V14_FINAL_NEW.py
+============================================================
+
+DO NOT use:
+
+C:\Users\PC\Desktop\FULL_QUEUE_WORKER_V14_FINAL_NEW.py
+
+as the implementation base.
+
+It is only a failed/testing scaffold.
+
+It contains:
+- DummyDriver
+- simulated Gemini
+- simulated WMR
+- fake architecture tests
+- fake status
+- fake downloads
+
+Therefore it must NOT be treated as the real implementation.
+
+You may inspect it only to understand what was attempted.
+
+============================================================
+5. DO NOT OPTIMIZE FOR LINE COUNT
+============================================================
+
+I said approximately 800-1000 lines only as a preference for a clean testing source.
+
+DO NOT sacrifice functionality to achieve 800-1000 lines.
+
+COMPLETENESS IS MORE IMPORTANT THAN LINE COUNT.
+
+If the real N2N implementation requires:
+1200
+1500
+2000
+2500
+or more lines,
+
+that is acceptable.
+
+But do NOT artificially inflate the code.
+
+Every line must have a real purpose.
+
+No duplicated functions.
+
+No duplicate imports.
+
+No patch-stack artifacts.
+
+No dead code.
+
+============================================================
+6. CHROME ONLY
+============================================================
+
+ABSOLUTE REQUIREMENT:
+
+Google Chrome only.
+
+No Microsoft Edge.
+
+Remove all:
+- Edge
+- msedge
+- microsoft-edge
+- EdgeOptions
+- EdgeWorker
+- msedgedriver
+
+The entire system must use:
+
+selenium.webdriver.Chrome
+ChromeOptions
+
+Gemini:
+Chrome
+
+WMR:
+Chrome
+
+Separate Chrome profiles are required.
+
+============================================================
+7. GEMINI T0-T3
+============================================================
+
+Create four logical Gemini resources:
+
+T0
+T1
+T2
+T3
+
+Each T resource must own:
+
+- Chrome driver/process
+- isolated Chrome profile
+- persistent Gemini tab/window
+- window handle
+- current state
+- current job
+- health state
+- command ownership
+- release sequence
+
+Tabs are LAZY CREATED.
+
+Do NOT open four unnecessary Chrome instances before jobs arrive.
+
+First job:
+T0
+
+Second:
+T1
+
+Third:
+T2
+
+Fourth:
+T3
+
+============================================================
+8. PERSISTENT GEMINI TAB
+============================================================
+
+CRITICAL.
+
+Do NOT close the Gemini tab after every job.
+
+Example:
+
+J1 -> T0
+
+J1 generated image download starts.
+
+At that exact moment:
+
+T0 = FREE
+
+But:
+
+T0 Chrome remains alive.
+T0 Gemini tab remains alive.
+
+Next job:
+
+J5 -> SAME T0
+
+Do not create another Chrome.
+
+Do not recreate the Gemini tab.
+
+Do not close the browser because the previous raw download is still running.
+
+============================================================
+9. FIRST-FREE-WINS
+============================================================
+
+This is NOT:
+
+lowest T ID wins.
+
+It is:
+
+FIRST RESOURCE THAT ACTUALLY BECAME FREE WINS.
+
+Example:
+
+T2 becomes free first.
+T0 becomes free second.
+T3 becomes free third.
+
+Next jobs:
+
+J5 -> T2
+J6 -> T0
+J7 -> T3
+
+Use a release sequence broker.
+
+Use thread-safe synchronization.
+
+Log:
+
+[GEMINI] T2 RELEASED seq=101
+[GEMINI] T0 RELEASED seq=102
+[GEMINI] T3 RELEASED seq=103
+
+Then:
+
+[GEMINI] FIRST-FREE -> T2 for J5
+
+============================================================
+10. DOWNLOAD LIFECYCLE IS SEPARATE
+============================================================
+
+This is one of the most important rules.
+
+JOB lifecycle != RESOURCE lifecycle != DOWNLOAD lifecycle.
+
+Example:
+
+J1 -> T0
+
+Gemini download starts.
+
+Immediately:
+
+T0 FREE
+
+while:
+
+J1 raw PNG is still downloading.
+
+Then:
+
+J5 -> T0
+
+while J1 raw download continues.
+
+Do NOT wait for:
+- raw download completion
+- PIL validation
+- WMR
+- WebP
+- R2
+- DB
+- credits
+
+before freeing T0.
+
+T0 release event is:
+
+ACTUAL GEMINI DOWNLOAD START CONFIRMED.
+
+============================================================
+11. REAL DOWNLOAD OWNERSHIP
+============================================================
+
+Do NOT identify downloads using:
+
+- newest file
+- first PNG
+- filename
+- modification time
+- directory scan only
+
+Use Chrome CDP.
+
+Capture:
+
+Browser.downloadWillBegin
+
+and:
+
+Browser.downloadProgress
+
+Register:
+
+download_guid
+job_id
+resource_id
+system
+window_handle
+staging_dir
+expected filename
+start timestamp
+
+Example:
+
+GUID-AAA
+job=J1
+system=GEMINI
+resource=T0
+
+GUID-BBB
+job=J5
+system=GEMINI
+resource=T0
+
+Both may exist simultaneously.
+
+The GUID owns the download.
+
+============================================================
+12. GEMINI DOWNLOAD START
+============================================================
+
+The sequence must be:
+
+Click exact generated image Download
+        ->
+CDP downloadWillBegin
+        ->
+obtain GUID
+        ->
+register GUID
+        ->
+mark GEMINI_DOWNLOAD_STARTED
+        ->
+release T resource
+        ->
+continue raw download asynchronously
+
+Never release T before actual download start confirmation.
+
+A click alone is NOT sufficient.
+
+============================================================
+13. RAW DOWNLOAD VALIDATION
+============================================================
+
+After T resource is released:
+
+central download monitor continues.
+
+Wait for:
+
+- download completion
+- .crdownload gone
+- file exists
+- file size > minimum
+- stable size for N polls
+- PIL.Image.open()
+- PIL.verify()
+- PIL.load()
+- valid dimensions
+- valid image format
+
+Only then:
+
+RAW_READY
+
+Then:
+
+WMR_QUEUE
+
+============================================================
+14. WMR ARCHITECTURE
+============================================================
+
+WMR is Chrome only.
+
+Profiles:
+
+W0
+W1
+W2
+W3
+
+Each WMR profile is a separate Chrome process/profile.
+
+Each profile contains:
+
+W0-T0
+W0-T1
+
+W1-T0
+W1-T1
+
+W2-T0
+W2-T1
+
+W3-T0
+W3-T1
+
+Total:
+
+8 WMR logical resources.
+
+Configuration:
+
+WMR_WORKERS = 4
+WMR_TABS_PER_PROFILE = 2
+
+============================================================
+15. WMR DRIVER THREAD SAFETY
+============================================================
+
+One Chrome WebDriver MUST NOT be controlled simultaneously by multiple Python threads.
+
+Therefore:
+
+W0 owns one driver.
+
+W0 has one owner thread.
+
+W0 owner thread owns:
+W0-T0
+W0-T1
+
+All Selenium commands for W0-T0/W0-T1 go through W0 command queue.
+
+Same:
+
+W1 -> W1-T0/W1-T1
+W2 -> W2-T0/W2-T1
+W3 -> W3-T0/W3-T1
+
+This preserves Selenium thread safety.
+
+However:
+
+DO NOT put one giant lock around an entire WMR job.
+
+Jobs must remain independently schedulable.
+
+============================================================
+16. GLOBAL WMR FIRST-FREE-WINS
+============================================================
+
+All eight WMR tabs share ONE global release-order broker.
+
+Example:
+
+W1-T0 released first
+W0-T1 released second
+W2-T0 released third
+
+Next jobs:
+
+J10 -> W1-T0
+J11 -> W0-T1
+J12 -> W2-T0
+
+Do not sort:
+W0 before W1
+T0 before T1
+
+Release order controls ownership.
+
+============================================================
+17. WMR DOWNLOAD RELEASE
+============================================================
+
+WMR resource lifecycle is also independent from download lifecycle.
+
+Example:
+
+J1 -> W0-T0
+
+WMR processing completes.
+
+Download PNG clicked.
+
+CDP confirms:
+
+downloadWillBegin GUID=XYZ
+
+Immediately:
+
+W0-T0 FREE
+
+Previous clean PNG can continue downloading.
+
+Next job may use:
+
+W0-T0
+
+Do not wait for clean PNG completion.
+
+============================================================
+18. REAL GEMINI PIPELINE
+============================================================
+
+Use the REAL functions from V11/ECOM.
+
+Actual sequence:
+
+1. Acquire T resource
+2. Ensure Chrome healthy
+3. Ensure Gemini tab exists
+4. Switch to correct window
+5. Check Google session
+6. If already logged in:
+       continue
+7. If not:
+       execute real Google login flow
+8. Open Gemini
+9. Start new clean chat
+10. Verify chat
+11. Select required model
+12. Select Create Image
+13. Find file input
+14. Upload references using send_keys()
+15. Verify exact attachment count
+16. Insert prompt
+17. Verify prompt
+18. Click Send
+19. Wait for generation
+20. Detect generated image
+21. Verify result ownership
+22. Click exact generated image Download
+23. Wait for CDP download start
+24. Register GUID
+25. Release T resource
+26. Return to scheduler
+
+Do NOT simulate any step.
+
+============================================================
+19. GOOGLE LOGIN
+============================================================
+
+Use the real login implementation from:
+
+C:\Users\PC\Downloads\google login.py
+
+and mature logic from V11.
+
+Login handling must support:
+
+- existing session
+- cookie restoration
+- Google account page
+- email
+- password
+- verification/challenge detection
+- session save
+- session reuse
+
+Already logged-in detection should use multiple signals.
+
+Do NOT say:
+
+cookie exists => logged in.
+
+Do NOT login for every job.
+
+Use persistent Chrome profile.
+
+============================================================
+20. NEW CHAT
+============================================================
+
+Each job must begin with a clean Gemini conversation state.
+
+Use the proven:
+
+open_new_chat_and_reload()
+
+logic from V11/ECOM.
+
+Verify:
+- correct Gemini URL
+- new chat state
+- composer available
+- previous generation not being reused
+
+If new-chat navigation fails:
+retry according to configured retry budget.
+
+============================================================
+21. IMAGE GENERATION
+============================================================
+
+Use actual ECOM/V11 browser controls.
+
+Do NOT assume DOM selectors from memory.
+
+Study the source files and preserve robust selectors.
+
+Need real:
+
+Flash mode
+Create Image mode
+reference upload
+attachment count
+prompt
+send
+generation wait
+image detection
+download
+
+============================================================
+22. WMR
+============================================================
+
+Use actual ECOM/V11 methods.
+
+Sequence:
+
+RAW_READY
+    ->
+WMR resource acquired
+    ->
+WMR page
+    ->
+file input
+    ->
+send_keys(raw_path)
+    ->
+upload verification
+    ->
+processing wait
+    ->
+result container detection
+    ->
+exact visible/enabled Download PNG
+    ->
+click
+    ->
+CDP downloadWillBegin
+    ->
+GUID registration
+    ->
+WMR resource release
+
+Never:
+- click arbitrary PNG
+- select newest download
+- assume processing completed
+- use fake sleep as success
+
+============================================================
+23. BULLMQ
+============================================================
+
+Use actual BullMQ Worker.
+
+Queue:
+
+generations
+
+Job callback must:
+
+1. receive BullMQ job
+2. extract job/generation ID
+3. resolve DB generation if required
+4. resolve prompt
+5. resolve reference images
+6. create JobContext
+7. submit to scheduler
+8. wait for actual pipeline completion
+9. return actual success result
+
+If job fails:
+raise/return appropriate BullMQ failure.
+
+Do not mark BullMQ success before final pipeline completion.
+
+============================================================
+24. JOB CONTEXT
+============================================================
+
+Each job must maintain independent state.
+
+At minimum:
+
+job_id
+generation_id
+user_id
+prompt
+refs
+retry_count
+
+gemini_tid
+gemini_window_handle
+gemini_download_guid
+
+raw_path
+raw_state
+
+wmr_resource
+wmr_profile
+wmr_tab
+wmr_window_handle
+wmr_download_guid
+
+clean_path
+webp_path
+
+r2_png_url
+r2_webp_url
+
+state
+error
+timestamps
+
+No global current_job.
+
+============================================================
+25. FINALIZATION
+============================================================
+
+After WMR clean PNG is fully downloaded:
+
+1. stability check
+2. PIL validation
+3. CLEAN_READY
+4. WebP conversion
+5. WEBP_READY
+6. R2 PNG upload
+7. R2 WebP upload
+8. R2_READY
+9. DB finalization
+10. credits settlement
+11. COMPLETED
+
+Use actual V11/backend methods.
+
+Do not simulate:
+
+R2_READY
+DB_FINALIZING
+COMPLETED
+
+============================================================
+26. R2
+============================================================
+
+Use real boto3.
+
+Credentials only from environment/Colab secrets.
+
+Never hardcode:
+- access key
+- secret
+- database password
+- Redis password
+
+Use:
+
+os.environ.get(...)
+
+or Colab Secrets.
+
+If R2 fails:
+record failure.
+Do not falsely mark job completed.
+
+============================================================
+27. DATABASE
+============================================================
+
+Use the actual DB methods from V11/backend reference.
+
+Do not create fake DB success.
+
+Use correct state transitions.
+
+Maintain idempotency.
+
+============================================================
+28. CREDITS
+============================================================
+
+Credits must only settle after successful finalization.
+
+Never settle twice.
+
+If credit settlement fails:
+log exact error
+preserve job state
+apply configured retry/finalization policy
+
+Do not silently ignore it.
+
+============================================================
+29. FAILURE ISOLATION
+============================================================
+
+T0 failure:
+only affected T0 job is affected.
+
+T1/T2/T3 continue.
+
+W0 failure:
+only W0-owned jobs affected.
+
+W1/W2/W3 continue.
+
+One bad image:
+only that job fails/retries.
+
+One R2 failure:
+do not kill Gemini.
+
+One DB failure:
+do not kill WMR.
+
+One browser crash:
+recover only that resource where possible.
+
+============================================================
+30. CHROME PROFILE PERSISTENCE
+============================================================
+
+Gemini profiles:
+
+T0
+T1
+T2
+T3
+
+WMR profiles:
+
+W0
+W1
+W2
+W3
+
+Do not reuse the same Chrome user-data-dir simultaneously.
+
+Do not create multiple Chrome processes using the same profile.
+
+============================================================
+31. DOWNLOAD DIRECTORIES
+============================================================
+
+Use job-isolated directories.
+
+Gemini:
+
+/content/downloads/chrome/T0/JOB_ID/incoming
+/content/downloads/chrome/T1/JOB_ID/incoming
+/content/downloads/chrome/T2/JOB_ID/incoming
+/content/downloads/chrome/T3/JOB_ID/incoming
+
+Staging:
+
+/content/downloads/chrome_staging/T0
+...
+T3
+
+WMR:
+
+/content/downloads/wmr/JOB_ID/incoming
+
+WMR staging:
+
+/content/downloads/wmr_staging/W0
+...
+W3
+
+Final:
+
+/content/downloads/final_output/T0/JOB_ID
+
+Do not mix job files.
+
+============================================================
+32. ASYNCIO / COLAB
+============================================================
+
+The source must run properly in Google Colab.
+
+Do NOT use:
+
+asyncio.run(main())
+
+inside a running notebook loop.
+
+Provide:
+
+async def run_worker_forever()
+
+and:
+
+def start_in_current_environment()
+
+Behavior:
+
+COLAB:
+detect running loop
+create task OR allow:
+await run_worker_forever()
+
+TERMINAL:
+asyncio.run(run_worker_forever())
+
+No:
+
+RuntimeError("Use: await main()")
+
+No:
+
+coroutine was never awaited
+
+No silent background task.
+
+Attach done callback.
+
+If task crashes:
+
+print complete exception + traceback.
+
+============================================================
+33. EASY COLAB EXECUTION
+============================================================
+
+The file must support:
+
+exec(open(
+    "FULL_QUEUE_WORKER_V14_N2N_TEST.py",
+    encoding="utf-8"
+).read())
+
+and:
+
+await run_worker_forever()
+
+Both must work.
+
+When auto-starting in Colab, immediately print:
+
+[V14] Runtime entrypoint reached
+[V14] Colab/Jupyter detected
+[V14] Starting worker
+[V14] Startup sequence beginning
+
+Then show all startup stages.
+
+============================================================
+34. STARTUP OUTPUT
+============================================================
+
+Do NOT only print:
+
+[V14] Colab/Jupyter event loop detected
+
+Startup must visibly continue.
+
+Required:
+
+============================================================
+FULL QUEUE WORKER V14 N2N
+============================================================
+
+[STEP 1] Configuration
+[OK]
+
+[STEP 2] Directories
+[OK]
+
+[STEP 3] Dependencies
+[OK]
+
+[STEP 4] Google Chrome
+[OK]
+
+[STEP 5] Redis / BullMQ
+[OK]
+
+[STEP 6] Database / R2
+[OK]
+
+[STEP 7] Gemini resources
+[OK] T0
+[OK] T1
+[OK] T2
+[OK] T3
+
+[STEP 8] WMR resources
+[OK] W0-T0
+[OK] W0-T1
+[OK] W1-T0
+[OK] W1-T1
+[OK] W2-T0
+[OK] W2-T1
+[OK] W3-T0
+[OK] W3-T1
+
+[STEP 9] Download manager
+[OK]
+
+[STEP 10] BullMQ
+[OK]
+
+[STEP 11] Health monitor
+[OK]
+
+============================================================
+[V14] WORKER READY
+============================================================
+
+Then:
+
+[STATUS] Queue=0 Gemini=0/4 WMR=0/8 Downloads=0
+
+============================================================
+35. REAL STATUS
+============================================================
+
+Status must reflect actual state.
+
+Do NOT print fake:
+
+Redis=CONNECTED
+
+unless actual Redis connection succeeded.
+
+Do NOT print:
+
+T0=IDLE
+
+unless actual state is IDLE.
+
+Do not hardcode test output.
+
+============================================================
+36. TEST MODE
+============================================================
+
+This source is for N2N testing.
+
+Therefore add:
+
+V14_TEST_MODE
+
+but test mode must test REAL components.
+
+Architecture-only tests are insufficient.
+
+At minimum:
+
+TEST 1:
+real Chrome startup
+
+TEST 2:
+real Google session check
+
+TEST 3:
+real Gemini navigation
+
+TEST 4:
+real reference upload
+
+TEST 5:
+real generation
+
+TEST 6:
+real Gemini download
+
+TEST 7:
+real download GUID
+
+TEST 8:
+real raw validation
+
+TEST 9:
+real WMR upload
+
+TEST 10:
+real WMR processing
+
+TEST 11:
+real WMR Download PNG
+
+TEST 12:
+real WMR GUID
+
+TEST 13:
+real WebP
+
+TEST 14:
+real R2
+
+TEST 15:
+real DB
+
+TEST 16:
+BullMQ completion
+
+External systems that are unavailable may be reported as BLOCKED.
+
+Never report BLOCKED as PASS.
+
+============================================================
+37. STATIC VALIDATION
+============================================================
+
+After writing the final source, run:
+
+python -m py_compile
+
+AST parse
+
+flake8 --select=F821
+
+duplicate function detection
+
+duplicate class detection
+
+Edge scan
+
+mojibake scan
+
+hardcoded credential scan
+
+DummyDriver scan
+
+simulation scan
+
+fake GUID scan
+
+fake PASS scan
+
+asyncio.run scan
+
+entrypoint scan
+
+============================================================
+38. FORBIDDEN PATTERNS
+============================================================
+
+Final production source must contain ZERO:
+
+DummyDriver
+
+class FakeDriver
+
+simulate
+
+simulation
+
+fake_guid
+
+uuid-only fake download ownership
+
+asyncio.sleep(1) pretending generation
+
+print("[V14 TEST] T01 PASS") without actual test
+
+return True replacing real browser operation
+
+return "fake"
+
+placeholder
+
+TODO
+
+NotImplementedError
+
+pass inside critical browser operation
+
+hardcoded R2 credentials
+
+hardcoded DB credentials
+
+hardcoded Redis credentials
+
+Edge
+
+msedge
+
+microsoft-edge
+
+EdgeOptions
+
+EdgeWorker
+
+============================================================
+39. REAL CODE VS TEST CODE
+============================================================
+
+Do NOT confuse:
+
+"architecture test"
+
+with:
+
+"real pipeline test".
+
+I want the latter.
+
+If a function is named:
+
+perform_robust_upload()
+
+it must actually perform Selenium upload.
+
+If named:
+
+_wmr_click_download()
+
+it must actually click the real WMR Download PNG.
+
+If named:
+
+poll_active_downloads()
+
+it must actually monitor real files/GUIDs.
+
+If named:
+
+upload_to_r2()
+
+it must actually upload using boto3.
+
+If named:
+
+process_bullmq_job()
+
+it must actually process BullMQ jobs.
+
+============================================================
+40. USE V11 METHODS, NOT V11 ARCHITECTURE BUGS
+============================================================
+
+V11 is a browser-operation reference.
+
+Some V11 lifecycle behavior is intentionally obsolete.
+
+Specifically:
+
+OLD V11:
+physical Gemini tab was closed after download start.
+
+NEW V14:
+physical Gemini tab MUST remain alive.
+
+Therefore:
+
+copy the browser-operation logic
+NOT the old tab-destruction lifecycle.
+
+============================================================
+41. V13/V14 ARCHITECTURE
+============================================================
+
+Use the advanced architecture:
+
+FirstFreeBroker
+persistent resources
+download/resource separation
+GUID ownership
+WMR global first-free
+thread-safe WMR driver queues
+failure isolation
+
+But do not use V14's current dummy implementation.
+
+============================================================
+42. IMPORTANT RESOURCE STATE MACHINE
+============================================================
+
+Gemini:
+
+IDLE
+ASSIGNED
+UPLOADING
+GENERATING
+DOWNLOAD_CLICKED
+DOWNLOAD_STARTED
+RELEASED
+
+After RELEASED:
+
+T resource = IDLE
+
+Download remains:
+
+RAW_DOWNLOADING
+
+Later:
+
+RAW_READY
+
+WMR:
+
+QUEUED
+ASSIGNED
+UPLOADING
+PROCESSING
+DOWNLOAD_CLICKED
+DOWNLOAD_STARTED
+RELEASED
+
+After RELEASED:
+
+WMR resource = IDLE
+
+Clean file continues:
+
+CLEAN_DOWNLOADING
+
+============================================================
+43. FIRST-FREE PROOF
+============================================================
+
+Implement real test:
+
+Acquire:
+T0
+T1
+T2
+T3
+
+Release:
+T2
+T0
+T3
+
+Acquire must return:
+
+T2
+T0
+T3
+
+Then WMR:
+
+release:
+W1-T0
+W0-T1
+W3-T1
+
+Acquire must return:
+
+W1-T0
+W0-T1
+W3-T1
+
+Do not use numeric ordering.
+
+============================================================
+44. OVERLAPPING DOWNLOAD TEST
+============================================================
+
+Real architecture test:
+
+J1 -> T0
+
+Trigger Gemini download.
+
+Wait for actual download GUID.
+
+Release T0.
+
+Immediately:
+
+J2 -> T0.
+
+J1 raw download must still be active.
+
+The system must track both independently.
+
+No filename collision.
+
+============================================================
+45. PERSISTENT TAB TEST
+============================================================
+
+J1 uses T0.
+
+Record:
+
+Chrome process ID
+window handle
+
+After J1 download start:
+
+J2 uses T0.
+
+Verify:
+
+same Chrome process
+same Gemini tab/window handle
+
+If a new tab/process was created unnecessarily:
+FAIL.
+
+============================================================
+46. WMR MULTI-TAB TEST
+============================================================
+
+Start:
+
+W0-T0 busy.
+
+W0-T1 free.
+
+Submit next job.
+
+It MUST use:
+
+W0-T1.
+
+Do not wait for W0-T0.
+
+============================================================
+47. REAL LOGIN TEST
+============================================================
+
+If Chrome profile already has valid Google session:
+
+detect it.
+
+Do NOT ask user to login again.
+
+If session invalid:
+
+execute real login flow.
+
+If Google requires human verification:
+report:
+
+[AUTH] Human verification required
+
+Do not falsely report login success.
+
+============================================================
+48. REFERENCE IMAGE HANDLING
+============================================================
+
+Job references may be:
+- local paths
+- URLs
+- database records
+- cached files
+
+Resolve them to local files before upload.
+
+Validate:
+exists
+readable
+valid image
+
+Do not upload missing files.
+
+============================================================
+49. EXACT ATTACHMENT COUNT
+============================================================
+
+If job requires 3 images:
+
+actual attachments MUST equal 3.
+
+Do not accept:
+
+>= 3
+
+Do not continue if only 2 uploaded.
+
+Retry upload if safe.
+
+Otherwise fail job.
+
+============================================================
+50. GENERATION DETECTION
+============================================================
+
+Do not use arbitrary fixed:
+
+sleep(30)
+
+as the generation-complete condition.
+
+Use the real V11/ECOM image detection logic.
+
+Wait until:
+- result exists
+- result is attributable to current generation
+- image is actually available
+- Download control belongs to current result
+
+============================================================
+51. WMR RESULT OWNERSHIP
+============================================================
+
+Do not click first "Download PNG" on page.
+
+Find the current result container.
+
+Verify:
+- correct result
+- visible
+- enabled
+- exact Download PNG button
+
+Then click.
+
+============================================================
+52. FINALIZATION MUST BE REAL
+============================================================
+
+The final source must actually implement:
+
+PNG
+ ->
+WebP
+ ->
+R2 PNG
+ ->
+R2 WebP
+ ->
+DB
+ ->
+credits
+ ->
+BullMQ completion
+
+No fake completion.
+
+============================================================
+53. NO SECRET LEAKS
+============================================================
+
+The current generated NEW source contains credentials.
+
+DO NOT COPY THEM.
+
+Use environment/Colab Secrets.
+
+If credentials were exposed in old files:
+do not reproduce them in the new source.
+
+Also mention in final report that credentials must be rotated if they were previously exposed.
+
+============================================================
+54. SOURCE READING PROCESS
+============================================================
+
+Before coding:
+
+FIRST read all four authoritative files completely.
+
+Do not rely on snippets.
+
+Create an internal source map:
+
+GOOGLE LOGIN:
+source -> functions -> lines
+
+GEMINI:
+source -> functions -> lines
+
+WMR:
+source -> functions -> lines
+
+BULLMQ:
+source -> functions -> lines
+
+BACKEND:
+source -> functions -> lines
+
+COLAB:
+source -> startup/runtime
+
+Then build.
+
+============================================================
+55. DO NOT BUILD USING REGEX PATCH STACK
+============================================================
+
+Do NOT:
+
+read current V14
+regex replace 20 sections
+regex replace another 20 sections
+run another fix script
+run another fix script
+generate another intermediate file
+
+This caused the current fragmented architecture.
+
+Instead:
+
+1. inspect sources
+2. design final architecture
+3. write ONE clean source
+4. compile
+5. test
+6. fix source directly
+7. compile again
+
+No patch-stack production file.
+
+============================================================
+56. OUTPUT
+============================================================
+
+Create exactly:
+
+C:\Users\PC\Desktop\FULL_QUEUE_WORKER_V14_N2N_TEST.py
+
+Do not overwrite my V11.
+
+Do not overwrite the current V14 unless explicitly requested.
+
+Do not create:
+FINAL_NEW2
+FINAL_NEW3
+FINAL_PATCH
+FINAL_PATCH2
+
+One clean file.
+
+============================================================
+57. FINAL REPORT
+============================================================
+
+After building, report:
+
+SOURCE FILE:
+FULL_QUEUE_WORKER_V14_N2N_TEST.py
+
+LINES:
+actual line count
+
+REAL FUNCTIONS:
+Gemini login
+Gemini upload
+Gemini generation
+Gemini download
+WMR upload
+WMR processing
+WMR download
+GUID tracking
+WebP
+R2
+DB
+Credits
+BullMQ
+
+VALIDATION:
+
+py_compile = PASS/FAIL
+AST = PASS/FAIL
+F821 = PASS/FAIL
+Duplicate definitions = PASS/FAIL
+Edge scan = PASS/FAIL
+Mojibake scan = PASS/FAIL
+Credential scan = PASS/FAIL
+DummyDriver scan = PASS/FAIL
+Simulation scan = PASS/FAIL
+
+ARCHITECTURE:
+
+Gemini T0-T3 = REAL
+Persistent tabs = REAL
+First-Free = REAL
+Download/resource separation = REAL
+
+WMR:
+
+W0-W3 = REAL
+8 logical tabs = REAL
+Global First-Free = REAL
+Driver command queues = REAL
+
+PIPELINE:
+
+Google login = REAL
+Gemini generation = REAL
+Gemini download = REAL
+Raw validation = REAL
+WMR = REAL
+Clean PNG = REAL
+WebP = REAL
+R2 = REAL
+DB = REAL
+Credits = REAL
+BullMQ = REAL
+
+IMPORTANT:
+
+If something could not be executed because Colab/Chrome/Google/Redis/R2/DB is unavailable, say:
+
+NOT RUNTIME VERIFIED
+
+Do NOT say PASS.
+
+============================================================
+58. MOST IMPORTANT FINAL RULE
+============================================================
+
+I want a REAL N2N implementation.
+
+The following is NOT acceptable:
+
+"Architecture implemented."
+
+"Static pass."
+
+"Function exists."
+
+"Dummy driver."
+
+"Simulation."
+
+"Test scaffold."
+
+I want the actual browser automation code.
+
+The final code must be capable of:
+
+BullMQ job
+    ->
+Google login/session
+    ->
+Gemini
+    ->
+real image generation
+    ->
+real image download
+    ->
+real WMR upload
+    ->
+real watermark-removal processing
+    ->
+real clean PNG download
+    ->
+WebP
+    ->
+R2
+    ->
+DB
+    ->
+credits
+    ->
+BullMQ completion.
+
+Build this as ONE coherent source file.
+============================================================
+END MASTER INSTRUCTION
+============================================================
+</USER_REQUEST>
+<ADDITIONAL_METADATA>
+The current local time is: 2026-09-25T00:09:15+05:30.
+</ADDITIONAL_METADATA>

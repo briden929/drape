@@ -1,0 +1,332 @@
+============================================================
+FULL_QUEUE_WORKER_V14 FINAL AUDIT
+============================================================
+
+SOURCE:
+C:\Users\PC\Desktop\FULL_QUEUE_WORKER_V14_FINAL.py
+
+ECOM REFERENCE:
+C:\Users\PC\Downloads\copy_of_ecom_combo_photoshoot_order.py
+
+NOTEBOOK:
+C:\Users\PC\Downloads\GEMINI QUEUE WORKER (1).ipynb
+
+SCRATCH:
+C:\Users\PC\.gemini\antigravity\scratch
+
+BACKUP CREATED:
+C:\Users\PC\Desktop\backup\FULL_QUEUE_WORKER_V14_FINAL_before_ecom_audit_20260924_230427.py
+
+------------------------------------------------------------
+FORENSIC ANALYSIS SUMMARY
+------------------------------------------------------------
+
+Files analyzed:
+  - FULL_QUEUE_WORKER_V14_FINAL.py (2688 lines, current final)
+  - FULL_QUEUE_WORKER_V11_FINAL.py (V11 browser reference)
+  - FULL_QUEUE_WORKER_V13_FINAL.py (V13 architecture reference)
+  - copy_of_ecom_combo_photoshoot_order.py (ECOM browser ops reference)
+  - GEMINI QUEUE WORKER (1).ipynb (Colab runtime reference)
+  - scratch/ (100+ historical forensic files)
+
+Bugs found and fixed this session:
+  1. CRITICAL: upload_to_r2() was a fake stub ("return 'https://r2/' + object_name")
+     -> Replaced with real boto3 implementation using R2_ACCOUNT_ID/BUCKET/etc from env
+  2. validate_image_file() returned bool but callers expected (bool, reason) tuple
+     -> Upgraded to return tuple, legacy callers fixed
+  3. nb_check_image() called with wrong signature (2 args) in GeminiWorker
+     -> Replaced with correct page URL check for composer-ready verification
+  4. 10 mojibake strings (\xa0\x8f, \x90) found in log/print statements
+     -> Replaced with ASCII: [WARN], [INFO], ->
+  5. DB state transition used wrong constant (DB_READY instead of DB_FINALIZING)
+     -> Fixed to JobState.DB_FINALIZING
+
+------------------------------------------------------------
+ARCHITECTURE
+------------------------------------------------------------
+
+Gemini T0-T3:
+STATIC PASS — defined as GeminiWorker(tid=0..3) with persistent window handles
+
+Persistent tabs:
+STATIC PASS — _ensure_tab() reuses self.window_handle; tabs never closed on job finish
+
+First-Free Broker:
+PASS — heapq-based FirstFreeBroker tested; T8/T9/T12 all pass with correct release order
+
+WMR W0-W3:
+STATIC PASS — WmrDriverThread per profile, isolated Chrome profiles
+
+WMR multi-tab:
+STATIC PASS — WMR_TABS_PER_PROFILE = 2 (configurable), WMR_BROKER.release("W{i}-T{t}")
+
+Global WMR First-Free:
+PASS — uses same FirstFreeBroker as Gemini; T12 simulation passes
+
+------------------------------------------------------------
+GOOGLE / GEMINI
+------------------------------------------------------------
+
+Already logged-in detection:
+STATIC PASS — comprehensive_login_check() uses 7 independent signals; 43% confidence threshold
+
+Login flow:
+STATIC PASS — handle_google_login_fast() with cookie load + Google credentials entry
+BLOCKED — actual Google browser login requires running Colab+Chrome environment
+
+Session persistence:
+STATIC PASS — CHROME_PROFILE_DIR reused across jobs; save_cookies/load_cookies implemented
+
+New chat:
+STATIC PASS — open_new_chat_and_reload() called at start of every job (Rule 14)
+
+Flash/Create Image:
+STATIC PASS — ensure_flash_mode() and ensure_create_image_mode() present
+
+Upload:
+STATIC PASS — perform_robust_upload() uses file input send_keys (DOM, no pyautogui)
+
+Attachment verification:
+STATIC PASS — verify_attachment_count() checks exact N attachments; fails job if mismatch
+
+Prompt:
+STATIC PASS — _inject_prompt_atomic() implemented
+
+Send:
+STATIC PASS — _click_send_button() implemented
+
+Generation detection:
+STATIC PASS — nb_check_image() polls for generated image with timeout loop
+
+Download:
+STATIC PASS — _hover_and_dl_single_click() + CDP downloadWillBegin GUID capture
+
+------------------------------------------------------------
+DOWNLOAD
+------------------------------------------------------------
+
+CDP GUID:
+STATIC PASS — Browser.downloadWillBegin event captured via performance logs
+
+Download ownership:
+STATIC PASS — GUID registered in download_registry keyed by guid; job+resource+dir stored
+
+Resource release at download start:
+STATIC PASS — GEMINI_BROKER.release(self.tid) called via call_soon_threadsafe immediately
+               after download_start confirmed (fs evidence + CDP)
+
+Raw validation before WMR:
+STATIC PASS — poll_active_downloads() performs PIL verify+load+dimension check before
+               transitioning to RAW_READY and WMR_QUEUED
+
+------------------------------------------------------------
+WMR
+------------------------------------------------------------
+
+WMR upload:
+STATIC PASS — _wmr_find_file_input() + inp.send_keys(raw_path)
+
+Processing detection:
+STATIC PASS — _wmr_check_status() polls for 'download png' button in result container
+
+Exact Download PNG:
+STATIC PASS — _wmr_click_download() finds result container then locates Download PNG
+               button by text match inside that container
+
+WMR GUID:
+STATIC PASS — Browser.downloadWillBegin captured in _run_wmr_logic() performance log loop
+
+WMR resource release:
+STATIC PASS — WMR_BROKER.release(resource_id) via call_soon_threadsafe after download start
+
+------------------------------------------------------------
+BACKEND
+------------------------------------------------------------
+
+WebP:
+PASS — convert_to_webp() tested with real PIL temp PNG; format confirmed as WEBP
+
+R2:
+STATIC PASS — Real boto3 upload_to_r2() with put_object() implemented
+BLOCKED — actual R2 upload requires R2_ACCOUNT_ID/KEY env vars + network
+
+DB:
+STATIC PASS — db.connection() context manager with UPDATE generations query
+BLOCKED — actual DB write requires DATABASE_URL env var + Supabase connection
+
+Credits:
+STATIC PASS — credits.settle() called after DB finalization
+BLOCKED — actual credit settlement requires running backend
+
+BullMQ:
+STATIC PASS — Worker() initialized with REDIS_TUNNEL_URL from env, QUEUE_NAME, concurrency
+BLOCKED — actual BullMQ requires Redis tunnel running in Colab
+
+------------------------------------------------------------
+ISOLATION
+------------------------------------------------------------
+
+Gemini T failure isolation:
+STATIC PASS — GeminiWorker._process_job_thread() wraps all work in try/except;
+               GEMINI_BROKER.release() called in both success and failure paths
+
+WMR profile failure isolation:
+STATIC PASS — WmrDriverThread.run() wraps each cmd in try/except;
+               WMR_BROKER.release() called in _run_wmr_logic success and exception
+
+Job failure isolation:
+STATIC PASS — JobContext.transition(FAILED) + resolve_future_once(is_exception=True)
+               isolates each job; other jobs unaffected
+
+------------------------------------------------------------
+CODE QUALITY
+------------------------------------------------------------
+
+py_compile:
+PASS — python -m py_compile exits 0
+
+AST:
+PASS — ast.parse() succeeds on full source
+
+F821 (undefined names):
+PASS — flake8 --select=F821 returns 0 violations
+
+Duplicate definitions (top-level):
+PASS — no duplicate top-level function/class names
+
+Edge scan:
+PASS — zero msedge/EdgeOptions/microsoft-edge references
+
+Mojibake scan:
+PASS — all \xa0\x8f/\x90 escapes replaced with ASCII [WARN]/->
+
+Hardcoded credentials:
+PASS — all config from os.environ.get(); no hardcoded passwords/keys/IDs in source
+
+------------------------------------------------------------
+ASYNCIO / COLAB
+------------------------------------------------------------
+
+Active event loop:
+PASS — async def main() uses asyncio.get_running_loop(); no asyncio.run() inside main()
+
+await main():
+STATIC PASS — main() is async coroutine; "await main()" works inside Colab cell
+
+Standalone entrypoint:
+STATIC PASS — run_worker() calls asyncio.run(main()); guarded by is_running_in_notebook()
+               which raises RuntimeError if called from within Colab
+
+------------------------------------------------------------
+REAL BROWSER
+------------------------------------------------------------
+
+Chrome:
+NOT TESTED — Windows environment; no Linux/Colab Chrome available here
+
+Google session:
+NOT TESTED — requires actual Chrome + Google account
+
+Gemini:
+NOT TESTED — requires Colab environment
+
+WMR:
+NOT TESTED — requires Colab environment
+
+Full real job:
+NOT TESTED — requires complete Colab stack (Redis + DB + R2 + Chrome)
+
+------------------------------------------------------------
+UNIT / ARCHITECTURE TESTS (all executed locally)
+------------------------------------------------------------
+
+T8: FirstFree basic release order:
+PASS — [T2,T0,T3,T1] -> acquire returns [T2,T0,T3,T1]
+
+T9: FirstFree reuse release order:
+PASS — release T1,T2,T0 -> acquire returns [T1,T2,T0]
+
+T12: WMR global first-free:
+PASS — release W1-T0 first -> W1-T0 acquired first
+
+T22: Asyncio active-loop pattern:
+PASS — asyncio.get_running_loop() works inside running coroutine
+
+T24: WebP conversion:
+PASS — real PIL PNG -> valid WEBP output confirmed
+
+validate_image_file:
+PASS — (True,'OK') for valid PNG, (False,reason) for missing file
+
+------------------------------------------------------------
+ECOM METHOD COMPARISON (browser operations)
+------------------------------------------------------------
+
+LOGIN/SESSION:
+  ECOM: multi-signal check (cookies, avatar, email, account elements)
+  V14:  KEPT — comprehensive_login_check() with 7 methods, same approach
+
+GEMINI NAVIGATION:
+  ECOM: Navigate to gemini.google.com/app, detect model panel
+  V14:  KEPT — open_new_chat_and_reload() navigates and reloads
+
+FLASH/CREATE IMAGE:
+  ECOM: Click model selector -> Flash 2.0 -> Create image button
+  V14:  KEPT — ensure_flash_mode() + ensure_create_image_mode()
+
+FILE UPLOAD:
+  ECOM: find_file_input() + send_keys() (DOM, no native dialogs)
+  V14:  KEPT — perform_robust_upload() uses same pattern
+
+ATTACHMENT COUNT:
+  ECOM: counts attachment elements, exact N required
+  V14:  KEPT — verify_attachment_count() exact match enforcement
+
+GENERATION DETECTION:
+  ECOM: poll for img element with non-chatURL src
+  V14:  KEPT — nb_check_image() same logic
+
+DOWNLOAD:
+  ECOM: hover -> Download button click -> CDP GUID
+  V14:  KEPT — _hover_and_dl_single_click() + CDP
+
+WMR UPLOAD:
+  ECOM: find file input, send_keys raw image path
+  V14:  KEPT — _wmr_find_file_input() + inp.send_keys()
+
+WMR DOWNLOAD PNG:
+  ECOM: find result container, find Download PNG button by text
+  V14:  KEPT — _wmr_click_download() same JS selector approach
+
+------------------------------------------------------------
+FINAL STATUS
+------------------------------------------------------------
+
+READY WITH EXTERNAL BLOCKERS
+
+All static verifications pass. All locally-executable tests pass.
+The following remain BLOCKED until Colab environment is available:
+  - Redis connection (requires REDIS_TUNNEL_URL and running cloudflare tunnel)
+  - Database writes (requires DATABASE_URL and Supabase)
+  - R2 uploads (requires R2_ACCOUNT_ID/KEY/BUCKET env vars)
+  - BullMQ job processing (requires Redis)
+  - Chrome/Gemini browser operations (requires Colab Linux + Chrome)
+  - WMR browser operations (requires Colab Linux + Chrome)
+  - Google login (requires active Colab session + Google account)
+
+KNOWN REMAINING LIMITATIONS:
+  - WmrDriverThread does not retry on driver death (profile-level recovery not implemented)
+  - No exponential backoff on Gemini login retry
+  - No automatic Gemini tab health recovery during worker run (manual restart required)
+  - credits.settle() error is logged but does not prevent job completion (by design)
+
+CHANGES MADE THIS SESSION:
+  1. upload_to_r2: fake stub -> real boto3 R2 implementation
+  2. validate_image_file: bool -> (bool, reason) tuple with PIL verify+load+dimensions
+  3. nb_check_image: wrong 2-arg call -> correct page URL check in GeminiWorker
+  4. 10 mojibake strings fixed to ASCII
+  5. DB state transition: DB_READY -> DB_FINALIZING
+  6. R2 constants block added (R2_ACCOUNT_ID, _r2_client, fs_configured, FASHION_STUDIO_USER_ID)
+  7. mimetypes and boto3 imports added
+
+============================================================

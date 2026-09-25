@@ -1,0 +1,3259 @@
+<USER_REQUEST>
+# ----------------------------------------------------------------------------
+# 1. Secrets
+# ----------------------------------------------------------------------------
+import os
+
+# Hardcoded per explicit request, baked in from backend/.env at generation
+# time \u2014 no Colab secrets popups. Trade-off: this cell (and this whole
+# .ipynb) now carries live DB/R2 credentials in plaintext. Don\'t share,
+# sync, or upload this specific generated file anywhere.
+_HARDCODED = {'DATABASE_URL': 'postgresql://postgres.cfgthwsqgmvtftlyoamj:Daxil%4016%3F80!@aws-0-ap-northeast-1.pooler.supabase.com:6543/postgres', 'R2_ACCOUNT_ID': '8e22889fff8e7c874800278c4bdcb26c', 'R2_ACCESS_KEY_ID': 'e90045f23e9cd55bb08238384b771bf2', 'R2_SECRET_ACCESS_KEY': '0b0e32afb39cf06d1682968ee7dc1750526b04c2ea16b200fb6027b070e7d4d6', 'R2_BUCKET_NAME': 'studio-photoshoot', 'R2_PUBLIC_URL': 'https://pub-943056d53cd64d87aef37136315753a7.r2.dev', 'REDIS_URL': 'rediss://default:gQAAAAAABH39AAIgcDIzNDM4OTNlMTY0NDU0MWQ0YmYwMDJmZWMxOTc0N2Q4NQ@harmless-orca-294397.upstash.io:6379'}
+for _name, _val in _HARDCODED.items():
+    os.environ[_name] = _val
+
+# Loose sanity checks only \u2014 catches an obviously-wrong value (e.g. this
+# script picked up a stale/empty line from backend/.env) without needing
+# any external service.
+_FORMAT_HINTS = {
+    "DATABASE_URL": lambda v: v.startswith(("postgres://", "postgresql://")),
+    "R2_PUBLIC_URL": lambda v: v.startswith("https://"),
+    "REDIS_URL": lambda v: v.startswith(("redis://", "rediss://")),
+    "R2_ACCOUNT_ID": lambda v: len(v) == 32 and all(c in "0123456789abcdef" for c in v.lower()),
+}
+_problems = [n for n in _HARDCODED if not _HARDCODED[n].strip()]
+for _name, _check in _FORMAT_HINTS.items():
+    _val = _HARDCODED.get(_name, "")
+    if _val and not _check(_val):
+        print(f"  WARNING: {_name} doesn't look like the expected format (got: {_val[:12]}...)")
+
+if _problems:
+    raise SystemExit(f"Empty hardcoded value(s): {_problems} \u2014 edit this cell directly, or fix backend/.env and regenerate.")
+
+os.environ.setdefault("REDIS_KEY_PREFIX", "vastralook:")
+print("All required secrets present (hardcoded):")
+for _name, _val in _HARDCODED.items():
+    _shown = _val if len(_val) <= 10 else f"{_val[:6]}...{_val[-4:]}"
+    print(f"  {_name}: {_shown} (len={len(_val)})")
+
+
+
+# ----------------------------------------------------------------------------
+# 2. Install dependencies
+# ----------------------------------------------------------------------------
+import subprocess, sys
+
+for _pkg in ("bullmq", "psycopg2-binary", "boto3", "selenium", "Pillow", "websockets", "nest_asyncio",
+             "undetected-chromedriver", "webdriver-manager", "pyvirtualdisplay", "setuptools"):
+    # undetected-chromedriver etc. must be pre-installed here — gemini_login.py's
+    # own ensure_deps() re-installs them via pip on EVERY job otherwise (its
+    # `import undetected_chromedriver` check has nothing to find without this),
+    # adding ~60-90s of pure waste to every single generation.
+    subprocess.run([sys.executable, "-m", "pip", "install", "-q", _pkg], check=False)
+
+# Chrome + chromedriver, same as every other worker script this project uses on Colab.
+subprocess.run(["apt-get", "-qq", "update"], check=False)
+subprocess.run(["apt-get", "-qq", "install", "-y", "google-chrome-stable"], check=False)
+print("Dependencies installed.")
+
+
+
+# ----------------------------------------------------------------------------
+# 3. Register db/credits/fashion_studio modules
+# ----------------------------------------------------------------------------
+import sys, types
+_mod_db = types.ModuleType('db')
+sys.modules['db'] = _mod_db
+exec(compile((
+    'import contextlib\n'
+    'import os\n'
+    'import threading\n'
+    'import psycopg2\n'
+    'from psycopg2 import pool as _pgpool\n'
+    "DATABASE_URL = os.environ.get('DATABASE_URL')\n"
+    '_pool = None\n'
+    '_pool_lock = threading.Lock()\n'
+    '_last_used = {}\n'
+    '\n'
+    'def _get_pool():\n'
+    '    global _pool\n'
+    '    if _pool is None:\n'
+    '        with _pool_lock:\n'
+    '            if _pool is None:\n'
+    "                _pool = _pgpool.ThreadedConnectionPool(minconn=1, maxconn=24, dsn=DATABASE_URL, connect_timeout=10, options='-c statement_timeout=90000')\n"
+    '    return _pool\n'
+    '_PING_AFTER_IDLE_S = 60\n'
+    '\n'
+    'def _mark_used(conn):\n'
+    '    import time\n'
+    '    if len(_last_used) > 64:\n'
+    '        _last_used.clear()\n'
+    '    _last_used[id(conn)] = time.time()\n'
+    '\n'
+    'def _checkout():\n'
+    '    import time\n'
+    '    p = _get_pool()\n'
+    '    for attempt in (1, 2):\n'
+    '        conn = p.getconn()\n'
+    '        if time.time() - _last_used.get(id(conn), 0) < _PING_AFTER_IDLE_S:\n'
+    '            return conn\n'
+    '        try:\n'
+    '            with conn.cursor() as cur:\n'
+    "                cur.execute('SELECT 1')\n"
+    '            conn.rollback()\n'
+    '            return conn\n'
+    '        except Exception:\n'
+    '            p.putconn(conn, close=True)\n'
+    '            if attempt == 2:\n'
+    '                raise\n'
+    "    raise RuntimeError('unreachable')\n"
+    '\n'
+    '@contextlib.contextmanager\n'
+    'def connection():\n'
+    '    import time\n'
+    '    conn = _checkout()\n'
+    '    try:\n'
+    '        yield conn\n'
+    '    except Exception:\n'
+    '        try:\n'
+    '            conn.rollback()\n'
+    '        except Exception:\n'
+    '            _get_pool().putconn(conn, close=True)\n'
+    '            raise\n'
+    '        _mark_used(conn)\n'
+    '        _get_pool().putconn(conn)\n'
+    '        raise\n'
+    '    else:\n'
+    '        _mark_used(conn)\n'
+    '        _get_pool().putconn(conn)\n'
+    '\n'
+    'class _PooledBorrow:\n'
+    '\n'
+    '    def __init__(self, conn):\n'
+    '        self._conn = conn\n'
+    '        self._returned = False\n'
+    '\n'
+    '    def __getattr__(self, name):\n'
+    '        return getattr(self._conn, name)\n'
+    '\n'
+    '    def close(self):\n'
+    '        if self._returned:\n'
+    '            return\n'
+    '        self._returned = True\n'
+    '        try:\n'
+    '            self._conn.rollback()\n'
+    '        except Exception:\n'
+    '            _get_pool().putconn(self._conn, close=True)\n'
+    '            return\n'
+    '        import time\n'
+    '        _mark_used(self._conn)\n'
+    '        _get_pool().putconn(self._conn)\n'
+    '\n'
+    'def borrow():\n'
+    '    return _PooledBorrow(_checkout())'
+), 'D:\\Project\\gemini-automation-main\\gemini-automation-main\\backend\\db.py', 'exec'), _mod_db.__dict__)
+print("db module registered.")
+
+import sys, types
+_mod_credits = types.ModuleType('credits')
+sys.modules['credits'] = _mod_credits
+exec(compile((
+    'import hashlib\n'
+    'import hmac\n'
+    'import json\n'
+    'import os\n'
+    'import uuid\n'
+    'import psycopg2\n'
+    'import requests\n'
+    'import db\n'
+    "DATABASE_URL = os.environ.get('DATABASE_URL')\n"
+    "RAZORPAY_KEY_ID = os.environ.get('RAZORPAY_KEY_ID', '')\n"
+    "RAZORPAY_KEY_SECRET = os.environ.get('RAZORPAY_KEY_SECRET', '')\n"
+    "PAYMENTS_MOCK = os.environ.get('GA_PAYMENTS_MOCK') == '1'\n"
+    "COST_PER_LOOK = int(os.environ.get('GA_CREDITS_PER_LOOK', '10'))\n"
+    "RAZORPAY_API = 'https://api.razorpay.com/v1'\n"
+    '\n'
+    'def configured():\n'
+    '    return bool(DATABASE_URL)\n'
+    '\n'
+    'def payments_configured():\n'
+    '    return PAYMENTS_MOCK or bool(RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET)\n'
+    '\n'
+    'class InsufficientCredits(Exception):\n'
+    '\n'
+    '    def __init__(self, needed, balance):\n'
+    '        self.needed = needed\n'
+    '        self.balance = balance\n'
+    "        super().__init__(f'Insufficient credits: need {needed}, have {balance}.')\n"
+    '\n'
+    'class PaymentError(Exception):\n'
+    '    pass\n'
+    '\n'
+    'def _conn():\n'
+    '    return db.borrow()\n'
+    '\n'
+    'def _apply_delta(cur, user_id, delta, reason, reference_type, reference_id):\n'
+    "    cur.execute('SELECT credit_balance FROM users WHERE id = %s FOR UPDATE', (user_id,))\n"
+    '    row = cur.fetchone()\n'
+    '    if not row:\n'
+    "        raise PaymentError(f'user {user_id} not found')\n"
+    '    after = row[0] + delta\n'
+    '    if after < 0:\n'
+    '        raise InsufficientCredits(-delta, row[0])\n'
+    "    cur.execute('UPDATE users SET credit_balance = %s WHERE id = %s', (after, user_id))\n"
+    "    cur.execute('INSERT INTO credit_transactions (user_id, delta, balance_after, reason, reference_type, reference_id)\\n           VALUES (%s,%s,%s,%s,%s,%s)', (user_id, delta, after, reason, reference_type, reference_id))\n"
+    '    return after\n'
+    '\n'
+    'def balance(user_id):\n'
+    '    conn = _conn()\n'
+    '    try:\n'
+    '        cur = conn.cursor()\n'
+    "        cur.execute('SELECT credit_balance FROM users WHERE id = %s', (user_id,))\n"
+    '        row = cur.fetchone()\n'
+    '        return row[0] if row else None\n'
+    '    finally:\n'
+    '        conn.close()\n'
+    '\n'
+    'def packages():\n'
+    '    conn = _conn()\n'
+    '    try:\n'
+    '        cur = conn.cursor()\n'
+    "        cur.execute('SELECT slug, name, credits, price_minor, currency FROM credit_packages\\n               WHERE is_active ORDER BY price_minor')\n"
+    "        return [{'slug': r[0], 'name': r[1], 'credits': r[2], 'price_minor': r[3], 'currency': r[4].strip()} for r in cur.fetchall()]\n"
+    '    finally:\n'
+    '        conn.close()\n'
+    '\n'
+    'def charge_run(user_id, job, combos, prompt):\n'
+    '    conn = _conn()\n'
+    '    try:\n'
+    '        cur = conn.cursor()\n'
+    '        for c in combos:\n'
+    '            gen_id = str(uuid.uuid4())\n'
+    '            cur.execute("INSERT INTO image_generations\\n                       (id, user_id, prompt, params, is_free, credits_cost, status,\\n                        worker_id, provider_job_id, started_at)\\n                   VALUES (%s,%s,%s,%s,FALSE,%s,\'processing\',\'gemini-automation\',%s,now())", (gen_id, user_id, prompt, json.dumps({\'source\': \'gemini-automation\', **{k: v for k, v in {\'garmentName\': job.get(\'garment_name\'), \'modelName\': job.get(\'model_name\'), \'styleName\': c.get(\'style_name\'), \'modelImage\': job.get(\'model_portrait_url\'), \'styleImage\': c.get(\'style_thumbnail_url\')}.items() if v}}), COST_PER_LOOK, job[\'id\']))\n'
+    "            _apply_delta(cur, user_id, -COST_PER_LOOK, 'generation_spend', 'generation', gen_id)\n"
+    "            cur.execute('INSERT INTO credit_holds (user_id, generation_id, amount) VALUES (%s,%s,%s)', (user_id, gen_id, COST_PER_LOOK))\n"
+    "            c['charge_id'] = gen_id\n"
+    '        conn.commit()\n'
+    '    except Exception:\n'
+    '        conn.rollback()\n'
+    '        raise\n'
+    '    finally:\n'
+    '        conn.close()\n'
+    '\n'
+    'def settle_look(gen_id):\n'
+    '    conn = _conn()\n'
+    '    try:\n'
+    '        cur = conn.cursor()\n'
+    '        cur.execute("UPDATE credit_holds SET status = \'settled\', released_at = now()\\n               WHERE generation_id = %s AND status = \'held\'", (gen_id,))\n'
+    '        cur.execute("UPDATE image_generations SET status = \'done\', completed_at = now()\\n               WHERE id = %s AND status = \'processing\'", (gen_id,))\n'
+    '        conn.commit()\n'
+    '    finally:\n'
+    '        conn.close()\n'
+    '\n'
+    'def refund_look(gen_id, error=None):\n'
+    '    conn = _conn()\n'
+    '    try:\n'
+    '        cur = conn.cursor()\n'
+    '        cur.execute("UPDATE credit_holds SET status = \'released\', released_at = now()\\n               WHERE generation_id = %s AND status = \'held\'\\n               RETURNING user_id, amount", (gen_id,))\n'
+    '        row = cur.fetchone()\n'
+    '        if row and row[1] > 0:\n'
+    "            _apply_delta(cur, row[0], row[1], 'hold_release', 'generation', gen_id)\n"
+    '        cur.execute("UPDATE image_generations\\n               SET status = \'failed\', error = COALESCE(%s, error), completed_at = now()\\n               WHERE id = %s AND status = \'processing\'", ((error or \'generation did not finish\')[:500], gen_id))\n'
+    '        conn.commit()\n'
+    '        return bool(row)\n'
+    '    except Exception:\n'
+    '        conn.rollback()\n'
+    '        raise\n'
+    '    finally:\n'
+    '        conn.close()\n'
+    '\n'
+    'def create_order(user_id, package_slug):\n'
+    '    conn = _conn()\n'
+    '    try:\n'
+    '        cur = conn.cursor()\n'
+    "        cur.execute('SELECT id, name, credits, price_minor, currency FROM credit_packages\\n               WHERE slug = %s AND is_active', (package_slug,))\n"
+    '        pack = cur.fetchone()\n'
+    '        if not pack:\n'
+    "            raise PaymentError('unknown credit pack')\n"
+    '        pack_id, name, credits_n, amount_minor, currency = (pack[0], pack[1], pack[2], pack[3], pack[4].strip())\n'
+    '        cur.execute("INSERT INTO payments (user_id, kind, amount_minor, currency, provider, credit_package_id)\\n               VALUES (%s,\'credit_pack\',%s,%s,\'razorpay\',%s) RETURNING id", (user_id, amount_minor, currency, pack_id))\n'
+    '        payment_id = str(cur.fetchone()[0])\n'
+    '        if PAYMENTS_MOCK:\n'
+    "            order_id = f'order_mock_{payment_id[:18]}'\n"
+    '        else:\n'
+    "            resp = requests.post(f'{RAZORPAY_API}/orders', auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET), json={'amount': amount_minor, 'currency': currency, 'receipt': payment_id, 'notes': {'payment_id': payment_id, 'kind': 'credit_pack'}}, timeout=20)\n"
+    '            if resp.status_code >= 300:\n'
+    "                raise PaymentError(f'gateway rejected the order ({resp.status_code})')\n"
+    "            order_id = resp.json()['id']\n"
+    "        cur.execute('UPDATE payments SET provider_payment_id = %s WHERE id = %s', (order_id, payment_id))\n"
+    '        conn.commit()\n'
+    "        return {'payment_id': payment_id, 'razorpay_order_id': order_id, 'key_id': RAZORPAY_KEY_ID, 'amount_minor': amount_minor, 'currency': currency, 'description': name, 'credits': credits_n, 'mock': PAYMENTS_MOCK, 'test_mode': PAYMENTS_MOCK or RAZORPAY_KEY_ID.startswith('rzp_test_')}\n"
+    '    except Exception:\n'
+    '        conn.rollback()\n'
+    '        raise\n'
+    '    finally:\n'
+    '        conn.close()\n'
+    '\n'
+    'def _settle_paid_order(user_id, order_id, amount_minor, currency):\n'
+    '    conn = _conn()\n'
+    '    try:\n'
+    '        cur = conn.cursor()\n'
+    "        cur.execute('SELECT id, user_id, amount_minor, currency, status, credit_package_id\\n               FROM payments WHERE provider_payment_id = %s FOR UPDATE', (order_id,))\n"
+    '        pay = cur.fetchone()\n'
+    '        if not pay:\n'
+    "            raise PaymentError('payment not found for that order')\n"
+    '        pay_id, pay_user, pay_amount, pay_currency, status, pack_id = (str(pay[0]), str(pay[1]), pay[2], pay[3].strip(), pay[4], pay[5])\n'
+    '        if pay_user != str(user_id):\n'
+    "            raise PaymentError('payment belongs to a different account')\n"
+    "        if status == 'paid':\n"
+    "            return {'already_processed': True, 'credits_granted': 0}\n"
+    '        if amount_minor != pay_amount or currency != pay_currency:\n'
+    "            raise PaymentError('captured amount does not match the order')\n"
+    '        cur.execute("UPDATE payments SET status = \'paid\', paid_at = now() WHERE id = %s", (pay_id,))\n'
+    "        cur.execute('SELECT credits FROM credit_packages WHERE id = %s', (pack_id,))\n"
+    '        granted = cur.fetchone()[0]\n'
+    "        after = _apply_delta(cur, pay_user, granted, 'pack_purchase', 'payment', pay_id)\n"
+    '        conn.commit()\n'
+    "        return {'already_processed': False, 'credits_granted': granted, 'balance': after}\n"
+    '    except Exception:\n'
+    '        conn.rollback()\n'
+    '        raise\n'
+    '    finally:\n'
+    '        conn.close()\n'
+    '\n'
+    'def verify_payment(user_id, order_id, payment_id, signature):\n'
+    "    if PAYMENTS_MOCK and order_id.startswith('order_mock_'):\n"
+    '        conn = _conn()\n'
+    '        try:\n'
+    '            cur = conn.cursor()\n'
+    "            cur.execute('SELECT amount_minor, currency FROM payments WHERE provider_payment_id = %s', (order_id,))\n"
+    '            row = cur.fetchone()\n'
+    '        finally:\n'
+    '            conn.close()\n'
+    '        if not row:\n'
+    "            raise PaymentError('payment not found for that order')\n"
+    '        return _settle_paid_order(user_id, order_id, row[0], row[1].strip())\n'
+    "    expected = hmac.new(RAZORPAY_KEY_SECRET.encode(), f'{order_id}|{payment_id}'.encode(), hashlib.sha256).hexdigest()\n"
+    "    if not hmac.compare_digest(expected, signature or ''):\n"
+    "        raise PaymentError('payment signature verification failed')\n"
+    "    resp = requests.get(f'{RAZORPAY_API}/payments/{payment_id}', auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET), timeout=20)\n"
+    '    if resp.status_code >= 300:\n'
+    "        raise PaymentError(f'could not confirm the payment with the gateway ({resp.status_code})')\n"
+    '    payment = resp.json()\n'
+    "    if payment.get('order_id') != order_id:\n"
+    "        raise PaymentError('payment does not belong to that order')\n"
+    "    if payment.get('status') == 'authorized':\n"
+    "        cap = requests.post(f'{RAZORPAY_API}/payments/{payment_id}/capture', auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET), json={'amount': payment['amount'], 'currency': payment['currency']}, timeout=20)\n"
+    '        if cap.status_code >= 300:\n'
+    "            raise PaymentError('payment could not be captured')\n"
+    '        payment = cap.json()\n'
+    "    if payment.get('status') != 'captured':\n"
+    '        raise PaymentError(f"payment is {payment.get(\'status\')}")\n'
+    "    return _settle_paid_order(user_id, order_id, payment['amount'], payment['currency'])"
+), 'D:\\Project\\gemini-automation-main\\gemini-automation-main\\backend\\credits.py', 'exec'), _mod_credits.__dict__)
+print("credits module registered.")
+
+import sys, types
+_mod_fashion_studio = types.ModuleType('fashion_studio')
+sys.modules['fashion_studio'] = _mod_fashion_studio
+exec(compile((
+    'import json\n'
+    'import mimetypes\n'
+    'import os\n'
+    'import uuid\n'
+    'from pathlib import Path\n'
+    'import boto3\n'
+    'import psycopg2\n'
+    'import db\n'
+    "R2_ACCOUNT_ID = os.environ.get('R2_ACCOUNT_ID')\n"
+    "R2_ACCESS_KEY_ID = os.environ.get('R2_ACCESS_KEY_ID')\n"
+    "R2_SECRET_ACCESS_KEY = os.environ.get('R2_SECRET_ACCESS_KEY')\n"
+    "R2_BUCKET_NAME = os.environ.get('R2_BUCKET_NAME')\n"
+    "R2_PUBLIC_URL = (os.environ.get('R2_PUBLIC_URL') or '').rstrip('/')\n"
+    "DATABASE_URL = os.environ.get('DATABASE_URL')\n"
+    "FASHION_STUDIO_USER_ID = os.environ.get('FASHION_STUDIO_USER_ID')\n"
+    '\n'
+    'def configured():\n'
+    '    return bool(R2_ACCOUNT_ID and R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY and R2_BUCKET_NAME and R2_PUBLIC_URL and DATABASE_URL)\n'
+    '\n'
+    'def _r2_client():\n'
+    "    return boto3.client('s3', endpoint_url=f'https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com', aws_access_key_id=R2_ACCESS_KEY_ID, aws_secret_access_key=R2_SECRET_ACCESS_KEY, region_name='auto')\n"
+    '\n'
+    'def _db():\n'
+    '    return db.borrow()\n'
+    '\n'
+    'def already_done(gen_id):\n'
+    '    if not DATABASE_URL:\n'
+    '        return False\n'
+    '    conn = _db()\n'
+    '    try:\n'
+    '        cur = conn.cursor()\n'
+    "        cur.execute('SELECT status, output_url FROM image_generations WHERE id = %s', (gen_id,))\n"
+    '        row = cur.fetchone()\n'
+    "        return bool(row and row[0] == 'done' and row[1])\n"
+    '    except Exception:\n'
+    '        return False\n'
+    '    finally:\n'
+    '        conn.close()\n'
+    '\n'
+    'def list_categories():\n'
+    '    if not DATABASE_URL:\n'
+    '        return []\n'
+    '    conn = _db()\n'
+    '    try:\n'
+    '        cur = conn.cursor()\n'
+    "        cur.execute('\\n            SELECT DISTINCT cat.name\\n            FROM catalogue_items ci\\n            JOIN categories cat ON cat.id = ci.category_id\\n            WHERE ci.is_active = TRUE AND cat.is_active = TRUE\\n            ORDER BY cat.name\\n            ')\n"
+    '        return [row[0] for row in cur.fetchall()]\n'
+    '    finally:\n'
+    '        conn.close()\n'
+    '\n'
+    'def list_genders():\n'
+    '    if not DATABASE_URL:\n'
+    '        return []\n'
+    '    conn = _db()\n'
+    '    try:\n'
+    '        cur = conn.cursor()\n'
+    "        cur.execute('\\n            SELECT DISTINCT g.label\\n            FROM catalogue_items ci\\n            JOIN genders g ON g.id = ci.gender_id\\n            WHERE ci.is_active = TRUE\\n            ORDER BY g.label\\n            ')\n"
+    '        return [row[0] for row in cur.fetchall()]\n'
+    '    finally:\n'
+    '        conn.close()\n'
+    '\n'
+    'def _format_facet_label(raw):\n'
+    "    label = ' '.join(raw.split())\n"
+    '    return label[:1].upper() + label[1:] if label else label\n'
+    '\n'
+    'def list_pose_types():\n'
+    '    if not DATABASE_URL:\n'
+    '        return []\n'
+    '    conn = _db()\n'
+    '    try:\n'
+    '        cur = conn.cursor()\n'
+    '        cur.execute("\\n            SELECT DISTINCT ON (lower(trim(pose_type))) trim(pose_type)\\n            FROM poses\\n            WHERE NULLIF(trim(pose_type), \'\') IS NOT NULL\\n            ORDER BY lower(trim(pose_type)), trim(pose_type)\\n            ")\n'
+    '        return [_format_facet_label(row[0]) for row in cur.fetchall()]\n'
+    '    finally:\n'
+    '        conn.close()\n'
+    '\n'
+    'def list_view_angles():\n'
+    '    if not DATABASE_URL:\n'
+    '        return []\n'
+    '    conn = _db()\n'
+    '    try:\n'
+    '        cur = conn.cursor()\n'
+    '        cur.execute("\\n            SELECT DISTINCT ON (lower(trim(view_angle))) trim(view_angle)\\n            FROM poses\\n            WHERE NULLIF(trim(view_angle), \'\') IS NOT NULL\\n            ORDER BY lower(trim(view_angle)), trim(view_angle)\\n            ")\n'
+    '        return [_format_facet_label(row[0]) for row in cur.fetchall()]\n'
+    '    finally:\n'
+    '        conn.close()\n'
+    '\n'
+    'def list_styles(limit=16, category=None, gender=None, pose_type=None, view_angle=None, search=None):\n'
+    '    if not DATABASE_URL:\n'
+    '        return []\n'
+    '    conn = _db()\n'
+    '    try:\n'
+    '        cur = conn.cursor()\n'
+    "        where = ['ci.is_active = TRUE', 'pk.is_active = TRUE', 'ci.thumbnail_url IS NOT NULL']\n"
+    '        params = []\n'
+    '        if category:\n'
+    "            where.append('cat.name = %s')\n"
+    '            params.append(category)\n'
+    '        if gender:\n'
+    "            where.append('g.label = %s')\n"
+    '            params.append(gender)\n'
+    '        if pose_type:\n'
+    "            where.append('lower(trim(po.pose_type)) = lower(trim(%s))')\n"
+    '            params.append(pose_type)\n'
+    '        if view_angle:\n'
+    "            where.append('lower(trim(po.view_angle)) = lower(trim(%s))')\n"
+    '            params.append(view_angle)\n'
+    '        if search:\n'
+    "            where.append('(bg.name ILIKE %s OR pk.primary_outfit_name ILIKE %s OR ci.title ILIKE %s)')\n"
+    "            like = f'%{search}%'\n"
+    '            params += [like, like, like]\n'
+    '        params.append(limit)\n'
+    '        cur.execute(f"\\n            SELECT ci.id, ci.title, ci.thumbnail_url, ci.hologram_url, ci.camera_angle, ci.body_visibility,\\n                   pk.primary_outfit_name, po.pose_type, po.view_angle,\\n                   bg.name AS background_name, cat.name AS category_name\\n            FROM catalogue_items ci\\n            JOIN packages pk ON pk.id = ci.package_id\\n            LEFT JOIN poses po ON po.id = ci.pose_id\\n            LEFT JOIN backgrounds bg ON bg.id = pk.background_id\\n            LEFT JOIN categories cat ON cat.id = ci.category_id\\n            LEFT JOIN genders g ON g.id = ci.gender_id\\n            WHERE {\' AND \'.join(where)}\\n            ORDER BY random()\\n            LIMIT %s\\n            ", params)\n'
+    "        cols = ['id', 'title', 'thumbnail_url', 'hologram_url', 'camera_angle', 'body_visibility', 'outfit_name', 'pose_type', 'view_angle', 'background', 'category']\n"
+    '        rows = [dict(zip(cols, row)) for row in cur.fetchall()]\n'
+    '        for row in rows:\n'
+    "            row['id'] = str(row['id'])\n"
+    "            row['prompt'] = style_prompt(row)\n"
+    '        return rows\n'
+    '    finally:\n'
+    '        conn.close()\n'
+    '\n'
+    'def list_ethnicities():\n'
+    '    if not DATABASE_URL:\n'
+    '        return []\n'
+    '    conn = _db()\n'
+    '    try:\n'
+    '        cur = conn.cursor()\n'
+    "        cur.execute('\\n            SELECT DISTINCT e.label FROM models m JOIN ethnicities e ON e.id = m.ethnicity_id\\n            WHERE m.is_active = TRUE ORDER BY e.label\\n            ')\n"
+    '        return [row[0] for row in cur.fetchall()]\n'
+    '    finally:\n'
+    '        conn.close()\n'
+    '\n'
+    'def list_skin_tones():\n'
+    '    if not DATABASE_URL:\n'
+    '        return []\n'
+    '    conn = _db()\n'
+    '    try:\n'
+    '        cur = conn.cursor()\n'
+    "        cur.execute('\\n            SELECT DISTINCT st.label FROM models m JOIN skin_tones st ON st.id = m.skin_tone_id\\n            WHERE m.is_active = TRUE ORDER BY st.label\\n            ')\n"
+    '        return [row[0] for row in cur.fetchall()]\n'
+    '    finally:\n'
+    '        conn.close()\n'
+    '\n'
+    'def list_body_types():\n'
+    '    if not DATABASE_URL:\n'
+    '        return []\n'
+    '    conn = _db()\n'
+    '    try:\n'
+    '        cur = conn.cursor()\n'
+    "        cur.execute('\\n            SELECT DISTINCT bt.label FROM models m JOIN body_types bt ON bt.id = m.body_type_id\\n            WHERE m.is_active = TRUE ORDER BY bt.label\\n            ')\n"
+    '        return [row[0] for row in cur.fetchall()]\n'
+    '    finally:\n'
+    '        conn.close()\n'
+    '\n'
+    'def list_ages():\n'
+    '    if not DATABASE_URL:\n'
+    '        return []\n'
+    '    conn = _db()\n'
+    '    try:\n'
+    '        cur = conn.cursor()\n'
+    "        cur.execute('\\n            SELECT DISTINCT age_min, age_max FROM models\\n            WHERE is_active = TRUE AND age_min IS NOT NULL AND age_max IS NOT NULL\\n            ORDER BY age_min\\n            ')\n"
+    "        return [f'{row[0]}–{row[1]}' for row in cur.fetchall()]\n"
+    '    finally:\n'
+    '        conn.close()\n'
+    '\n'
+    'def list_models(limit=16, ethnicity=None, skin_tone=None, body_type=None, age=None):\n'
+    '    if not DATABASE_URL:\n'
+    '        return []\n'
+    '    conn = _db()\n'
+    '    try:\n'
+    '        cur = conn.cursor()\n'
+    "        where = ['m.is_active = TRUE', 'm.image_url IS NOT NULL']\n"
+    '        params = []\n'
+    '        if ethnicity:\n'
+    "            where.append('e.label = %s')\n"
+    '            params.append(ethnicity)\n'
+    '        if skin_tone:\n'
+    "            where.append('st.label = %s')\n"
+    '            params.append(skin_tone)\n'
+    '        if body_type:\n'
+    "            where.append('bt.label = %s')\n"
+    '            params.append(body_type)\n'
+    "        if age and '–' in age:\n"
+    "            age_min, age_max = age.split('–', 1)\n"
+    '            if age_min.isdigit() and age_max.isdigit():\n'
+    "                where.append('m.age_min = %s AND m.age_max = %s')\n"
+    '                params += [int(age_min), int(age_max)]\n'
+    '        params.append(limit)\n'
+    '        cur.execute(f"\\n            SELECT m.id, m.name, m.image_url, m.angle_image_url,\\n                   e.label AS ethnicity, st.label AS skin_tone, bt.label AS body_type,\\n                   m.age_min, m.age_max\\n            FROM models m\\n            LEFT JOIN ethnicities e ON e.id = m.ethnicity_id\\n            LEFT JOIN skin_tones st ON st.id = m.skin_tone_id\\n            LEFT JOIN body_types bt ON bt.id = m.body_type_id\\n            WHERE {\' AND \'.join(where)}\\n            ORDER BY random()\\n            LIMIT %s\\n            ", params)\n'
+    "        cols = ['id', 'name', 'image_url', 'angle_image_url', 'ethnicity', 'skin_tone', 'body_type', 'age_min', 'age_max']\n"
+    '        rows = [dict(zip(cols, row)) for row in cur.fetchall()]\n'
+    '        for row in rows:\n'
+    "            row['id'] = str(row['id'])\n"
+    '        return rows\n'
+    '    finally:\n'
+    '        conn.close()\n'
+    '\n'
+    'def list_packages(limit=16, category=None, search=None, style_count=None):\n'
+    '    if not DATABASE_URL:\n'
+    '        return []\n'
+    '    conn = _db()\n'
+    '    try:\n'
+    '        cur = conn.cursor()\n'
+    "        where = ['pk.is_active = TRUE', 'pk.cover_image_url IS NOT NULL']\n"
+    '        params = []\n'
+    '        if category:\n'
+    "            where.append('cat.name = %s')\n"
+    '            params.append(category)\n'
+    '        if search:\n'
+    "            where.append('(bg.name ILIKE %s OR pk.primary_outfit_name ILIKE %s)')\n"
+    "            like = f'%{search}%'\n"
+    '            params += [like, like]\n'
+    '        if style_count:\n'
+    "            at_least = style_count.endswith('+')\n"
+    '            n = style_count[:-1] if at_least else style_count\n'
+    '            if n.isdigit():\n'
+    "                op = '>=' if at_least else '='\n"
+    "                where.append(f'(SELECT count(*) FROM catalogue_items ci WHERE ci.package_id = pk.id AND ci.is_active) {op} %s')\n"
+    '                params.append(int(n))\n'
+    '        params.append(limit)\n'
+    '        cur.execute(f"\\n            SELECT pk.id, pk.name, pk.cover_image_url, pk.primary_outfit_name,\\n                   cat.name AS category_name, fm.label AS mood\\n            FROM packages pk\\n            LEFT JOIN categories cat ON cat.id = pk.category_id\\n            LEFT JOIN fashion_moods fm ON fm.id = pk.fashion_mood_id\\n            LEFT JOIN backgrounds bg ON bg.id = pk.background_id\\n            WHERE {\' AND \'.join(where)}\\n            ORDER BY random()\\n            LIMIT %s\\n            ", params)\n'
+    "        cols = ['id', 'name', 'cover_image_url', 'outfit_name', 'category', 'mood']\n"
+    '        rows = [dict(zip(cols, row)) for row in cur.fetchall()]\n'
+    '        for row in rows:\n'
+    "            row['id'] = str(row['id'])\n"
+    "            row['prompt'] = package_prompt(row)\n"
+    '        if rows:\n'
+    "            ids = [row['id'] for row in rows]\n"
+    "            cur.execute('\\n                SELECT package_id, id, title, thumbnail_url, hologram_url, item_count\\n                FROM (\\n                    SELECT ci.package_id, ci.id, ci.title, ci.thumbnail_url, ci.hologram_url,\\n                           row_number() OVER (PARTITION BY ci.package_id ORDER BY ci.sequence_no) AS rn,\\n                           count(*) OVER (PARTITION BY ci.package_id) AS item_count\\n                    FROM catalogue_items ci\\n                    WHERE ci.package_id = ANY(%s::uuid[]) AND ci.is_active AND ci.thumbnail_url IS NOT NULL\\n                ) t\\n                WHERE rn <= 8\\n                ORDER BY package_id, rn\\n                ', (ids,))\n"
+    '            scenes_by_pkg = {}\n'
+    '            count_by_pkg = {}\n'
+    '            for package_id, item_id, title, thumbnail_url, hologram_url, item_count in cur.fetchall():\n'
+    '                package_id = str(package_id)\n'
+    "                scenes_by_pkg.setdefault(package_id, []).append({'id': str(item_id), 'title': title, 'thumbnail_url': thumbnail_url, 'hologram_url': hologram_url})\n"
+    '                count_by_pkg[package_id] = item_count\n'
+    '            for row in rows:\n'
+    "                row['scenes'] = scenes_by_pkg.get(row['id']) or [{'id': row['id'], 'title': row['name'], 'thumbnail_url': row['cover_image_url'], 'hologram_url': None}]\n"
+    "                row['scene_count'] = count_by_pkg.get(row['id'], len(row['scenes']))\n"
+    '        return rows\n'
+    '    finally:\n'
+    '        conn.close()\n'
+    '\n'
+    'def package_prompt(pkg):\n'
+    '    bits = []\n'
+    "    if pkg.get('category'):\n"
+    '        bits.append(f"professional {pkg[\'category\']} fashion photography")\n'
+    "    if pkg.get('outfit_name'):\n"
+    '        bits.append(f"garment styled as: {pkg[\'outfit_name\']}")\n'
+    "    if pkg.get('mood'):\n"
+    '        bits.append(f"{pkg[\'mood\']} mood")\n'
+    "    bits.append('studio-quality lighting, sharp focus, realistic fabric texture')\n"
+    "    return 'Put this exact garment on a fashion model. ' + ', '.join(bits) + '.'\n"
+    '\n'
+    'def style_prompt(style):\n'
+    '    bits = []\n'
+    "    if style.get('category'):\n"
+    '        bits.append(f"professional {style[\'category\']} fashion photography")\n'
+    "    if style.get('outfit_name'):\n"
+    '        bits.append(f"garment styled as: {style[\'outfit_name\']}")\n'
+    "    if style.get('pose_type'):\n"
+    "        pose = style['pose_type']\n"
+    "        if style.get('view_angle'):\n"
+    '            pose = f"{style[\'view_angle\']} {pose}"\n'
+    '        bits.append(pose)\n'
+    "    if style.get('camera_angle'):\n"
+    '        bits.append(f"{style[\'camera_angle\']} camera angle")\n'
+    "    if style.get('body_visibility'):\n"
+    '        bits.append(f"{style[\'body_visibility\']} shot")\n'
+    "    if style.get('background'):\n"
+    '        bits.append(f"set against {style[\'background\']}")\n'
+    "    bits.append('studio-quality lighting, sharp focus, realistic fabric texture')\n"
+    "    return 'Put this exact garment on a fashion model. ' + ', '.join(bits) + '.'\n"
+    '_FASHION_TRYON_BODY = "GOLDEN RULE: BINARY VISIBILITY MASK\\nThe mannequin is a strict binary visibility mask. Replace ONLY pixels occupied by the mannequin. Never expand the mask. Never generate outside the mannequin\'s crop boundaries. If a body part is cropped in the mannequin, it remains cropped.\\n\\nREFERENCE AUTHORITY (STRICT ISOLATION)\\n• MANNEQUIN_REF: Absolute authority for pose, skeleton, camera, crop, framing, lighting, shadows, environment, accessory paths, and footwear contact. Contains ZERO clothing/face data.\\n• CLOTHING_REF: Absolute authority for garment identity, construction, structural topology, material properties and commercial product specification. Contains ZERO pose, body or camera data.{face_ref_authority}\\n\\nREFERENCE COMPLETENESS\\nUse only information explicitly visible in each reference.\\nWhen information is not visible, reconstruct conservatively from visible structural evidence without redesigning or inventing new product features.\\n\\nHARD CONSTRAINTS & SOFT PREFERENCES\\nHARD CONSTRAINTS (Must Never Change):\\n• Visibility mask and crop boundaries\\n• Pose, skeleton, and camera geometry\\n• Face identity and hairstyle identity\\n• Garment identity and material identity\\n• Accessory geometry and paths\\n\\nSOFT PREFERENCES (Optimize When Possible):\\n• Photographic realism and lighting consistency\\n• Fabric wrinkles, folds, and drape\\n• Facial expression and eye gaze\\n• Hair strand physics and movement\\n• Soft tissue and skin deformation\\n\\nCONFLICT HIERARCHY\\n1. Visibility Mask & Canvas (Absolute)\\n2. Pose, Skeleton & Camera (Immutable structural base)\\n3. Garment & Face Identity (Identity Preservation)\\n4. Photorealistic Rendering (Execution)\\n\\nFAILURE POLICY\\nIf all constraints cannot be satisfied simultaneously, preserve every hard constraint.\\nNever invent new content to resolve ambiguity.\\nPrefer an incomplete but faithful reconstruction over an incorrect reconstruction.\\nDo not redesign, approximate, beautify, or hallucinate missing information.\\nWhen uncertainty exists, preserve product identity and structural consistency rather than inventing missing garment details.\\n\\nPOSE OVERRIDES GARMENT\\nIf preserving garment appearance requires changing pose, skeleton, camera, or framing, DO NOT modify the body.\\nAlways adapt the garment to the locked pose.\\nNever adapt the pose to the garment.\\n\\nPOSE, SKELETON & CAMERA LOCK\\n• Skeleton: Immutable. Faithfully preserve exact joint angles, limb states, weight distribution, and asymmetry. Do not relax, beautify, or auto-correct.\\n• Hands & Contact: Faithfully preserve exact gesture, finger curl, and physical contact points. No new or removed contacts.\\n• Camera: Camera geometry is immutable. Maintain identical viewpoint, perspective, focal length, framing, crop, and aspect ratio.\\n\\nVISIBILITY & OCCLUSION\\n• Mask Rule: Visible anatomy comes ONLY from MANNEQUIN_REF. Never reveal hidden surfaces or complete cropped regions.\\n• Occlusion: Exact foreground/background relationships maintained.\\n\\nGARMENT IDENTITY\\nTreat CLOTHING_REF as the canonical product specification rather than a worn garment\\nInfer garment construction only from visible evidence contained in CLOTHING_REF.\\nReconstruct the same garment as if professionally worn on the reconstructed body without altering its identity.\\nFaithfully preserve the original garment identity, including:\\n• garment category, construction, neckline, sleeve length\\n• embroidery geometry, placement, border geometry, print layout\\n• fabric type, micro-texture, weave pattern, embroidery density, printed motifs, trims, borders, surface finish and material appearance.\\nDo not redesign, reinterpret, or approximate the product.\\nPreserve the commercial product exactly; only physically plausible deformation caused by dressing and the locked pose is permitted.\\n\\nIDENTITY CONTINUITY\\nAll visible garment regions must remain mutually consistent as parts of the same commercial product.\\nConstruction, proportions, materials, decorative elements and finishing details must remain coherent across the entire garment.\\n\\nGARMENT DRESSING\\nReconstruct the complete human anatomy from MANNEQUIN_REF before applying the garment.\\nDress the reconstructed body with the garment defined by CLOTHING_REF.\\nDetermine the correct wearing configuration from the garment construction, structural design and fastening system.\\nBody anatomy defines garment deformation.\\nGenerate physically realistic wrapping, layering, fastening, tension, compression, folds and drape created only by body anatomy, gravity, material properties and the locked pose.\\nDo not copy fold patterns from CLOTHING_REF.\\nGenerate new folds from physical interaction while preserving product identity.\\n\\nGARMENT TOPOLOGY\\nPreserve the relative spatial arrangement and proportions of all structural garment components.\\nNecklines, waistlines, shoulder seams, sleeve attachments, borders, hems, pleats, panels, lapels, collars, cuffs and structural elements must remain in their correct anatomical positions.\\nDo not shift, rotate, resize or proportionally alter structural garment components.\\n\\nBODY–GARMENT COUPLING\\nThe garment must appear physically worn rather than overlaid.\\nMaintain continuous body contact where naturally expected.\\nFabric deformation must arise only from body anatomy, contact, gravity, material properties and the locked pose.\\nAvoid floating fabric or detached garment regions.\\nMaterial appearance should respond naturally to the locked scene lighting while preserving original fabric characteristics.\\n\\nSTRUCTURAL STABILITY\\nPreserve the structural integrity of the garment.\\nSeams, attachment points, closures, waistlines, necklines, cuffs, collars and other structural components must remain mechanically consistent under deformation.\\nOnly physically plausible deformation is permitted.\\n\\nFACE & HAIR ADAPTATION\\n• Face: Identity is immutable. Do not copy the reference expression. Generate a natural expression from the combined influence of body language, head orientation, garment style, environment, lighting, camera distance and commercial fashion intent. Expressions should appear naturally emerging from the interaction between the model, photographer, garment and environment, rather than looking artificially posed or emotionally empty. Preserve natural facial asymmetry, subtle facial muscle activation, dimples, smile lines, crow\'s feet, nasolabial folds and other genuine micro-expressions when naturally produced by the scene or expression.\\n• Hair: Identity (haircut, length, density, texture and color) is immutable. Hair strands are adaptive. Preserve hairstyle identity while naturally responding to gravity, body movement, shoulder contact and airflow. Hair must emerge naturally from the scalp with realistic volume and strand continuity.\\n\\nEYE BEHAVIOR\\nEyes should exhibit realistic human behavior with natural focus, subtle eyelid asymmetry, appropriate catchlights, gaze stability, gentle squinting under bright sunlight and relaxed ocular muscles. Avoid frozen staring or perfectly symmetrical eyes.\\n\\nSKIN REALISM\\nPreserve natural skin characteristics including fine pores, subtle wrinkles, gentle skin compression, lip texture, realistic translucency, slight color variation and natural specular highlights appropriate to the lighting.\\n\\nACCESSORY & ENVIRONMENT LOCK\\n• Accessories: Rigid geometry. Faithfully preserve exact dimensions, strap paths, and occlusion. Do not reroute straps or float bags.\\n• Environment: Static. Lighting, shadows, and background remain spatially identical to MANNEQUIN_REF.\\n\\nCONSISTENCY PRINCIPLE\\nAll reconstructed elements must remain mutually consistent.\\nFace, body, clothing, lighting, shadows, perspective, and material response must appear to belong to a single photograph captured at one moment in time.\\nAll reconstructed elements must share one physically coherent three-dimensional world space.\\n\\nHUMAN REALISM\\nProduce an authentic commercial fashion photograph with consistent lighting, perspective, material response and photographic realism.\\nPreserve natural human asymmetry, realistic skin and authentic fabric imperfections.\\nAvoid synthetic, over-processed or digitally illustrated appearance.\\n\\nNEGATIVE CONSTRAINTS\\nDo not violate:\\n• visibility\\n• pose\\n• camera\\n• garment identity\\n• face identity\\n• material identity\\n• accessory geometry\\n\\nAvoid:\\n• AI artifacts\\n• plastic skin\\n• floating objects\\n• unrealistic fabric physics\\n• incorrect garment construction\\n• geometry distortion\\n• artificial symmetry\\n\\nINPUT ORDER (this request):\\n{input_order}\\nGenerate exactly one final fashion photograph."\n'
+    '\n'
+    'def fashion_tryon_prompt(has_model):\n'
+    '    if has_model:\n'
+    "        core_objective = 'CORE OBJECTIVE\\nCreate one physically plausible commercial fashion photograph by replacing the mannequin with the real person from FACE_REF while faithfully preserving the garment identity from CLOTHING_REF and the complete body pose from MANNEQUIN_REF.\\nThis is a constrained reconstruction task, not creative image synthesis.'\n"
+    "        face_ref_authority = '\\n• FACE_REF: Absolute authority for facial identity, skin, hair, and person appearance from the model character/angle reference. Contains ZERO body pose data — pose always comes from MANNEQUIN_REF.'\n"
+    "        input_order = '1) CLOTHING_REF image(s) — garment packshot(s)\\n2) MANNEQUIN_REF image — hologram / pose mannequin\\n3) FACE_REF image — model character / angle reference (identity)'\n"
+    '    else:\n'
+    "        core_objective = 'CORE OBJECTIVE\\nCreate one physically plausible commercial fashion photograph by rendering a professional fashion model wearing the garment from CLOTHING_REF, in the exact body pose, camera framing and scene established by MANNEQUIN_REF.\\nThis is a constrained reconstruction task, not creative image synthesis.'\n"
+    "        face_ref_authority = ''\n"
+    "        input_order = '1) CLOTHING_REF image(s) — garment packshot(s)\\n2) MANNEQUIN_REF image — hologram / pose mannequin'\n"
+    "    return core_objective + '\\n\\n' + _FASHION_TRYON_BODY.format(face_ref_authority=face_ref_authority, input_order=input_order)\n"
+    '\n'
+    'def download_remote_image(url, dest_dir):\n'
+    '    import hashlib\n'
+    '    import urllib.request\n'
+    "    ext = Path(url.split('?')[0]).suffix or '.webp'\n"
+    '    dest_dir = Path(dest_dir)\n'
+    '    dest_dir.mkdir(parents=True, exist_ok=True)\n'
+    "    dest = dest_dir / f'ref-{hashlib.sha1(url.encode()).hexdigest()[:20]}{ext}'\n"
+    '    if dest.exists() and dest.stat().st_size > 0:\n'
+    '        return str(dest)\n'
+    "    req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})\n"
+    '    with urllib.request.urlopen(req, timeout=20) as resp:\n'
+    '        dest.write_bytes(resp.read())\n'
+    '    return str(dest)\n'
+    '\n'
+    'def list_generations(user_id, limit=30):\n'
+    '    if not configured() or not user_id:\n'
+    '        return []\n'
+    '    conn = _db()\n'
+    '    try:\n'
+    '        cur = conn.cursor()\n'
+    '        cur.execute("\\n            SELECT id, prompt, params, output_url,\\n                   EXTRACT(EPOCH FROM created_at) AS created_at\\n            FROM image_generations\\n            WHERE user_id = %s AND status = \'done\' AND output_url IS NOT NULL\\n            ORDER BY created_at DESC\\n            LIMIT %s\\n            ", (user_id, limit))\n'
+    '        rows = cur.fetchall()\n'
+    '    finally:\n'
+    '        conn.close()\n'
+    '    out = []\n'
+    '    for gen_id, prompt_text, params, output_url, created_at in rows:\n'
+    '        p = params if isinstance(params, dict) else {}\n'
+    "        garment_images = p.get('garmentImages') or []\n"
+    "        out.append({'id': str(gen_id), 'output_url': output_url, 'prompt': prompt_text, 'created_at': float(created_at) if created_at is not None else None, 'garment_name': p.get('garmentName'), 'model_name': p.get('modelName'), 'style_name': p.get('styleName'), 'garment_image': (garment_images[0] if garment_images else None) or p.get('garmentImage'), 'model_image': p.get('modelImage'), 'style_image': p.get('styleImage'), 'source': p.get('source')})\n"
+    '    return out\n'
+    '\n'
+    'def push_generation(image_path, prompt, user_id=None, params=None, gen_id=None, webp_path=None, force=False):\n'
+    '    if not configured():\n'
+    "        raise RuntimeError('fashion-studio push not configured — check backend/.env (R2_*, DATABASE_URL)')\n"
+    '    target_user_id = user_id or FASHION_STUDIO_USER_ID\n'
+    '    if not target_user_id:\n'
+    "        raise RuntimeError('no fashion-studio account linked — sign in with Google (Step 0) first, or set FASHION_STUDIO_USER_ID in backend/.env as a fallback')\n"
+    "    ext = Path(image_path).suffix.lstrip('.').lower() or 'png'\n"
+    "    if ext == 'jpeg':\n"
+    "        ext = 'jpg'\n"
+    "    content_type = mimetypes.guess_type(image_path)[0] or 'image/png'\n"
+    '    gen_id = gen_id or str(uuid.uuid4())\n'
+    "    key = f'generations/{target_user_id}/{gen_id}.{ext}'\n"
+    "    with open(image_path, 'rb') as f:\n"
+    '        data = f.read()\n'
+    "    _r2_client().put_object(Bucket=R2_BUCKET_NAME, Key=key, Body=data, ContentType=content_type, CacheControl='public, max-age=31536000, immutable')\n"
+    "    output_url = f'{R2_PUBLIC_URL}/{key}'\n"
+    '    webp_url = None\n'
+    '    if webp_path and os.path.exists(webp_path):\n'
+    "        webp_key = f'generations/{target_user_id}/{gen_id}.webp'\n"
+    "        with open(webp_path, 'rb') as f:\n"
+    '            webp_data = f.read()\n'
+    "        _r2_client().put_object(Bucket=R2_BUCKET_NAME, Key=webp_key, Body=webp_data, ContentType='image/webp', CacheControl='public, max-age=31536000, immutable')\n"
+    "        webp_url = f'{R2_PUBLIC_URL}/{webp_key}'\n"
+    "    params_json = json.dumps({'source': 'gemini-automation', **{k: v for k, v in (params or {}).items() if v}})\n"
+    '    conn = db.borrow()\n'
+    '    try:\n'
+    '        cur = conn.cursor()\n'
+    '        try:\n'
+    '            if force:\n'
+    '                cur.execute("\\n                    INSERT INTO image_generations\\n                        (id, user_id, prompt, params, is_free, credits_cost, status,\\n                         output_url, webp_url, started_at, completed_at)\\n                    VALUES (%s, %s, %s, %s, TRUE, 0, \'done\', %s, %s, now(), now())\\n                    ON CONFLICT (id) DO UPDATE SET\\n                        status = \'done\', output_url = EXCLUDED.output_url,\\n                        webp_url = EXCLUDED.webp_url, completed_at = now()\\n                    ", (gen_id, target_user_id, prompt, params_json, output_url, webp_url))\n'
+    '            else:\n'
+    '                cur.execute("\\n                    UPDATE image_generations\\n                    SET status = \'done\', output_url = %s, webp_url = %s, completed_at = now()\\n                    WHERE id = %s AND status = \'processing\'\\n                    ", (output_url, webp_url, gen_id))\n'
+    '                if cur.rowcount == 0:\n'
+    '                    cur.execute("\\n                        INSERT INTO image_generations\\n                            (id, user_id, prompt, params, is_free, credits_cost, status,\\n                             output_url, webp_url, started_at, completed_at)\\n                        VALUES (%s, %s, %s, %s, TRUE, 0, \'done\', %s, %s, now(), now())\\n                        ON CONFLICT (id) DO NOTHING\\n                        ", (gen_id, target_user_id, prompt, params_json, output_url, webp_url))\n'
+    '        except psycopg2.errors.UndefinedColumn:\n'
+    '            conn.rollback()\n'
+    '            cur = conn.cursor()\n'
+    '            if force:\n'
+    '                cur.execute("\\n                    INSERT INTO image_generations\\n                        (id, user_id, prompt, params, is_free, credits_cost, status,\\n                         output_url, started_at, completed_at)\\n                    VALUES (%s, %s, %s, %s, TRUE, 0, \'done\', %s, now(), now())\\n                    ON CONFLICT (id) DO UPDATE SET\\n                        status = \'done\', output_url = EXCLUDED.output_url, completed_at = now()\\n                    ", (gen_id, target_user_id, prompt, params_json, output_url))\n'
+    '            else:\n'
+    '                cur.execute("\\n                    UPDATE image_generations\\n                    SET status = \'done\', output_url = %s, completed_at = now()\\n                    WHERE id = %s AND status = \'processing\'\\n                    ", (output_url, gen_id))\n'
+    '                if cur.rowcount == 0:\n'
+    '                    cur.execute("\\n                        INSERT INTO image_generations\\n                            (id, user_id, prompt, params, is_free, credits_cost, status,\\n                             output_url, started_at, completed_at)\\n                        VALUES (%s, %s, %s, %s, TRUE, 0, \'done\', %s, now(), now())\\n                        ON CONFLICT (id) DO NOTHING\\n                        ", (gen_id, target_user_id, prompt, params_json, output_url))\n'
+    '        conn.commit()\n'
+    '    finally:\n'
+    '        conn.close()\n'
+    "    return {'output_url': output_url, 'webp_url': webp_url}"
+), 'D:\\Project\\gemini-automation-main\\gemini-automation-main\\backend\\fashion_studio.py', 'exec'), _mod_fashion_studio.__dict__)
+print("fashion_studio module registered.")
+
+
+
+# ----------------------------------------------------------------------------
+# 4. Write gemini_login.py / gemini_generate.py to disk
+# ----------------------------------------------------------------------------
+from pathlib import Path
+_BUNDLE_DIR = Path("/content/queue_worker_bundle")
+_BUNDLE_DIR.mkdir(parents=True, exist_ok=True)
+(_BUNDLE_DIR / 'gemini_login.py').write_text((
+    'import argparse\n'
+    'import base64\n'
+    'import json\n'
+    'import os\n'
+    'import pickle\n'
+    'import platform\n'
+    'import re\n'
+    'import shutil\n'
+    'import subprocess\n'
+    'import sys\n'
+    'import threading\n'
+    'import time\n'
+    'from pathlib import Path\n'
+    "EMBEDDED_COOKIES_B64 = globals().get('EMBEDDED_COOKIES_B64')\n"
+    "EMBEDDED_CHROME_PROFILE_REMOTE = globals().get('EMBEDDED_CHROME_PROFILE_REMOTE')\n"
+    '\n'
+    'def run_cmd(cmd, timeout=120):\n'
+    '    try:\n'
+    '        return subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)\n'
+    '    except Exception:\n'
+    '        return None\n'
+    '\n'
+    'def is_colab():\n'
+    '    try:\n'
+    '        import google.colab\n'
+    '        return True\n'
+    '    except ImportError:\n'
+    '        return False\n'
+    '\n'
+    'class Status:\n'
+    '\n'
+    '    def __init__(self, path):\n'
+    '        self.path = path\n'
+    '        self.lock = threading.Lock()\n'
+    '        self.start_time = time.time()\n'
+    "        self.data = {'phase': 'starting', 'message': '', 'mode': None, 'vnc_url': None, 'cookies_file': None, 'elapsed_s': 0, 'finished': False, 'error': None, 'log': []}\n"
+    '        self.flush(force=True)\n'
+    '\n'
+    '    def update(self, **kwargs):\n'
+    '        with self.lock:\n'
+    '            self.data.update(kwargs)\n'
+    "            self.data['elapsed_s'] = round(time.time() - self.start_time, 1)\n"
+    "            msg = kwargs.get('message')\n"
+    '            if msg:\n'
+    "                phase = self.data.get('phase')\n"
+    "                last = self.data['log'][-1] if self.data['log'] else None\n"
+    "                if not last or last.get('phase') != phase or last.get('message') != msg:\n"
+    "                    self.data['log'].append({'phase': phase, 'message': msg, 't': self.data['elapsed_s']})\n"
+    '            snapshot = dict(self.data)\n'
+    '        self.flush(snapshot=snapshot, force=True)\n'
+    '        print(f"[{snapshot[\'phase\']}] {snapshot.get(\'message\', \'\')}", flush=True)\n'
+    '\n'
+    '    def flush(self, snapshot=None, force=False):\n'
+    '        with self.lock:\n'
+    '            snapshot = snapshot or dict(self.data)\n'
+    "        tmp = self.path + '.tmp'\n"
+    "        with open(tmp, 'w', encoding='utf-8') as f:\n"
+    '            json.dump(snapshot, f)\n'
+    '        os.replace(tmp, self.path)\n'
+    '\n'
+    'def ensure_deps(status, headless):\n'
+    "    status.update(phase='installing', message='Checking Chrome + Selenium deps...')\n"
+    '    try:\n'
+    '        import selenium\n'
+    '        import undetected_chromedriver\n'
+    '    except ImportError:\n'
+    "        run_cmd(f'{sys.executable} -m pip install -q selenium undetected-chromedriver webdriver-manager setuptools', timeout=180)\n"
+    '        if headless:\n'
+    "            run_cmd(f'{sys.executable} -m pip install -q pyvirtualdisplay', timeout=60)\n"
+    '    chrome_bin = find_chrome()\n'
+    '    if not chrome_bin:\n'
+    '        if headless:\n'
+    "            os.environ['DEBIAN_FRONTEND'] = 'noninteractive'\n"
+    "            run_cmd('apt-get update -y', timeout=60)\n"
+    "            run_cmd('apt-get install -y wget xvfb x11vnc novnc websockify unzip xclip curl dbus-x11', timeout=180)\n"
+    "            run_cmd('wget -q -O /tmp/chrome.deb https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb', timeout=90)\n"
+    "            run_cmd('dpkg -i /tmp/chrome.deb', timeout=60)\n"
+    "            run_cmd('apt-get install -f -y', timeout=90)\n"
+    '            chrome_bin = find_chrome()\n'
+    '        if not chrome_bin:\n'
+    "            raise RuntimeError('Google Chrome not found. On macOS, install it from https://www.google.com/chrome/ first — headless auto-install is Linux/Colab-only (uses apt).')\n"
+    '    return chrome_bin\n'
+    '\n'
+    'def find_chrome():\n'
+    "    candidates = ['/usr/bin/google-chrome-stable', '/usr/bin/google-chrome', '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome', 'C:\\\\Program Files\\\\Google\\\\Chrome\\\\Application\\\\chrome.exe', 'C:\\\\Program Files (x86)\\\\Google\\\\Chrome\\\\Application\\\\chrome.exe', os.path.expandvars('%LOCALAPPDATA%\\\\Google\\\\Chrome\\\\Application\\\\chrome.exe')]\n"
+    '    for path in candidates:\n'
+    '        if os.path.exists(path):\n'
+    '            return path\n'
+    "    for name in ('google-chrome-stable', 'google-chrome', 'chrome', 'chromium', 'chrome.exe'):\n"
+    '        found = shutil.which(name)\n'
+    '        if found:\n'
+    '            return found\n'
+    '    return None\n'
+    '\n'
+    'def start_display_and_vnc(status, screen_w=1920, screen_h=1080, vnc_port=5900, novnc_port=6080):\n'
+    "    if platform.system() != 'Linux':\n"
+    "        raise RuntimeError(f'Headless mode (Xvfb/x11vnc/noVNC) needs Linux/apt — this is {platform.system()}. Use --mode local on a Mac instead: Chrome opens as a real, visible window and no virtual display is needed.')\n"
+    "    status.update(phase='waiting_display', message='Starting virtual display + noVNC...')\n"
+    '    from pyvirtualdisplay import Display\n'
+    '    disp_obj = Display(visible=0, size=(screen_w, screen_h))\n'
+    '    disp_obj.start()\n'
+    '    os.environ[\'DISPLAY\'] = f":{getattr(disp_obj, \'display\', 99)}"\n'
+    "    run_cmd('pkill -f x11vnc', timeout=5)\n"
+    "    run_cmd('pkill -f websockify', timeout=5)\n"
+    '    time.sleep(0.5)\n'
+    "    subprocess.Popen(['x11vnc', '-display', os.environ['DISPLAY'], '-forever', '-nopw', '-shared', '-quiet', '-rfbport', str(vnc_port)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
+    '    time.sleep(1.5)\n'
+    '    web_dir = None\n'
+    "    for p in ('/usr/share/novnc', '/usr/share/noVNC'):\n"
+    "        if os.path.isfile(os.path.join(p, 'vnc.html')):\n"
+    '            web_dir = p\n'
+    '            break\n'
+    "    cmd = ['websockify', '--web', web_dir, str(novnc_port), f'localhost:{vnc_port}'] if web_dir else ['websockify', str(novnc_port), f'localhost:{vnc_port}']\n"
+    '    subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n'
+    '    time.sleep(1.5)\n'
+    "    cf_path = '/usr/local/bin/cloudflared'\n"
+    '    if not os.path.exists(cf_path):\n'
+    "        run_cmd(f'wget -q -O {cf_path} https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64', timeout=90)\n"
+    "        run_cmd(f'chmod +x {cf_path}', timeout=5)\n"
+    '    if os.path.exists(cf_path):\n'
+    "        proc = subprocess.Popen([cf_path, 'tunnel', '--url', f'http://localhost:{novnc_port}'], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)\n"
+    '        deadline = time.time() + 20\n'
+    '        while time.time() < deadline:\n'
+    '            line = proc.stdout.readline()\n'
+    '            if not line:\n'
+    '                continue\n'
+    "            m = re.search('https://[a-z0-9\\\\-]+\\\\.trycloudflare\\\\.com', line)\n"
+    '            if m:\n'
+    "                url = f'{m.group(0)}/vnc.html?autoconnect=true&resize=scale'\n"
+    '                return url\n'
+    "    return f'http://localhost:{novnc_port}/vnc.html'\n"
+    '\n'
+    'def _make_plain_selenium_driver(chrome_bin, screen_w, screen_h, prefs, profile_dir=None):\n'
+    '    from selenium import webdriver\n'
+    '    from selenium.webdriver.chrome.service import Service\n'
+    '    from selenium.webdriver.chrome.options import Options\n'
+    '    from webdriver_manager.chrome import ChromeDriverManager\n'
+    '    opts = Options()\n'
+    '    opts.binary_location = chrome_bin\n'
+    "    opts.add_argument(f'--window-size={screen_w},{screen_h}')\n"
+    "    opts.add_argument('--start-maximized')\n"
+    "    opts.add_argument('--lang=en-US,en')\n"
+    "    opts.add_argument('--disable-blink-features=AutomationControlled')\n"
+    "    opts.add_argument('--no-sandbox')\n"
+    "    opts.add_argument('--disable-dev-shm-usage')\n"
+    "    opts.add_experimental_option('excludeSwitches', ['enable-automation'])\n"
+    "    opts.add_experimental_option('useAutomationExtension', False)\n"
+    '    if profile_dir:\n'
+    "        opts.add_argument(f'--user-data-dir={profile_dir}')\n"
+    "        opts.add_argument('--profile-directory=Default')\n"
+    '    if prefs:\n'
+    "        opts.add_experimental_option('prefs', prefs)\n"
+    '    svc = Service(ChromeDriverManager().install())\n'
+    '    d = webdriver.Chrome(service=svc, options=opts)\n'
+    '    d.execute_script("Object.defineProperty(navigator,\'webdriver\',{get:()=>undefined})")\n'
+    '    return d\n'
+    '\n'
+    'def make_driver(chrome_bin, screen_w=1920, screen_h=1080, download_dir=None, profile_dir=None):\n'
+    '    try:\n'
+    '        from selenium.webdriver.remote.remote_connection import RemoteConnection\n'
+    '        RemoteConnection.set_timeout(120)\n'
+    '    except Exception:\n'
+    '        pass\n'
+    '    prefs = None\n'
+    '    if download_dir:\n'
+    "        prefs = {'download.default_directory': os.path.abspath(download_dir), 'download.prompt_for_download': False, 'download.directory_upgrade': True, 'safebrowsing.enabled': True}\n"
+    '    d = None\n'
+    '    try:\n'
+    '        import undetected_chromedriver as uc\n'
+    '        from webdriver_manager.chrome import ChromeDriverManager\n'
+    '        driver_path = ChromeDriverManager().install()\n'
+    '        opts = uc.ChromeOptions()\n'
+    '        opts.binary_location = chrome_bin\n'
+    "        opts.add_argument(f'--window-size={screen_w},{screen_h}')\n"
+    "        opts.add_argument('--lang=en-US,en')\n"
+    "        opts.add_argument('--no-sandbox')\n"
+    "        opts.add_argument('--disable-dev-shm-usage')\n"
+    '        if profile_dir:\n'
+    "            opts.add_argument(f'--user-data-dir={profile_dir}')\n"
+    "            opts.add_argument('--profile-directory=Default')\n"
+    '        if prefs:\n'
+    "            opts.add_experimental_option('prefs', prefs)\n"
+    '        d = uc.Chrome(options=opts, driver_executable_path=driver_path, use_subprocess=True)\n'
+    "        d.get('about:blank')\n"
+    "        print('[make_driver] using undetected-chromedriver', flush=True)\n"
+    '    except Exception as e:\n'
+    "        print(f'[make_driver] undetected-chromedriver failed ({e!r}), falling back to plain Selenium', flush=True)\n"
+    '        try:\n'
+    '            if d is not None:\n'
+    '                d.quit()\n'
+    '        except Exception:\n'
+    '            pass\n'
+    '        d = _make_plain_selenium_driver(chrome_bin, screen_w, screen_h, prefs, profile_dir)\n'
+    '    d.set_page_load_timeout(60)\n'
+    '    d.implicitly_wait(3)\n'
+    '    return d\n'
+    '\n'
+    'def save_cookies(drv, cookies_file):\n'
+    '    Path(cookies_file).parent.mkdir(parents=True, exist_ok=True)\n'
+    "    with open(cookies_file, 'wb') as f:\n"
+    '        pickle.dump(drv.get_cookies(), f)\n'
+    '\n'
+    'def load_cookies(drv, cookies_file):\n'
+    '    if not os.path.exists(cookies_file):\n'
+    '        return False\n'
+    '    try:\n'
+    "        with open(cookies_file, 'rb') as f:\n"
+    '            cookies = pickle.load(f)\n'
+    "        drv.get('https://www.google.com')\n"
+    '        time.sleep(0.5)\n'
+    '        for c in cookies:\n'
+    '            try:\n'
+    '                drv.add_cookie(c)\n'
+    '            except Exception:\n'
+    '                pass\n'
+    '        return True\n'
+    '    except Exception:\n'
+    '        return False\n'
+    "_PROFILE_SKIP_DIRS = {'cache', 'code cache', 'gpucache', 'shadercache', 'grshadercache', 'dawncache', 'blob_storage', 'file system', 'cachestorage', 'component_crx_cache', 'safe browsing', 'webrtc_event_logs', 'optimization_guide_prediction_models'}\n"
+    '\n'
+    'def restore_chrome_profile(profile_dir, embedded_remote_path):\n'
+    '    if not embedded_remote_path or not os.path.exists(embedded_remote_path):\n'
+    '        return False\n'
+    '    try:\n'
+    '        if os.path.isdir(profile_dir) and os.listdir(profile_dir):\n'
+    '            return False\n'
+    '        os.makedirs(profile_dir, exist_ok=True)\n'
+    "        shutil.unpack_archive(embedded_remote_path, profile_dir, format='zip')\n"
+    '        return True\n'
+    '    except Exception:\n'
+    '        return False\n'
+    '\n'
+    'def save_chrome_profile(profile_dir, archive_out_path):\n'
+    '    if not profile_dir or not os.path.isdir(profile_dir):\n'
+    '        return False\n'
+    '    try:\n'
+    '        import zipfile\n'
+    '        Path(archive_out_path).parent.mkdir(parents=True, exist_ok=True)\n'
+    "        tmp_path = str(archive_out_path) + '.tmp'\n"
+    "        with zipfile.ZipFile(tmp_path, 'w', zipfile.ZIP_DEFLATED) as zf:\n"
+    '            for root, dirs, files in os.walk(profile_dir):\n'
+    '                dirs[:] = [d for d in dirs if d.lower() not in _PROFILE_SKIP_DIRS]\n'
+    '                for fname in files:\n'
+    '                    fpath = os.path.join(root, fname)\n'
+    '                    try:\n'
+    '                        zf.write(fpath, os.path.relpath(fpath, profile_dir))\n'
+    '                    except Exception:\n'
+    '                        continue\n'
+    '        os.replace(tmp_path, archive_out_path)\n'
+    '        return True\n'
+    '    except Exception:\n'
+    '        return False\n'
+    '\n'
+    'def is_logged_in(drv):\n'
+    '    try:\n'
+    "        drv.get('https://myaccount.google.com/')\n"
+    '        time.sleep(1.5)\n'
+    '        url = drv.current_url\n'
+    "        return 'myaccount.google.com' in url and 'signin' not in url\n"
+    '    except Exception:\n'
+    '        return False\n'
+    "_GOOGLE_SESSION_COOKIE_NAMES = {'SID', 'HSID', 'SSID', '__Secure-1PSID', '__Secure-3PSID'}\n"
+    '\n'
+    'def has_google_session_cookie(drv):\n'
+    '    try:\n'
+    "        names = {c.get('name') for c in drv.get_cookies()}\n"
+    '        return bool(names & _GOOGLE_SESSION_COOKIE_NAMES)\n'
+    '    except Exception:\n'
+    '        return False\n'
+    '\n'
+    'def _activity_click_menu_item(drv, texts):\n'
+    '    from selenium.webdriver.common.by import By\n'
+    '    texts_l = [t.lower() for t in texts]\n'
+    '    try:\n'
+    '        for el in drv.find_elements(By.CSS_SELECTOR, "button, [role=\'menuitem\'], [role=\'menuitemcheckbox\']"):\n'
+    '            try:\n'
+    '                if not el.is_displayed():\n'
+    '                    continue\n'
+    "                label = (el.text or el.get_attribute('aria-label') or '').strip().lower()\n"
+    '                if label and any((t in label for t in texts_l)):\n'
+    "                    drv.execute_script('arguments[0].click();', el)\n"
+    '                    time.sleep(0.5)\n'
+    '                    return True\n'
+    '            except Exception:\n'
+    '                continue\n'
+    '    except Exception:\n'
+    '        pass\n'
+    '    return False\n'
+    '\n'
+    'def turn_off_gemini_activity(drv, status):\n'
+    '    from selenium.webdriver.common.by import By\n'
+    '    from selenium.webdriver.support.ui import WebDriverWait\n'
+    '    try:\n'
+    "        status.update(message='Checking Gemini Activity setting...')\n"
+    "        drv.get('https://myactivity.google.com/product/gemini')\n"
+    "        WebDriverWait(drv, 20).until(lambda d: d.execute_script('return document.readyState') == 'complete')\n"
+    '        time.sleep(3)\n'
+    '        toggle = None\n'
+    '        for el in drv.find_elements(By.CSS_SELECTOR, "[role=\'switch\']"):\n'
+    '            if el.is_displayed():\n'
+    '                toggle = el\n'
+    '                break\n'
+    '        if not toggle:\n'
+    '            for el in drv.find_elements(By.XPATH, "//button[contains(@aria-label,\'activity\') or contains(@aria-label,\'Keep activity\')]"):\n'
+    '                if el.is_displayed():\n'
+    '                    toggle = el\n'
+    '                    break\n'
+    '        if not toggle:\n'
+    '            return False\n'
+    '        drv.execute_script("arguments[0].scrollIntoView({block:\'center\'});", toggle)\n'
+    '        time.sleep(0.5)\n'
+    '        try:\n'
+    '            toggle.click()\n'
+    '        except Exception:\n'
+    "            drv.execute_script('arguments[0].click();', toggle)\n"
+    '        time.sleep(1.5)\n'
+    "        if not _activity_click_menu_item(drv, ['turn off']):\n"
+    '            return False\n'
+    '        time.sleep(1.5)\n'
+    "        _activity_click_menu_item(drv, ['got it', 'pause', 'confirm', 'ok'])\n"
+    "        status.update(message='Gemini Activity turned off.')\n"
+    '        return True\n'
+    '    except Exception:\n'
+    '        return False\n'
+    '\n'
+    'def handle_login(drv, status, cookies_file, login_timeout, mark_finished=True, profile_dir=None, profile_archive_out=None):\n'
+    "    status.update(phase='checking_cookies', message='Checking for saved cookies...')\n"
+    '    if load_cookies(drv, cookies_file):\n'
+    '        drv.refresh()\n'
+    '        if is_logged_in(drv):\n'
+    "            status.update(phase='logged_in', message='Logged in via saved cookies.', cookies_file=cookies_file, finished=mark_finished)\n"
+    '            return True\n'
+    '        drv.delete_all_cookies()\n'
+    "    drv.get('https://accounts.google.com/ServiceLogin')\n"
+    "    status.update(phase='waiting_login', message=f'Waiting for manual login (timeout {login_timeout}s)...')\n"
+    '    deadline = time.time() + login_timeout\n'
+    '    while time.time() < deadline:\n'
+    '        if has_google_session_cookie(drv) and is_logged_in(drv):\n'
+    '            save_cookies(drv, cookies_file)\n'
+    '            if profile_dir and profile_archive_out:\n'
+    '                save_chrome_profile(profile_dir, profile_archive_out)\n'
+    '            turn_off_gemini_activity(drv, status)\n'
+    "            status.update(phase='logged_in', message='Login confirmed, cookies saved.', cookies_file=cookies_file, finished=mark_finished)\n"
+    '            return True\n'
+    '        time.sleep(3)\n'
+    "    status.update(phase='timeout', message='Timed out waiting for login.', finished=True, error='login_timeout')\n"
+    '    return False\n'
+    "_PERSISTENT_DRIVER = globals().get('_PERSISTENT_DRIVER')\n"
+    "_PERSISTENT_VNC_URL = globals().get('_PERSISTENT_VNC_URL')\n"
+    '\n'
+    'def main():\n'
+    "    parser = argparse.ArgumentParser(description='Gemini/Google login worker')\n"
+    "    parser.add_argument('--status-file', required=True)\n"
+    "    parser.add_argument('--output-dir', default='./gemini_login_session')\n"
+    "    parser.add_argument('--cookies-file', default=None, help='Defaults to <output-dir>/google_cookies.pkl')\n"
+    "    parser.add_argument('--headless', action='store_true', help='Force the Xvfb+noVNC path even off Colab (local-headless mode).')\n"
+    "    parser.add_argument('--login-timeout', type=int, default=900)\n"
+    "    parser.add_argument('--screen-width', type=int, default=1920)\n"
+    "    parser.add_argument('--screen-height', type=int, default=1080)\n"
+    '    parser.add_argument(\'--keep-alive\', action=\'store_true\', help="Leave the browser open (in this kernel\'s globals) instead of quitting it, so a later `colab exec` on the same session can reuse it for Generate without logging in again.")\n'
+    '    args = parser.parse_args()\n'
+    '    os.makedirs(args.output_dir, exist_ok=True)\n'
+    "    cookies_file = args.cookies_file or os.path.join(args.output_dir, 'google_cookies.pkl')\n"
+    '    if EMBEDDED_COOKIES_B64:\n'
+    '        Path(cookies_file).parent.mkdir(parents=True, exist_ok=True)\n'
+    '        Path(cookies_file).write_bytes(base64.b64decode(EMBEDDED_COOKIES_B64))\n'
+    "    profile_dir = os.path.join(args.output_dir, 'chrome_profile')\n"
+    "    profile_archive_out = os.path.join(args.output_dir, 'chrome_profile.zip')\n"
+    '    if EMBEDDED_CHROME_PROFILE_REMOTE:\n'
+    '        restore_chrome_profile(profile_dir, EMBEDDED_CHROME_PROFILE_REMOTE)\n'
+    '    status = Status(args.status_file)\n'
+    '    headless = args.headless or is_colab()\n'
+    "    mode = 'colab' if is_colab() else 'local-headless' if args.headless else 'local'\n"
+    '    status.update(mode=mode, message=f"Starting in \'{mode}\' mode.")\n'
+    '    try:\n'
+    '        chrome_bin = ensure_deps(status, headless)\n'
+    '        global _PERSISTENT_DRIVER, _PERSISTENT_VNC_URL\n'
+    '        if _PERSISTENT_DRIVER is not None:\n'
+    "            status.update(phase='checking_session', message='Checking existing browser session...')\n"
+    '            if is_logged_in(_PERSISTENT_DRIVER):\n'
+    "                status.update(phase='logged_in', message='Already logged in — reusing existing session.', cookies_file=cookies_file, finished=True)\n"
+    '                if not args.keep_alive:\n'
+    '                    try:\n'
+    '                        _PERSISTENT_DRIVER.quit()\n'
+    '                    except Exception:\n'
+    '                        pass\n'
+    '                    _PERSISTENT_DRIVER = None\n'
+    '                return\n'
+    '            try:\n'
+    '                _PERSISTENT_DRIVER.quit()\n'
+    '            except Exception:\n'
+    '                pass\n'
+    '            _PERSISTENT_DRIVER = None\n'
+    '        vnc_url = None\n'
+    '        if headless:\n'
+    '            vnc_url = start_display_and_vnc(status, args.screen_width, args.screen_height)\n'
+    '            _PERSISTENT_VNC_URL = vnc_url\n'
+    "            status.update(vnc_url=vnc_url, message='Virtual display ready — open vnc_url to log in.')\n"
+    "        status.update(phase='launching_browser', message=f'Launching Chrome ({chrome_bin})...')\n"
+    '        drv = make_driver(chrome_bin, args.screen_width, args.screen_height, args.output_dir, profile_dir)\n'
+    '        if args.keep_alive:\n'
+    '            ok = handle_login(drv, status, cookies_file, args.login_timeout, profile_dir=profile_dir, profile_archive_out=profile_archive_out)\n'
+    '            if ok:\n'
+    '                _PERSISTENT_DRIVER = drv\n'
+    "                status.update(message=status.data.get('message', '') + ' (browser kept open for reuse)')\n"
+    '            else:\n'
+    '                drv.quit()\n'
+    '            return\n'
+    '        try:\n'
+    '            handle_login(drv, status, cookies_file, args.login_timeout, profile_dir=profile_dir, profile_archive_out=profile_archive_out)\n'
+    '        finally:\n'
+    '            drv.quit()\n'
+    '    except Exception as e:\n'
+    "        status.update(phase='error', message=str(e), error=str(e), finished=True)\n"
+    '        raise\n'
+    "if __name__ == '__main__':\n"
+    '    main()'
+), encoding='utf-8')
+print("wrote gemini_login.py")
+
+from pathlib import Path
+_BUNDLE_DIR = Path("/content/queue_worker_bundle")
+_BUNDLE_DIR.mkdir(parents=True, exist_ok=True)
+(_BUNDLE_DIR / 'gemini_generate.py').write_text((
+    'import argparse\n'
+    'import base64\n'
+    'import json\n'
+    'import os\n'
+    'import queue\n'
+    'import re\n'
+    'import subprocess\n'
+    'import sys\n'
+    'import threading\n'
+    'import time\n'
+    'from pathlib import Path\n'
+    'import gemini_login as gl\n'
+    "EMBEDDED_COOKIES_B64 = globals().get('EMBEDDED_COOKIES_B64')\n"
+    "EMBEDDED_IMAGE_B64 = globals().get('EMBEDDED_IMAGE_B64')\n"
+    "EMBEDDED_IMAGE_EXT = globals().get('EMBEDDED_IMAGE_EXT')\n"
+    "EMBEDDED_MODEL_IMAGE_B64 = globals().get('EMBEDDED_MODEL_IMAGE_B64')\n"
+    "EMBEDDED_MODEL_IMAGE_EXT = globals().get('EMBEDDED_MODEL_IMAGE_EXT')\n"
+    "EMBEDDED_HOLOGRAM_IMAGE_B64 = globals().get('EMBEDDED_HOLOGRAM_IMAGE_B64')\n"
+    "EMBEDDED_HOLOGRAM_IMAGE_EXT = globals().get('EMBEDDED_HOLOGRAM_IMAGE_EXT')\n"
+    "EMBEDDED_BATCH_B64 = globals().get('EMBEDDED_BATCH_B64')\n"
+    "EMBEDDED_IMAGE_REMOTE = globals().get('EMBEDDED_IMAGE_REMOTE')\n"
+    "EMBEDDED_MODEL_IMAGE_REMOTE = globals().get('EMBEDDED_MODEL_IMAGE_REMOTE')\n"
+    "EMBEDDED_CHROME_PROFILE_REMOTE = globals().get('EMBEDDED_CHROME_PROFILE_REMOTE')\n"
+    'LIMIT_PHRASES = ["you\'ve reached your image-generation limit", \'reached your image-generation limit\', \'image-generation limit\', "can\'t generate more images for you today", \'come back tomorrow\', "you\'ve reached your limit", \'reached your daily limit\', \'rate limit\', \'too many requests\']\n'
+    'REFUSAL_PHRASES = ["can\'t create images of", \'cannot create images of\', "i\'m not able to create that image", "i\'m unable to create that image", "i can\'t create this image"]\n'
+    "FALLBACK_MODELS = ['3.7 Flash', '3.5 Flash-Lite']\n"
+    '\n'
+    'def check_limit_or_refusal(drv):\n'
+    '    try:\n'
+    "        body = drv.find_element(By.TAG_NAME, 'body').text.lower()\n"
+    '    except Exception:\n'
+    '        return None\n'
+    '    for p in REFUSAL_PHRASES:\n'
+    '        if p in body:\n'
+    "            return 'refusal'\n"
+    '    for p in LIMIT_PHRASES:\n'
+    '        if p in body:\n'
+    "            return 'limit'\n"
+    '    return None\n'
+    'By = None\n'
+    'Keys = None\n'
+    'ActionChains = None\n'
+    "GEMINI_URL = 'https://gemini.google.com/app'\n"
+    "WMR_URL = 'https://app.gemini-logo-remover.workers.dev/gemini'\n"
+    '\n'
+    'def open_gemini_tab(drv, url=GEMINI_URL, wait_sec=1.0):\n'
+    '    try:\n'
+    '        before = set(drv.window_handles)\n'
+    "        drv.execute_cdp_cmd('Target.createTarget', {'url': url})\n"
+    '        new_handle = None\n'
+    '        deadline = time.time() + wait_sec\n'
+    '        while time.time() < deadline:\n'
+    '            diff = set(drv.window_handles) - before\n'
+    '            if diff:\n'
+    '                new_handle = next(iter(diff))\n'
+    '                break\n'
+    '            time.sleep(0.03)\n'
+    '        if not new_handle:\n'
+    '            handles = drv.window_handles\n'
+    '            if len(handles) > len(before):\n'
+    '                new_handle = handles[-1]\n'
+    '        if not new_handle:\n'
+    '            return False\n'
+    '        drv.switch_to.window(new_handle)\n'
+    '        time.sleep(wait_sec)\n'
+    '        return True\n'
+    '    except Exception:\n'
+    '        return False\n'
+    '\n'
+    'def close_other_tabs(drv, keep_handle):\n'
+    '    try:\n'
+    '        for h in list(drv.window_handles):\n'
+    '            if h != keep_handle:\n'
+    '                try:\n'
+    '                    drv.switch_to.window(h)\n'
+    '                    drv.close()\n'
+    '                except Exception:\n'
+    '                    pass\n'
+    '        drv.switch_to.window(keep_handle)\n'
+    '    except Exception:\n'
+    '        pass\n'
+    '\n'
+    'def start_new_chat(drv):\n'
+    '    for sel in [\'a[aria-label="New chat"]\', \'button[aria-label="New chat"]\', \'div[aria-label="New chat"]\', \'[data-test-id="new-chat-button"]\']:\n'
+    '        try:\n'
+    '            for el in drv.find_elements(By.CSS_SELECTOR, sel):\n'
+    '                if el.is_displayed():\n'
+    "                    drv.execute_script('arguments[0].click();', el)\n"
+    '                    time.sleep(1.0)\n'
+    '                    return True\n'
+    '        except Exception:\n'
+    '            continue\n'
+    '    return False\n'
+    "_PERSISTENT_DRIVER = globals().get('_PERSISTENT_DRIVER')\n"
+    "_PERSISTENT_VNC_URL = globals().get('_PERSISTENT_VNC_URL')\n"
+    '\n'
+    'def click_plus_button(drv):\n'
+    '    for sel in [\'button[aria-label="Upload and tools"]\', \'button[aria-haspopup="menu"][aria-label*="Upload"]\', \'button[jslog*="300142"]\']:\n'
+    '        try:\n'
+    '            for btn in drv.find_elements(By.CSS_SELECTOR, sel):\n'
+    '                if btn.is_displayed():\n'
+    "                    drv.execute_script('arguments[0].click();', btn)\n"
+    '                    time.sleep(0.4)\n'
+    '                    return True\n'
+    '        except Exception:\n'
+    '            continue\n'
+    '    try:\n'
+    '        result = drv.execute_script(\'\\n            var btns=document.querySelectorAll(\\\'button\\\');\\n            for(var i=0;i<btns.length;i++){\\n                var b=btns[i];\\n                if(b.offsetParent!==null){\\n                    var lbl=(b.getAttribute(\\\'aria-label\\\')||\\\'\\\').toLowerCase();\\n                    if(lbl.indexOf(\\\'upload\\\')!==-1||lbl.indexOf(\\\'tools\\\')!==-1){\\n                        b.click();return \\\'OK\\\';\\n                    }\\n                    var icon=b.querySelector(\\\'mat-icon[fonticon="plus"],mat-icon[data-mat-icon-name="plus"]\\\');\\n                    if(icon){b.click();return \\\'OK\\\';}\\n                }\\n            } return \\\'NO\\\';\\n        \')\n'
+    "        if result == 'OK':\n"
+    '            time.sleep(0.4)\n'
+    '            return True\n'
+    '    except Exception:\n'
+    '        pass\n'
+    '    return False\n'
+    '\n'
+    'def click_menu_item(drv, texts):\n'
+    '    texts_l = [t.lower() for t in texts]\n'
+    '    try:\n'
+    '        candidates = drv.find_elements(By.CSS_SELECTOR, "button, [role=\'menuitem\'], [role=\'menuitemcheckbox\']")\n'
+    '        for el in candidates:\n'
+    '            try:\n'
+    '                if not el.is_displayed():\n'
+    '                    continue\n'
+    "                label = (el.text or el.get_attribute('aria-label') or '').strip().lower()\n"
+    '                if label and any((t in label for t in texts_l)):\n'
+    "                    drv.execute_script('arguments[0].click();', el)\n"
+    '                    time.sleep(0.5)\n'
+    '                    return True\n'
+    '            except Exception:\n'
+    '                continue\n'
+    '    except Exception:\n'
+    '        pass\n'
+    '    return False\n'
+    '\n'
+    'def click_create_image(drv):\n'
+    '    try:\n'
+    '        for btn in drv.find_elements(By.CSS_SELECTOR, "button[role=\'menuitemcheckbox\'].toolbox-drawer-item-list-button"):\n'
+    "            if btn.is_displayed() and 'Create image' in btn.text:\n"
+    "                drv.execute_script('arguments[0].click();', btn)\n"
+    '                time.sleep(0.35)\n'
+    '                return True\n'
+    '    except Exception:\n'
+    '        pass\n'
+    '    try:\n'
+    '        for icon in drv.find_elements(By.CSS_SELECTOR, "mat-icon[data-mat-icon-name=\'image_create\'],mat-icon[fonticon=\'image_create\']"):\n'
+    '            if not icon.is_displayed():\n'
+    '                continue\n'
+    '            btn = drv.execute_script("var e=arguments[0]; while(e&&e.tagName!==\'BUTTON\') e=e.parentElement; return e;", icon)\n'
+    '            if btn and btn.is_displayed():\n'
+    "                drv.execute_script('arguments[0].click();', btn)\n"
+    '                time.sleep(0.35)\n'
+    '                return True\n'
+    '    except Exception:\n'
+    '        pass\n'
+    '    try:\n'
+    '        for btn in drv.find_elements(By.CSS_SELECTOR, "button[jslog*=\'271906\']"):\n'
+    '            if btn.is_displayed():\n'
+    "                drv.execute_script('arguments[0].click();', btn)\n"
+    '                time.sleep(0.35)\n'
+    '                return True\n'
+    '    except Exception:\n'
+    '        pass\n'
+    "    return click_menu_item(drv, ['create image', 'create images'])\n"
+    '\n'
+    'def _in_image_mode(drv):\n'
+    '    try:\n'
+    '        if drv.find_elements(By.CSS_SELECTOR, "div.ql-editor[data-placeholder=\'Describe your image\']"):\n'
+    '            return True\n'
+    '        for c in drv.find_elements(By.CSS_SELECTOR, "button[aria-label=\'Deselect Images\'],span.gds-body-s"):\n'
+    "            if c.is_displayed() and 'Images' in c.text:\n"
+    '                return True\n'
+    '    except Exception:\n'
+    '        pass\n'
+    '    return False\n'
+    '\n'
+    'def wait_for_image_mode(drv, timeout=4.0):\n'
+    '    deadline = time.time() + timeout\n'
+    '    while time.time() < deadline:\n'
+    '        if _in_image_mode(drv):\n'
+    '            return True\n'
+    '        time.sleep(0.15)\n'
+    '    return False\n'
+    '\n'
+    "def activate_create_image_mode(drv, status=None, tag='', attempts=3):\n"
+    '    if _in_image_mode(drv):\n'
+    '        if status:\n'
+    '            status.update(message=f"Already in \'Create image\' mode. {tag}".strip())\n'
+    '        return True\n'
+    '    for attempt in range(attempts):\n'
+    '        if status:\n'
+    '            status.update(message=f"Opening the \'+\' tools menu for \'Create image\'... {tag}".strip())\n'
+    '        if not click_plus_button(drv):\n'
+    '            time.sleep(0.5)\n'
+    '            continue\n'
+    '        if status:\n'
+    '            status.update(message=f"Clicking \'Create image\'... {tag}".strip())\n'
+    '        if not click_create_image(drv):\n'
+    '            try:\n'
+    "                drv.find_element(By.TAG_NAME, 'body').send_keys(Keys.ESCAPE)\n"
+    '            except Exception:\n'
+    '                pass\n'
+    '            time.sleep(0.5)\n'
+    '            continue\n'
+    '        if wait_for_image_mode(drv, timeout=4.0):\n'
+    '            if status:\n'
+    '                status.update(message=f"Switched to \'Create image\' mode. {tag}".strip())\n'
+    '            return True\n'
+    '        if status:\n'
+    '            status.update(message=f"\'Create image\' didn\'t confirm — retrying... {tag}".strip())\n'
+    '        try:\n'
+    "            drv.find_element(By.TAG_NAME, 'body').send_keys(Keys.ESCAPE)\n"
+    '        except Exception:\n'
+    '            pass\n'
+    '        time.sleep(0.5)\n'
+    '    if status:\n'
+    '        status.update(message=f"Could not switch to \'Create image\' mode after {attempts} attempts. {tag}".strip())\n'
+    '    return False\n'
+    '_MODEL_TRIGGER_SELECTOR = "button[aria-label*=\'model\' i], button[class*=\'model-switcher\' i], button[data-test-id*=\'model\' i], bard-mode-switcher button, button[class*=\'mode-switcher\' i]"\n'
+    '\n'
+    'def _current_model_label(drv):\n'
+    '    try:\n'
+    '        for btn in drv.find_elements(By.CSS_SELECTOR, _MODEL_TRIGGER_SELECTOR):\n'
+    '            if btn.is_displayed():\n'
+    "                return (btn.text or btn.get_attribute('aria-label') or '').strip().lower()\n"
+    '    except Exception:\n'
+    '        pass\n'
+    "    return ''\n"
+    '\n'
+    'def select_gemini_model(drv, model_query, status, attempts=3):\n'
+    '    q = model_query.strip().lower()\n'
+    '    if q in _current_model_label(drv):\n'
+    '        return True\n'
+    '    for attempt in range(attempts):\n'
+    '        try:\n'
+    '            opened = False\n'
+    '            for btn in drv.find_elements(By.CSS_SELECTOR, _MODEL_TRIGGER_SELECTOR):\n'
+    '                try:\n'
+    '                    if btn.is_displayed():\n'
+    "                        drv.execute_script('arguments[0].click();', btn)\n"
+    '                        time.sleep(0.4)\n'
+    '                        opened = True\n'
+    '                        break\n'
+    '                except Exception:\n'
+    '                    continue\n'
+    '            if not opened:\n'
+    '                status.update(message="Could not find Gemini\'s model switcher — continuing with the default model.")\n'
+    '                return False\n'
+    '            clicked = False\n'
+    '            for cand in drv.find_elements(By.CSS_SELECTOR, "[role=\'menuitem\'], [role=\'menuitemradio\'], button"):\n'
+    '                try:\n'
+    '                    if not cand.is_displayed():\n'
+    '                        continue\n'
+    "                    label = (cand.text or cand.get_attribute('aria-label') or '').strip().lower()\n"
+    '                    if label and q in label:\n'
+    "                        drv.execute_script('arguments[0].click();', cand)\n"
+    '                        time.sleep(0.4)\n'
+    '                        clicked = True\n'
+    '                        break\n'
+    '                except Exception:\n'
+    '                    continue\n'
+    '            if clicked and q in _current_model_label(drv):\n'
+    '                status.update(message=f"Selected the Gemini model matching \'{model_query}\'.")\n'
+    '                return True\n'
+    '        except Exception as e:\n'
+    "            status.update(message=f'Gemini model selection attempt failed ({e}), retrying...')\n"
+    '        try:\n'
+    "            drv.find_element(By.TAG_NAME, 'body').send_keys(Keys.ESCAPE)\n"
+    '        except Exception:\n'
+    '            pass\n'
+    '        time.sleep(0.4)\n'
+    '    status.update(message=f"No Gemini model matched \'{model_query}\' after {attempts} attempts — continuing with the default model.")\n'
+    '    return False\n'
+    '\n'
+    'def handle_consent(drv):\n'
+    '    try:\n'
+    '        for bsel in ["button[data-test-id=\'upload-image-agree-button\']", "//button[.//span[contains(text(),\'Agree\')]]", "//span[text()=\'Agree\']/ancestor::button"]:\n'
+    '            try:\n'
+    "                by = By.XPATH if bsel.startswith('//') else By.CSS_SELECTOR\n"
+    '                btn = drv.find_element(by, bsel)\n'
+    '                if btn and btn.is_displayed():\n'
+    "                    drv.execute_script('arguments[0].click();', btn)\n"
+    '                    time.sleep(0.15)\n'
+    '                    return True\n'
+    '            except Exception:\n'
+    '                continue\n'
+    '    except Exception:\n'
+    '        pass\n'
+    '    return False\n'
+    '\n'
+    'def click_upload_files_in_drawer(drv):\n'
+    '    for sel in ["button[data-test-id=\'local-images-files-uploader-button\']"]:\n'
+    '        try:\n'
+    '            for btn in drv.find_elements(By.CSS_SELECTOR, sel):\n'
+    '                if btn.is_displayed():\n'
+    "                    drv.execute_script('arguments[0].click();', btn)\n"
+    '                    time.sleep(0.3)\n'
+    '                    return True\n'
+    '        except Exception:\n'
+    '            continue\n'
+    '    for xp in ["//span[contains(text(),\'Upload files\')]/ancestor::button", "//div[contains(text(),\'Upload files\')]/ancestor::button"]:\n'
+    '        try:\n'
+    '            for btn in drv.find_elements(By.XPATH, xp):\n'
+    '                if btn.is_displayed():\n'
+    "                    drv.execute_script('arguments[0].click();', btn)\n"
+    '                    time.sleep(0.3)\n'
+    '                    return True\n'
+    '        except Exception:\n'
+    '            continue\n'
+    '    try:\n'
+    '        result = drv.execute_script("\\n            var btns=document.querySelectorAll(\'button\');\\n            for(var i=0;i<btns.length;i++){\\n                if(btns[i].offsetParent!==null &&\\n                   btns[i].textContent.toLowerCase().indexOf(\'upload files\')!==-1){\\n                    btns[i].click();return \'OK\';\\n                }\\n            } return \'NO\';\\n        ")\n'
+    "        if result == 'OK':\n"
+    '            time.sleep(0.3)\n'
+    '            return True\n'
+    '    except Exception:\n'
+    '        pass\n'
+    '    return False\n'
+    '\n'
+    'def find_file_input(drv):\n'
+    '    inputs = drv.find_elements(By.CSS_SELECTOR, "input[type=\'file\']")\n'
+    '    if inputs:\n'
+    '        return inputs[0]\n'
+    '    try:\n'
+    '        drv.execute_script(\'\\n            document.querySelectorAll(\\\'input[type="file"]\\\').forEach(function(el){\\n                el.style.cssText=\\\'display:block!important;opacity:1!important;\\\'\\n                    +\\\'position:fixed!important;top:0;left:0;z-index:99999;width:200px;height:50px;\\\';\\n            });\\n        \')\n'
+    '    except Exception:\n'
+    '        pass\n'
+    '    time.sleep(0.1)\n'
+    '    inputs = drv.find_elements(By.CSS_SELECTOR, "input[type=\'file\']")\n'
+    '    return inputs[0] if inputs else None\n'
+    '\n'
+    'def wait_for_attachment_chip(drv, timeout=8.0):\n'
+    '    t0 = time.time()\n'
+    '    while time.time() - t0 < timeout:\n'
+    '        try:\n'
+    '            for el in drv.find_elements(By.CSS_SELECTOR, \'button[aria-label="close attachment"]\'):\n'
+    '                if el.is_displayed():\n'
+    '                    return True\n'
+    "            for chip in drv.find_elements(By.CSS_SELECTOR, 'gem-media-attachment,uploader-file-preview'):\n"
+    '                if chip.is_displayed():\n'
+    '                    return True\n'
+    "            for w in drv.find_elements(By.CSS_SELECTOR, '.attachment-preview-wrapper,uploader-file-preview-container'):\n"
+    '                if w.is_displayed():\n'
+    '                    return True\n'
+    '        except Exception:\n'
+    '            pass\n'
+    '        time.sleep(0.2)\n'
+    '    return False\n'
+    '\n'
+    'def jsdrop_single(drv, image_path):\n'
+    '    try:\n'
+    '        abs_path = os.path.abspath(image_path)\n'
+    '        if os.path.getsize(abs_path) > 10000000:\n'
+    '            return False\n'
+    "        with open(abs_path, 'rb') as f:\n"
+    "            b64_data = base64.b64encode(f.read()).decode('ascii')\n"
+    '        ext = os.path.splitext(abs_path)[1].lower()\n'
+    "        mime = {'.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png', '.webp': 'image/webp'}.get(ext, 'image/jpeg')\n"
+    '        fname = os.path.basename(abs_path)\n'
+    '        result = drv.execute_script(\'\\n            var b64=arguments[0],mime=arguments[1],fname=arguments[2];\\n            var binary=atob(b64);var arr=new Uint8Array(binary.length);\\n            for(var i=0;i<binary.length;i++) arr[i]=binary.charCodeAt(i);\\n            var blob=new Blob([arr],{type:mime});\\n            var file=new File([blob],fname,{type:mime,lastModified:Date.now()});\\n            var dt=new DataTransfer();dt.items.add(file);\\n            var sels=[\\\'rich-textarea\\\',\\\'.ql-editor\\\',\\\'div[contenteditable="true"]\\\',\\\'.input-area-container\\\'];\\n            for(var s=0;s<sels.length;s++){\\n                var targets=document.querySelectorAll(sels[s]);\\n                for(var t=0;t<targets.length;t++){\\n                    var el=targets[t];if(el.offsetParent===null) continue;\\n                    el.dispatchEvent(new DragEvent(\\\'dragenter\\\',{dataTransfer:dt,bubbles:true}));\\n                    el.dispatchEvent(new DragEvent(\\\'dragover\\\',{dataTransfer:dt,bubbles:true}));\\n                    el.dispatchEvent(new DragEvent(\\\'drop\\\',{dataTransfer:dt,bubbles:true,cancelable:true}));\\n                    return \\\'OK\\\';\\n                }\\n            } return \\\'NO\\\';\\n        \', b64_data, mime, fname)\n'
+    '        time.sleep(0.3)\n'
+    '        handle_consent(drv)\n'
+    "        return result == 'OK'\n"
+    '    except Exception:\n'
+    '        return False\n'
+    '\n'
+    'def save_debug_screenshot(drv, output_dir, tag):\n'
+    '    try:\n'
+    "        debug_dir = Path(output_dir) / 'debug'\n"
+    '        debug_dir.mkdir(parents=True, exist_ok=True)\n'
+    "        path = debug_dir / f'{tag}.png'\n"
+    '        drv.save_screenshot(str(path))\n'
+    '        return str(path)\n'
+    '    except Exception:\n'
+    '        return None\n'
+    '\n'
+    'def upload_images(drv, image_paths, status, timeout=30):\n'
+    '    if len(image_paths) > 1 and _attach_images_together(drv, image_paths, status, timeout):\n'
+    '        return\n'
+    '    for i, image_path in enumerate(image_paths):\n'
+    '        _attach_one_image(drv, image_path, status, i + 1, len(image_paths), timeout)\n'
+    '\n'
+    'def _attach_images_together(drv, image_paths, status, timeout=30):\n'
+    '    try:\n'
+    '        paths = [str(Path(p).resolve()) for p in image_paths]\n'
+    '        for p in paths:\n'
+    '            if not os.path.exists(p):\n'
+    '                return False\n'
+    '        status.update(message=f"Opening the \'+\' tools menu... (all {len(paths)} at once)")\n'
+    '        if not click_plus_button(drv):\n'
+    '            return False\n'
+    '        status.update(message="Clicking \'Upload files\'...")\n'
+    '        if not click_upload_files_in_drawer(drv):\n'
+    '            try:\n'
+    '                drv.execute_script(\'\\n                    var b=document.querySelector(\\n                        \\\'button.hidden-local-file-image-selector-button,\\\'\\n                        +\\\'button[data-test-id="hidden-local-image-upload-button"],\\\'\\n                        +\\\'button[xapfileselectortrigger]\\\');\\n                    if(b) b.click();\\n                \')\n'
+    '                time.sleep(0.15)\n'
+    '            except Exception:\n'
+    '                pass\n'
+    '        handle_consent(drv)\n'
+    '        file_input = find_file_input(drv)\n'
+    '        if file_input is None:\n'
+    '            return False\n'
+    "        names = ', '.join((os.path.basename(p) for p in paths))\n"
+    "        status.update(message=f'Sending {len(paths)} files to the input: {names}')\n"
+    '        try:\n'
+    "            file_input.send_keys('\\n'.join(paths))\n"
+    '        except Exception:\n'
+    '            return False\n'
+    '        handle_consent(drv)\n'
+    "        status.update(message='Waiting for Gemini to render the attached images...')\n"
+    '        if not wait_for_attachment_chip(drv, timeout=timeout):\n'
+    '            return False\n'
+    '        time.sleep(1.2 * len(paths))\n'
+    "        status.update(message=f'Uploaded {len(paths)} files together: {names}')\n"
+    '        return True\n'
+    '    except Exception:\n'
+    '        return False\n'
+    '\n'
+    'def _attach_one_image(drv, image_path, status, index, total, timeout=30):\n'
+    '    image_path = str(Path(image_path).resolve())\n'
+    '    if not os.path.exists(image_path):\n'
+    "        raise FileNotFoundError(f'image not found: {image_path}')\n"
+    "    tag = f'({index}/{total})' if total > 1 else ''\n"
+    '    status.update(message=f"Opening the \'+\' tools menu... {tag}".strip())\n'
+    '    if not click_plus_button(drv):\n'
+    '        raise RuntimeError(f"could not open the \'+\' tools menu {tag}".strip())\n'
+    '    status.update(message=f"Clicking \'Upload files\'... {tag}".strip())\n'
+    '    if not click_upload_files_in_drawer(drv):\n'
+    '        try:\n'
+    '            drv.execute_script(\'\\n                var b=document.querySelector(\\n                    \\\'button.hidden-local-file-image-selector-button,\\\'\\n                    +\\\'button[data-test-id="hidden-local-image-upload-button"],\\\'\\n                    +\\\'button[xapfileselectortrigger]\\\');\\n                if(b) b.click();\\n            \')\n'
+    '            time.sleep(0.15)\n'
+    '        except Exception:\n'
+    '            pass\n'
+    '    handle_consent(drv)\n'
+    "    status.update(message=f'Sending the file to the input: {os.path.basename(image_path)} {tag}'.strip())\n"
+    '    sent_via = None\n'
+    '    file_input = find_file_input(drv)\n'
+    '    if file_input is not None:\n'
+    '        try:\n'
+    '            file_input.send_keys(image_path)\n'
+    "            sent_via = 'input'\n"
+    '        except Exception:\n'
+    '            pass\n'
+    '    if sent_via is None:\n'
+    '        status.update(message="send_keys didn\'t take — trying drag-drop simulation...")\n'
+    '        if jsdrop_single(drv, image_path):\n'
+    "            sent_via = 'jsdrop'\n"
+    '    if sent_via is None:\n'
+    '        raise RuntimeError("could not attach the file via the file input or drag-drop — Gemini\'s upload UI may have changed; check the debug screenshot.")\n'
+    '    handle_consent(drv)\n'
+    '    input_confirmed = False\n'
+    "    if sent_via == 'input':\n"
+    "        status.update(message='Confirming the file attached to the input...')\n"
+    '        deadline = time.time() + 10\n'
+    '        while time.time() < deadline:\n'
+    '            try:\n'
+    "                count = drv.execute_script('return arguments[0].files ? arguments[0].files.length : 0;', file_input)\n"
+    '                if count and count > 0:\n'
+    '                    input_confirmed = True\n'
+    '                    break\n'
+    '            except Exception:\n'
+    '                pass\n'
+    '            time.sleep(0.3)\n'
+    "    status.update(message='Waiting for Gemini to render the attached image...')\n"
+    '    if not wait_for_attachment_chip(drv, timeout=timeout):\n'
+    '        if not input_confirmed:\n'
+    '            raise RuntimeError("could not confirm the image attached — neither the file input nor Gemini\'s own attachment chip ever showed it; check the debug screenshot.")\n'
+    '        time.sleep(3)\n'
+    "    status.update(message=f'Uploaded {os.path.basename(image_path)} {tag}'.strip())\n"
+    '    return True\n'
+    '\n'
+    'def get_editor(drv):\n'
+    '    for sel in ["div.ql-editor[data-placeholder=\'Describe your image\']", "div.ql-editor[contenteditable=\'true\']", "div[contenteditable=\'true\']"]:\n'
+    '        try:\n'
+    '            for el in drv.find_elements(By.CSS_SELECTOR, sel):\n'
+    '                if el.is_displayed():\n'
+    '                    return el\n'
+    '        except Exception:\n'
+    '            pass\n'
+    '    return None\n'
+    '\n'
+    'def _strip_ws(text):\n'
+    "    return re.sub('\\\\s+', '', text)\n"
+    '\n'
+    'def _verify_editor_content(drv, editor, expected_text, timeout=4.0):\n'
+    '    first40 = _strip_ws(expected_text[:80])[:40]\n'
+    '    min_len = int(len(_strip_ws(expected_text)) * 0.5)\n'
+    '    deadline = time.time() + timeout\n'
+    '    while time.time() < deadline:\n'
+    '        try:\n'
+    '            content = drv.execute_script("return (arguments[0].textContent||\'\').trim();", editor) or \'\'\n'
+    '            content = _strip_ws(content)\n'
+    '            if len(content) >= min_len and first40 in content:\n'
+    '                return True\n'
+    '        except Exception:\n'
+    '            pass\n'
+    '        time.sleep(0.1)\n'
+    '    return False\n'
+    '\n'
+    'def _clear_editor(drv, editor):\n'
+    '    try:\n'
+    "        drv.execute_script('arguments[0].focus();', editor)\n"
+    '        drv.execute_script("document.execCommand(\'selectAll\',false,null);document.execCommand(\'delete\',false,null);")\n'
+    '        time.sleep(0.05)\n'
+    '    except Exception:\n'
+    '        pass\n'
+    '\n'
+    'def type_prompt(drv, text):\n'
+    '    editor = None\n'
+    '    deadline = time.time() + 10\n'
+    '    while time.time() < deadline:\n'
+    '        editor = get_editor(drv)\n'
+    '        if editor:\n'
+    '            break\n'
+    '        time.sleep(0.3)\n'
+    '    if not editor:\n'
+    "        raise RuntimeError('could not find the Gemini prompt box')\n"
+    '    drv.execute_script("arguments[0].scrollIntoView({block:\'center\'});", editor)\n'
+    '    time.sleep(0.1)\n'
+    '    _clear_editor(drv, editor)\n'
+    '    try:\n'
+    '        drv.execute_script("document.execCommand(\'insertText\',false,arguments[0]);", text)\n'
+    '        time.sleep(0.3)\n'
+    '        if _verify_editor_content(drv, editor, text, timeout=4.0):\n'
+    '            return True\n'
+    '    except Exception:\n'
+    '        pass\n'
+    '    _clear_editor(drv, editor)\n'
+    '    try:\n'
+    "        drv.execute_script('arguments[0].focus();', editor)\n"
+    '        chunk = 500\n'
+    "        lines = text.split('\\n')\n"
+    '        for li, line in enumerate(lines):\n'
+    '            for i in range(0, len(line), chunk):\n'
+    '                editor.send_keys(line[i:i + chunk])\n'
+    '                time.sleep(0.03)\n'
+    '            if li != len(lines) - 1:\n'
+    '                ActionChains(drv).key_down(Keys.SHIFT).send_keys(Keys.RETURN).key_up(Keys.SHIFT).perform()\n'
+    '                time.sleep(0.03)\n'
+    '        time.sleep(0.3)\n'
+    '        if _verify_editor_content(drv, editor, text, timeout=6.0):\n'
+    '            return True\n'
+    '    except Exception:\n'
+    '        pass\n'
+    "    raise RuntimeError('found the Gemini prompt box but could not verify the prompt was typed into it — neither instant JS insertion nor chunked send_keys ever verified; check the debug screenshot.')\n"
+    '\n'
+    'def click_send(drv):\n'
+    '    try:\n'
+    '        result = drv.execute_script(\'\\n            var icons=document.querySelectorAll(\\n                \\\'mat-icon[fonticon="arrow_upward"],mat-icon[data-mat-icon-name="arrow_upward"]\\\');\\n            for(var i=0;i<icons.length;i++){\\n                var b=icons[i].closest(\\\'button\\\');\\n                if(b&&!b.disabled&&b.offsetParent!==null){b.click();return \\\'OK_UP\\\';}\\n            }\\n            var sendIcons=document.querySelectorAll(\\n                \\\'mat-icon[fonticon="send"],mat-icon[data-mat-icon-name="send"]\\\');\\n            for(var i=0;i<sendIcons.length;i++){\\n                var b=sendIcons[i].closest(\\\'button\\\');\\n                if(b&&!b.disabled&&b.offsetParent!==null){b.click();return \\\'OK_SEND\\\';}\\n            }\\n            var btns=document.querySelectorAll(\\n                \\\'button[aria-label="Send message"],button[data-test-id="send-button"]\\\');\\n            for(var i=0;i<btns.length;i++){\\n                if(!btns[i].disabled&&btns[i].offsetParent!==null){btns[i].click();return \\\'OK_ARIA\\\';}\\n            }\\n            return \\\'NO\\\';\\n        \')\n'
+    "        if result and result.startswith('OK'):\n"
+    '            return True\n'
+    '    except Exception:\n'
+    '        pass\n'
+    '    for sel in ["button[aria-label=\'Send message\']", "button[data-test-id=\'send-button\']", "button[aria-label*=\'Send\']"]:\n'
+    '        try:\n'
+    '            for btn in drv.find_elements(By.CSS_SELECTOR, sel):\n'
+    '                if btn.is_displayed() and btn.is_enabled():\n'
+    "                    drv.execute_script('arguments[0].click();', btn)\n"
+    '                    return True\n'
+    '        except Exception:\n'
+    '            continue\n'
+    '    return False\n'
+    '\n'
+    'def snapshot_urls(drv):\n'
+    '    try:\n'
+    '        return set(drv.execute_script(\'return Array.from(document.querySelectorAll(\\\'img[src^="blob:"],img[src*="googleusercontent"]\\\')).map(i=>i.src).filter(s=>s&&s.length>10);\') or [])\n'
+    '    except Exception:\n'
+    '        return set()\n'
+    '\n'
+    'def check_new_image(drv, urls_before):\n'
+    '    try:\n'
+    '        new_srcs = drv.execute_script(\'\\n            var srcs=[];\\n            var imgs=document.querySelectorAll(\\n                \\\'img[src^="blob:https://gemini.google.com"]\\\');\\n            for (var i=imgs.length-1;i>=0;i--){\\n                var img=imgs[i]; if(!img.offsetParent) continue;\\n                var src=img.getAttribute(\\\'src\\\')||\\\'\\\';\\n                var tid=img.getAttribute(\\\'data-test-id\\\')||\\\'\\\';\\n                if (tid.includes(\\\'uploaded-img\\\')) continue;\\n                if (src.length>10) srcs.push(src);\\n            } return srcs;\\n        \') or []\n'
+    '        for src in new_srcs:\n'
+    '            if src not in urls_before:\n'
+    '                return src\n'
+    '    except Exception:\n'
+    '        pass\n'
+    '    return None\n'
+    '\n'
+    'def check_new_image_lenient(drv, urls_before):\n'
+    '    try:\n'
+    '        new_srcs = drv.execute_script(\'\\n            var srcs=[];\\n            var imgs=document.querySelectorAll(\\n                \\\'img[src^="blob:https://gemini.google.com"]\\\');\\n            for (var i=imgs.length-1;i>=0;i--){\\n                var img=imgs[i]; if(!img.offsetParent) continue;\\n                var src=img.getAttribute(\\\'src\\\')||\\\'\\\';\\n                if (src.length>10) srcs.push(src);\\n            } return srcs;\\n        \') or []\n'
+    '        for src in new_srcs:\n'
+    '            if src not in urls_before:\n'
+    '                return src\n'
+    '    except Exception:\n'
+    '        pass\n'
+    '    return None\n'
+    '\n'
+    'def wait_for_image(drv, urls_before, timeout=180):\n'
+    '    t0 = time.time()\n'
+    '    while time.time() - t0 < timeout:\n'
+    '        src = check_new_image(drv, urls_before)\n'
+    '        if src:\n'
+    '            return src\n'
+    '        time.sleep(1.0)\n'
+    '    return None\n'
+    '\n'
+    'def set_download_behavior(drv, download_dir):\n'
+    '    try:\n'
+    "        drv.execute_cdp_cmd('Page.setDownloadBehavior', {'behavior': 'allow', 'downloadPath': os.path.abspath(download_dir)})\n"
+    '        return True\n'
+    '    except Exception:\n'
+    '        return False\n'
+    '\n'
+    'def _direct_fetch_image(drv, save_path, urls_before):\n'
+    '    try:\n'
+    '        blob = drv.execute_script(\'\\n            var imgs=document.querySelectorAll(\\n                \\\'single-image img,generated-image img,\\\'\\n                \\\'img[src^="blob:https://gemini.google.com"]\\\');\\n            for (var i=imgs.length-1;i>=0;i--){\\n                var s=imgs[i].getAttribute(\\\'src\\\');\\n                if (s && s.startsWith(\\\'blob:https://gemini.google.com\\\')) return s;\\n            } return null;\\n        \')\n'
+    '        if not blob or blob in urls_before:\n'
+    '            return False\n'
+    '        result = drv.execute_cdp_cmd(\'Runtime.evaluate\', {\'expression\': f"fetch(\'{blob}\').then(r=>r.blob()).then(b=>new Promise(resolve=>{{const fr=new FileReader();fr.onloadend=()=>resolve(fr.result.split(\',\')[1]);fr.readAsDataURL(b);}}));", \'awaitPromise\': True, \'returnByValue\': True})\n'
+    "        if result and 'result' in result and ('value' in result['result']):\n"
+    "            data = base64.b64decode(result['result']['value'])\n"
+    '            if len(data) > 5000:\n'
+    '                Path(save_path).parent.mkdir(parents=True, exist_ok=True)\n'
+    '                Path(save_path).write_bytes(data)\n'
+    '                return True\n'
+    '    except Exception:\n'
+    '        pass\n'
+    '    return False\n'
+    '\n'
+    'def _click_download_button(drv):\n'
+    '    selectors = [(\'css\', "button[data-test-id=\'download-generated-image-button\']"), (\'css\', "button[aria-label=\'Download\']"), (\'css\', "button[aria-label=\'Download image\']"), (\'css\', "button[aria-label*=\'Download\']"), (\'xpath\', "//button[contains(@aria-label,\'Download\')]"), (\'xpath\', "//mat-icon[contains(@fonticon,\'download\')]/ancestor::button")]\n'
+    '    for by_type, sel in selectors:\n'
+    '        try:\n'
+    "            by = By.XPATH if by_type == 'xpath' else By.CSS_SELECTOR\n"
+    '            for btn in reversed(drv.find_elements(by, sel)):\n'
+    '                if btn.is_displayed() and btn.is_enabled():\n'
+    '                    drv.execute_script("arguments[0].scrollIntoView({block:\'center\'});", btn)\n'
+    '                    time.sleep(0.1)\n'
+    "                    drv.execute_script('arguments[0].click();', btn)\n"
+    '                    return True\n'
+    '        except Exception:\n'
+    '            continue\n'
+    '    return False\n'
+    '\n'
+    'def _hover_and_download(drv, urls_before):\n'
+    '    try:\n'
+    "        drv.execute_script('window.scrollTo(0,document.body.scrollHeight);')\n"
+    '        time.sleep(0.4)\n'
+    '    except Exception:\n'
+    '        pass\n'
+    '    for sel in (\'single-image img\', \'generated-image img\', "img[src^=\'blob:https://gemini.google.com\']"):\n'
+    '        try:\n'
+    '            imgs = list(reversed(drv.find_elements(By.CSS_SELECTOR, sel)))\n'
+    '        except Exception:\n'
+    '            continue\n'
+    '        for img in imgs:\n'
+    '            try:\n'
+    "                src = img.get_attribute('src') or ''\n"
+    "                tid = img.get_attribute('data-test-id') or ''\n"
+    "                if 'uploaded-img' in tid or tid == 'image-preview':\n"
+    '                    continue\n'
+    '                if src in urls_before or len(src) < 10 or (not img.is_displayed()):\n'
+    '                    continue\n'
+    '                drv.execute_script("arguments[0].scrollIntoView({block:\'center\',behavior:\'smooth\'});", img)\n'
+    '                time.sleep(0.4)\n'
+    '                try:\n'
+    '                    ActionChains(drv).move_to_element(img).perform()\n'
+    '                    time.sleep(0.5)\n'
+    '                    if _click_download_button(drv):\n'
+    '                        return True\n'
+    '                except Exception:\n'
+    '                    pass\n'
+    '                try:\n'
+    '                    drv.execute_script("\\n                        var el=arguments[0];\\n                        [\'mouseenter\',\'mouseover\',\'mousemove\'].forEach(function(evt){\\n                            el.dispatchEvent(new MouseEvent(evt,{bubbles:true,cancelable:true,view:window,\\n                                clientX:el.getBoundingClientRect().left+el.offsetWidth/2,\\n                                clientY:el.getBoundingClientRect().top+el.offsetHeight/2}));\\n                        });\\n                    ", img)\n'
+    '                    time.sleep(0.5)\n'
+    '                    if _click_download_button(drv):\n'
+    '                        return True\n'
+    '                except Exception:\n'
+    '                    pass\n'
+    '            except Exception:\n'
+    '                continue\n'
+    '    return False\n'
+    '\n'
+    'def _wait_for_download(dl_dir, files_before, timeout=30):\n'
+    '    deadline = time.time() + timeout\n'
+    '    while time.time() < deadline:\n'
+    '        try:\n'
+    '            cur = set(os.listdir(dl_dir))\n'
+    "            new_files = {f for f in cur - files_before if not f.endswith(('.crdownload', '.tmp', '.part')) and f.lower().endswith(('.png', '.jpg', '.jpeg', '.webp'))}\n"
+    '            if new_files:\n'
+    '                fname = sorted(new_files, key=lambda f: os.path.getmtime(os.path.join(dl_dir, f)), reverse=True)[0]\n'
+    '                fpath = os.path.join(dl_dir, fname)\n'
+    '                if os.path.getsize(fpath) > 5000:\n'
+    '                    return fpath\n'
+    '        except Exception:\n'
+    '            pass\n'
+    '        time.sleep(0.4)\n'
+    '    return None\n'
+    '\n'
+    'def _wmr_find_file_input(drv):\n'
+    '    try:\n'
+    '        inputs = drv.find_elements(By.CSS_SELECTOR, "input[type=\'file\']")\n'
+    '        if inputs:\n'
+    '            return inputs[0]\n'
+    '    except Exception:\n'
+    '        pass\n'
+    '    try:\n'
+    '        drv.execute_script(\'\\n            document.querySelectorAll(\\\'input[type="file"]\\\').forEach(function(el){\\n                el.style.cssText=\\\'display:block!important;opacity:1!important;\\\'\\n                    +\\\'position:fixed!important;top:0;left:0;z-index:99999;width:200px;height:50px;\\\';\\n                el.removeAttribute(\\\'hidden\\\');\\n                el.removeAttribute(\\\'disabled\\\');\\n            });\\n        \')\n'
+    '    except Exception:\n'
+    '        pass\n'
+    '    time.sleep(0.3)\n'
+    '    try:\n'
+    '        inputs = drv.find_elements(By.CSS_SELECTOR, "input[type=\'file\']")\n'
+    '        return inputs[0] if inputs else None\n'
+    '    except Exception:\n'
+    '        return None\n'
+    '\n'
+    'def _wmr_check_status(drv):\n'
+    '    try:\n'
+    '        result = drv.execute_script("\\n            function findDownloadBtn() {\\n                var btn = document.querySelector(\'button.bg-success\');\\n                if (btn && !btn.disabled) {\\n                    var style = window.getComputedStyle(btn);\\n                    if (style.display !== \'none\' && style.visibility !== \'hidden\') return btn;\\n                }\\n                var spans = document.querySelectorAll(\'span\');\\n                for (var i = 0; i < spans.length; i++) {\\n                    if ((spans[i].textContent || \'\').trim() === \'Download PNG\') {\\n                        var b = spans[i].closest(\'button\');\\n                        if (b && !b.disabled) return b;\\n                    }\\n                }\\n                return null;\\n            }\\n            if (findDownloadBtn()) return \'DONE\';\\n            var allText = document.body ? document.body.innerText.toLowerCase() : \'\';\\n            if (allText.indexOf(\'detecting\') !== -1 || allText.indexOf(\'processing\') !== -1) return \'BUSY\';\\n            if (allText.indexOf(\'not detected\') !== -1 || allText.indexOf(\'no watermark\') !== -1) {\\n                return findDownloadBtn() ? \'DONE\' : \'NOT_FOUND\';\\n            }\\n            if (allText.length < 10) return \'LOADING\';\\n            return \'BUSY\';\\n        ")\n'
+    "        return (result or 'error').lower()\n"
+    '    except Exception:\n'
+    "        return 'error'\n"
+    '\n'
+    'def _wmr_click_download(drv):\n'
+    '    try:\n'
+    '        result = drv.execute_script("\\n            var btn = document.querySelector(\'button.bg-success\');\\n            if (btn && !btn.disabled) { btn.scrollIntoView({block:\'center\'}); btn.click(); return \'OK\'; }\\n            var spans = document.querySelectorAll(\'span\');\\n            for (var i = 0; i < spans.length; i++) {\\n                if ((spans[i].textContent || \'\').trim() === \'Download PNG\') {\\n                    var b = spans[i].closest(\'button\');\\n                    if (b && !b.disabled) { b.scrollIntoView({block:\'center\'}); b.click(); return \'OK\'; }\\n                }\\n            }\\n            return null;\\n        ")\n'
+    "        return result == 'OK'\n"
+    '    except Exception:\n'
+    '        return False\n'
+    '\n'
+    'def convert_to_webp(png_path, max_size_kb=400, min_quality=20, downscale_floor=0.5):\n'
+    '    try:\n'
+    '        from PIL import Image\n'
+    '    except ImportError:\n'
+    '        try:\n'
+    "            subprocess.run([sys.executable, '-m', 'pip', 'install', '-q', 'Pillow'], timeout=60, capture_output=True)\n"
+    '            from PIL import Image\n'
+    '        except Exception:\n'
+    '            return None\n'
+    '    import io as _io\n'
+    '    try:\n'
+    "        webp_path = os.path.splitext(png_path)[0] + '.webp'\n"
+    '        img = Image.open(png_path)\n'
+    '        img.load()\n'
+    "        if img.mode not in ('RGB', 'RGBA'):\n"
+    "            img = img.convert('RGBA' if img.mode in ('P', 'LA', 'PA') else 'RGB')\n"
+    '        orig_w, orig_h = img.size\n'
+    '\n'
+    '        def encode(working, quality):\n'
+    '            buf = _io.BytesIO()\n'
+    "            working.save(buf, format='WEBP', quality=quality, method=4)\n"
+    '            return buf.getvalue()\n'
+    '        scale = 1.0\n'
+    '        while scale >= downscale_floor:\n'
+    '            working = img if scale >= 0.999 else img.resize((max(64, int(orig_w * scale)), max(64, int(orig_h * scale))), Image.Resampling.LANCZOS)\n'
+    '            if len(encode(working, min_quality)) / 1024 > max_size_kb:\n'
+    '                scale -= 0.1\n'
+    '                continue\n'
+    '            low, high, best_q = (min_quality, 95, min_quality)\n'
+    '            while low <= high:\n'
+    '                mid = (low + high) // 2\n'
+    '                if len(encode(working, mid)) / 1024 <= max_size_kb:\n'
+    '                    best_q = mid\n'
+    '                    low = mid + 1\n'
+    '                else:\n'
+    '                    high = mid - 1\n'
+    '            Path(webp_path).write_bytes(encode(working, best_q))\n'
+    '            return webp_path\n'
+    '        working = img.resize((max(64, int(orig_w * downscale_floor)), max(64, int(orig_h * downscale_floor))), Image.Resampling.LANCZOS)\n'
+    '        Path(webp_path).write_bytes(encode(working, min_quality))\n'
+    '        return webp_path\n'
+    '    except Exception:\n'
+    '        return None\n'
+    '\n'
+    'def remove_watermark(drv, image_path, download_dir, status, timeout=60):\n'
+    '    gemini_handle = drv.current_window_handle\n'
+    '    try:\n'
+    '        if not open_gemini_tab(drv, WMR_URL, wait_sec=1.5):\n'
+    "            status.update(message='Could not open the watermark remover — keeping original image.')\n"
+    '            return False\n'
+    '        set_download_behavior(drv, download_dir)\n'
+    '        file_input = _wmr_find_file_input(drv)\n'
+    '        if not file_input:\n'
+    '            time.sleep(0.5)\n'
+    '            file_input = _wmr_find_file_input(drv)\n'
+    '        if not file_input:\n'
+    "            status.update(message='Watermark remover: no file input found — keeping original image.')\n"
+    '            return False\n'
+    '        file_input.send_keys(os.path.abspath(image_path))\n'
+    "        status.update(message='Removing Gemini watermark...')\n"
+    '        deadline = time.time() + timeout\n'
+    "        outcome = 'error'\n"
+    '        while time.time() < deadline:\n'
+    '            outcome = _wmr_check_status(drv)\n'
+    "            if outcome in ('done', 'not_found', 'error'):\n"
+    '                break\n'
+    '            time.sleep(1.0)\n'
+    "        if outcome == 'not_found':\n"
+    "            status.update(message='No watermark detected — keeping original image.')\n"
+    '            return False\n'
+    "        if outcome != 'done':\n"
+    "            status.update(message='Watermark removal timed out — keeping original image.')\n"
+    '            return False\n'
+    '        files_before = set(os.listdir(download_dir)) if os.path.exists(download_dir) else set()\n'
+    '        if not _wmr_click_download(drv):\n'
+    "            status.update(message='Watermark remover: could not click Download — keeping original image.')\n"
+    '            return False\n'
+    '        fpath = _wait_for_download(download_dir, files_before, timeout=20)\n'
+    '        if not fpath:\n'
+    "            status.update(message='Watermark remover: download never landed — keeping original image.')\n"
+    '            return False\n'
+    '        try:\n'
+    '            Path(fpath).rename(image_path)\n'
+    '        except Exception:\n'
+    '            Path(image_path).write_bytes(Path(fpath).read_bytes())\n'
+    "        status.update(message='Watermark removed.')\n"
+    '        return True\n'
+    '    except Exception as e:\n'
+    "        status.update(message=f'Watermark removal failed ({e}) — keeping original image.')\n"
+    '        return False\n'
+    '    finally:\n'
+    '        try:\n'
+    '            if drv.current_window_handle != gemini_handle:\n'
+    '                drv.close()\n'
+    '            drv.switch_to.window(gemini_handle)\n'
+    '        except Exception:\n'
+    '            pass\n'
+    '_WMR_QUEUE = None\n'
+    '_WMR_THREAD = None\n'
+    '_WMR_START_LOCK = threading.Lock()\n'
+    '\n'
+    'def _remove_watermark_standalone(drv2, image_path, download_dir, timeout=60):\n'
+    '    try:\n'
+    '        drv2.get(WMR_URL)\n'
+    '        time.sleep(1.5)\n'
+    '        set_download_behavior(drv2, download_dir)\n'
+    '        file_input = _wmr_find_file_input(drv2)\n'
+    '        if not file_input:\n'
+    '            time.sleep(0.5)\n'
+    '            file_input = _wmr_find_file_input(drv2)\n'
+    '        if not file_input:\n'
+    '            return False\n'
+    '        file_input.send_keys(os.path.abspath(image_path))\n'
+    '        deadline = time.time() + timeout\n'
+    "        outcome = 'error'\n"
+    '        while time.time() < deadline:\n'
+    '            outcome = _wmr_check_status(drv2)\n'
+    "            if outcome in ('done', 'not_found', 'error'):\n"
+    '                break\n'
+    '            time.sleep(1.0)\n'
+    "        if outcome != 'done':\n"
+    '            return False\n'
+    '        files_before = set(os.listdir(download_dir)) if os.path.exists(download_dir) else set()\n'
+    '        if not _wmr_click_download(drv2):\n'
+    '            return False\n'
+    '        fpath = _wait_for_download(download_dir, files_before, timeout=20)\n'
+    '        if not fpath:\n'
+    '            return False\n'
+    '        try:\n'
+    '            Path(fpath).rename(image_path)\n'
+    '        except Exception:\n'
+    '            Path(image_path).write_bytes(Path(fpath).read_bytes())\n'
+    '        return True\n'
+    '    except Exception:\n'
+    '        return False\n'
+    '\n'
+    'def _wmr_worker_loop(chrome_bin, wmr_download_dir, work_queue):\n'
+    '    drv2 = None\n'
+    '    try:\n'
+    '        while True:\n'
+    '            item = work_queue.get()\n'
+    '            try:\n'
+    '                if item is None:\n'
+    '                    return\n'
+    '                idx, image_path, set_combo = item\n'
+    '                if drv2 is None:\n'
+    '                    try:\n'
+    '                        drv2 = gl.make_driver(chrome_bin, 1280, 900, wmr_download_dir)\n'
+    '                    except Exception:\n'
+    '                        drv2 = None\n'
+    '                if drv2 is not None:\n'
+    '                    ok = False\n'
+    '                    for _attempt in range(2):\n'
+    '                        try:\n'
+    '                            if _remove_watermark_standalone(drv2, image_path, wmr_download_dir):\n'
+    '                                ok = True\n'
+    '                                break\n'
+    '                        except Exception:\n'
+    '                            pass\n'
+    '                    if not ok:\n'
+    '                        pass\n'
+    '                webp_path = convert_to_webp(image_path)\n'
+    "                set_combo(idx, phase='done', message='Done', output=os.path.basename(image_path), output_webp=os.path.basename(webp_path) if webp_path else None)\n"
+    '            finally:\n'
+    '                work_queue.task_done()\n'
+    '    finally:\n'
+    '        try:\n'
+    '            if drv2:\n'
+    '                drv2.quit()\n'
+    '        except Exception:\n'
+    '            pass\n'
+    '\n'
+    'def start_watermark_worker(chrome_bin, download_dir, status):\n'
+    '    global _WMR_QUEUE, _WMR_THREAD\n'
+    '    with _WMR_START_LOCK:\n'
+    '        if _WMR_THREAD is not None:\n'
+    '            return\n'
+    "        wmr_download_dir = os.path.join(download_dir, '_wmr_downloads')\n"
+    '        os.makedirs(wmr_download_dir, exist_ok=True)\n'
+    '        _WMR_QUEUE = queue.Queue()\n'
+    '        _WMR_THREAD = threading.Thread(target=_wmr_worker_loop, args=(chrome_bin, wmr_download_dir, _WMR_QUEUE), daemon=True)\n'
+    '        _WMR_THREAD.start()\n'
+    '\n'
+    'def enqueue_watermark_removal(idx, image_path, set_combo):\n'
+    '    if _WMR_QUEUE is not None:\n'
+    '        _WMR_QUEUE.put((idx, image_path, set_combo))\n'
+    '\n'
+    'def stop_watermark_worker(wait_s=240):\n'
+    '    global _WMR_QUEUE, _WMR_THREAD\n'
+    '    with _WMR_START_LOCK:\n'
+    '        thread, q = (_WMR_THREAD, _WMR_QUEUE)\n'
+    '        _WMR_THREAD = None\n'
+    '        _WMR_QUEUE = None\n'
+    '    if thread is None:\n'
+    '        return\n'
+    '    try:\n'
+    '        q.put(None)\n'
+    '        thread.join(timeout=wait_s)\n'
+    '    except Exception:\n'
+    '        pass\n'
+    '\n'
+    'def download_image(drv, save_path, urls_before, download_dir, retries=3):\n'
+    '    if _direct_fetch_image(drv, save_path, urls_before):\n'
+    '        return True\n'
+    '    os.makedirs(download_dir, exist_ok=True)\n'
+    '    for _ in range(retries):\n'
+    '        try:\n'
+    '            files_before_dl = set(os.listdir(download_dir))\n'
+    "            drv.execute_script('window.scrollTo(0,document.body.scrollHeight);')\n"
+    '            time.sleep(0.3)\n'
+    '            hover_ok = _hover_and_download(drv, urls_before)\n'
+    '            fpath = _wait_for_download(download_dir, files_before_dl, timeout=30 if hover_ok else 8)\n'
+    '            if fpath:\n'
+    '                Path(save_path).parent.mkdir(parents=True, exist_ok=True)\n'
+    '                try:\n'
+    '                    Path(fpath).rename(save_path)\n'
+    '                except Exception:\n'
+    '                    Path(save_path).write_bytes(Path(fpath).read_bytes())\n'
+    '                if os.path.exists(save_path) and os.path.getsize(save_path) > 1000:\n'
+    '                    return True\n'
+    '        except Exception:\n'
+    '            pass\n'
+    '        time.sleep(0.5)\n'
+    '    return _direct_fetch_image(drv, save_path, urls_before)\n'
+    '\n'
+    'def run_batch_generation(drv, status, args, combos, image_path, model_image_path, chrome_bin=None):\n'
+    "    tab_cap = max(1, int(getattr(args, 'max_tabs', 6) or 6))\n"
+    '    if chrome_bin:\n'
+    '        start_watermark_worker(chrome_bin, args.output_dir, status)\n'
+    "    gen_dir = os.path.join(args.output_dir, 'generated')\n"
+    "    inbox_dir = os.path.join(args.output_dir, 'inbox')\n"
+    '    os.makedirs(gen_dir, exist_ok=True)\n'
+    '    os.makedirs(inbox_dir, exist_ok=True)\n'
+    "    for d, prefix in ((gen_dir, 'combo-'), (inbox_dir, '')):\n"
+    '        for f in os.listdir(d):\n'
+    '            if f.startswith(prefix):\n'
+    '                try:\n'
+    '                    os.remove(os.path.join(d, f))\n'
+    '                except OSError:\n'
+    '                    pass\n'
+    '    states = [{\'idx\': c[\'idx\'], \'label\': c.get(\'label\') or f"look {c[\'idx\'] + 1}", \'phase\': \'queued\', \'message\': \'\', \'output\': None} for c in combos]\n'
+    "    accepting = {'open': True}\n"
+    '\n'
+    '    def sync(msg=None):\n'
+    "        done = sum((1 for s in states if s['phase'] == 'done'))\n"
+    "        errs = sum((1 for s in states if s['phase'] == 'error'))\n"
+    "        status.update(phase='generating', accepting=accepting['open'], message=msg or f'Generating {len(states)} shots in {len(tabs)} tabs — {done} done, {errs} failed...', combos=[dict(s) for s in states])\n"
+    '\n'
+    '    def set_combo(idx, **kw):\n'
+    '        for s in states:\n'
+    "            if s['idx'] == idx:\n"
+    '                s.update(kw)\n'
+    '        sync()\n'
+    '    queue = list(combos)\n'
+    '    outputs = []\n'
+    '    parked = []\n'
+    '    limited_models = set()\n'
+    '    limit_cycles = 0\n'
+    '\n'
+    '    def ingest_inbox():\n'
+    '        added = 0\n'
+    '        try:\n'
+    '            names = sorted(os.listdir(inbox_dir))\n'
+    '        except OSError:\n'
+    '            return 0\n'
+    '        for name in names:\n'
+    "            if not (name.startswith('combo-') and name.endswith('.json')):\n"
+    '                continue\n'
+    '            jpath = os.path.join(inbox_dir, name)\n'
+    '            try:\n'
+    '                with open(jpath) as f:\n'
+    '                    spec = json.load(f)\n'
+    '            except Exception:\n'
+    '                continue\n'
+    "            holo = spec.get('hologram')\n"
+    '            hpath = os.path.join(inbox_dir, holo) if holo else None\n'
+    '            if holo and (not os.path.isfile(hpath)):\n'
+    '                continue\n'
+    '            try:\n'
+    '                os.remove(jpath)\n'
+    '            except OSError:\n'
+    '                pass\n'
+    "            idx = int(spec.get('idx', -1))\n"
+    "            if idx < 0 or any((c['idx'] == idx for c in combos)):\n"
+    '                continue\n'
+    "            combo = {'idx': idx, 'label': spec.get('label') or f'look {idx + 1}', 'prompt': spec.get('prompt') or (combos[0]['prompt'] if combos else ''), 'hologram_path': hpath}\n"
+    '            combos.append(combo)\n'
+    "            states.append({'idx': idx, 'label': combo['label'], 'phase': 'queued', 'message': '', 'output': None})\n"
+    '            queue.append(combo)\n'
+    '            added += 1\n'
+    '        if added:\n'
+    "            sync(f'{added} new look(s) joined the live batch.')\n"
+    '        return added\n'
+    "    tabs = [{'handle': drv.current_window_handle, 'combo': None, 'urls_before': set(), 'started': 0.0, 'model': None, 'fresh': True}]\n"
+    '\n'
+    '    def grow_tabs():\n'
+    "        while len(queue) + len([t for t in tabs if t['combo']]) > len(tabs) and len(tabs) < tab_cap:\n"
+    "            drv.switch_to.window(tabs[0]['handle'])\n"
+    '            if not open_gemini_tab(drv, GEMINI_URL):\n'
+    '                break\n'
+    "            tabs.append({'handle': drv.current_window_handle, 'combo': None, 'urls_before': set(), 'started': 0.0, 'model': None, 'fresh': True})\n"
+    '            time.sleep(0.8)\n'
+    "    sync(f'Opening Gemini tabs for {len(states)} shots...')\n"
+    '    grow_tabs()\n'
+    '\n'
+    '    def setup_tab_job(tab, combo, model=None):\n'
+    "        idx = combo['idx']\n"
+    '        target_model = model or args.gemini_model\n'
+    '        try:\n'
+    "            drv.switch_to.window(tab['handle'])\n"
+    "            click_menu_item(drv, ['dismiss'])\n"
+    "            set_combo(idx, phase='preparing', message='Setting up the chat...')\n"
+    "            if not tab['fresh']:\n"
+    '                start_new_chat(drv)\n'
+    '                time.sleep(1.0)\n'
+    "            tab['fresh'] = False\n"
+    '            if target_model:\n'
+    '                select_gemini_model(drv, target_model, status)\n'
+    "                tab['model'] = target_model\n"
+    "            combo['_model'] = tab.get('model')\n"
+    "            if not activate_create_image_mode(drv, status, tag=f'(look {idx})'):\n"
+    '                raise RuntimeError("could not switch this tab into \'Create image\' mode")\n'
+    '            image_paths = [image_path]\n'
+    "            if combo.get('hologram_path'):\n"
+    "                image_paths.append(combo['hologram_path'])\n"
+    '            if model_image_path:\n'
+    '                image_paths.append(model_image_path)\n'
+    '            upload_images(drv, image_paths, status)\n'
+    "            type_prompt(drv, combo['prompt'])\n"
+    "            tab['urls_before'] = snapshot_urls(drv)\n"
+    '            if not click_send(drv):\n'
+    "                raise RuntimeError('could not click send')\n"
+    "            tab['combo'] = combo\n"
+    "            tab['started'] = time.time()\n"
+    "            set_combo(idx, phase='generating', message='Gemini is generating...')\n"
+    '            return True\n'
+    '        except Exception as e:\n'
+    "            set_combo(idx, phase='error', message=str(e)[:200])\n"
+    '            return False\n'
+    '    while True:\n'
+    '        ingest_inbox()\n'
+    '        grow_tabs()\n'
+    '        for tab in tabs:\n'
+    "            if tab['combo'] is None and queue:\n"
+    '                combo = queue.pop(0)\n'
+    '                setup_tab_job(tab, combo)\n'
+    '                break\n'
+    "        active = [t for t in tabs if t['combo'] is not None]\n"
+    '        if not active and (not queue):\n'
+    '            if ingest_inbox():\n'
+    '                continue\n'
+    "            if parked and limit_cycles < int(getattr(args, 'max_limit_cycles', 3) or 3):\n"
+    '                limit_cycles += 1\n'
+    "                resume_at = time.time() + int(getattr(args, 'limit_wait', 3600) or 3600)\n"
+    '                while time.time() < resume_at:\n'
+    '                    mins = int((resume_at - time.time()) / 60) + 1\n'
+    '                    status.update(phase=\'limit_wait\', accepting=True, resume_at=resume_at, message=f"Gemini\'s limit is reached — resuming automatically in ~{mins} min. Your looks are safe.", combos=[dict(s) for s in states])\n'
+    '                    time.sleep(15)\n'
+    '                    ingest_inbox()\n'
+    '                limited_models.clear()\n'
+    '                status.update(resume_at=None)\n'
+    '                for c in parked:\n'
+    "                    c['_attempts'] = 0\n"
+    '                    queue.append(c)\n'
+    "                    set_combo(c['idx'], phase='queued', message='Resuming after the limit reset...')\n"
+    '                parked.clear()\n'
+    '                continue\n'
+    '            if parked:\n'
+    '                for c in parked:\n'
+    '                    set_combo(c[\'idx\'], phase=\'error\', message="Gemini\'s limit didn\'t lift after several waits — try this look again later")\n'
+    '                parked.clear()\n'
+    "            accepting['open'] = False\n"
+    '            status.update(accepting=False)\n'
+    '            break\n'
+    '        for tab in active:\n'
+    "            combo = tab['combo']\n"
+    "            idx = combo['idx']\n"
+    '            try:\n'
+    "                drv.switch_to.window(tab['handle'])\n"
+    "                timed_out = time.time() - tab['started'] > args.generation_timeout\n"
+    '                if timed_out:\n'
+    "                    src = check_new_image_lenient(drv, tab['urls_before'])\n"
+    '                else:\n'
+    "                    src = check_new_image(drv, tab['urls_before'])\n"
+    '                if not src:\n'
+    '                    if timed_out:\n'
+    "                        shot = save_debug_screenshot(drv, args.output_dir, f'look-{idx:02d}-timeout')\n"
+    "                        set_combo(idx, phase='error', message=f'no image within {args.generation_timeout}s', debug_screenshot=os.path.basename(shot) if shot else None)\n"
+    "                        tab['combo'] = None\n"
+    '                        continue\n'
+    "                    tab['checks'] = tab.get('checks', 0) + 1\n"
+    "                    if tab['checks'] % 3 == 0:\n"
+    '                        verdict = check_limit_or_refusal(drv)\n'
+    "                        if verdict == 'refusal':\n"
+    "                            set_combo(idx, phase='error', message='Gemini declined this prompt for this look')\n"
+    "                            tab['combo'] = None\n"
+    "                        elif verdict == 'limit':\n"
+    "                            limited_models.add(combo.get('_model') or '__default__')\n"
+    '                            nxt = next((m for m in FALLBACK_MODELS if m not in limited_models), None)\n'
+    "                            combo['_attempts'] = combo.get('_attempts', 0) + 1\n"
+    "                            tab['combo'] = None\n"
+    "                            if nxt and combo['_attempts'] < 4:\n"
+    "                                set_combo(idx, phase='preparing', message=f'Limit on this model — retrying on {nxt}...')\n"
+    '                                setup_tab_job(tab, combo, model=nxt)\n'
+    '                            else:\n'
+    '                                set_combo(idx, phase=\'limit_parked\', message="Gemini\'s limit is hit — parked for automatic resume")\n'
+    '                                parked.append(combo)\n'
+    '                    continue\n'
+    "                set_combo(idx, phase='downloading', message='Downloading the image...')\n"
+    "                save_path = os.path.join(gen_dir, f'combo-{idx:02d}.png')\n"
+    '                set_download_behavior(drv, args.output_dir)\n'
+    "                if download_image(drv, save_path, tab['urls_before'], args.output_dir):\n"
+    '                    outputs.append(save_path)\n'
+    "                    set_combo(idx, phase='removing_watermark', message='Removing the watermark...')\n"
+    '                    enqueue_watermark_removal(idx, save_path, set_combo)\n'
+    '                else:\n'
+    "                    set_combo(idx, phase='error', message='generated but download failed')\n"
+    "                tab['combo'] = None\n"
+    '            except Exception as e:\n'
+    "                set_combo(idx, phase='error', message=f'lost control of this tab: {e}'[:200])\n"
+    "                tab['combo'] = None\n"
+    '        time.sleep(1.0)\n'
+    '    stop_watermark_worker()\n'
+    "    done_states = [s for s in states if s['phase'] == 'done']\n"
+    '    ok = len(done_states)\n'
+    '    if ok == 0:\n'
+    "        status.update(phase='error', finished=True, accepting=False, error=f'all {len(states)} shots failed', combos=[dict(s) for s in states])\n"
+    '        return None\n'
+    "    status.update(phase='done', finished=True, accepting=False, message=f'{ok}/{len(states)} shots generated.', output_image=os.path.join(gen_dir, done_states[0]['output']), combos=[dict(s) for s in states])\n"
+    '    return outputs\n'
+    '\n'
+    'def main():\n'
+    '    global By, Keys, ActionChains\n'
+    "    parser = argparse.ArgumentParser(description='Gemini generate worker (login + image/prompt -> generated image)')\n"
+    "    parser.add_argument('--status-file', required=True)\n"
+    "    parser.add_argument('--output-dir', default='./gemini_generate_session')\n"
+    "    parser.add_argument('--cookies-file', default=None, help='Defaults to <output-dir>/google_cookies.pkl')\n"
+    '    parser.add_argument(\'--profile-dir\', default=None, help="Persistent Chrome user-data-dir to reuse across runs. Defaults to <output-dir>/chrome_profile, which is a fresh empty profile whenever the caller uses a per-job --output-dir (queue_worker.py does exactly that) — Google\'s login risk check looks at device-trust signals that live in the profile directory, not just cookies, so a brand-new profile re-triggers a fresh \'verify it\'s you\' challenge on every single job even with valid cookies. Pass a stable shared path here so one manual login trusts the device for every later job instead.")\n'
+    "    parser.add_argument('--headless', action='store_true')\n"
+    "    parser.add_argument('--login-timeout', type=int, default=900)\n"
+    "    parser.add_argument('--prompt', required=True)\n"
+    "    parser.add_argument('--image-path', default=None, help='Local image to upload as a reference. Omit for pure text-to-image (Create image mode).')\n"
+    "    parser.add_argument('--model-image-path', default=None, help='Optional second image (a real fashion-studio model reference photo) — attached alongside --image-path in the same chat turn.')\n"
+    "    parser.add_argument('--hologram-image-path', default=None, help='Optional pose/hologram reference for the selected style/package scene (MANNEQUIN_REF) — attached alongside --image-path in the same chat turn.')\n"
+    '    parser.add_argument(\'--gemini-model\', default=\'Flash\', help="Best-effort substring match against Gemini\'s own in-app model switcher (see select_gemini_model()). Defaults to \'Flash\' — the reference pipeline (ECOM COMBO PHOTOSHOOT ORDER.ipynb) always pins every tab to Flash rather than leaving it to whatever model a reused/persistent profile happened to last have active. Never fails the job — pass an empty string to skip switching entirely.")\n'
+    "    parser.add_argument('--generation-timeout', type=int, default=180)\n"
+    "    parser.add_argument('--max-tabs', type=int, default=6, help='Batch mode only — how many parallel Gemini tabs to run at once. 6 matches the reference pipeline, proven on a Colab VM.')\n"
+    '    parser.add_argument(\'--limit-wait\', type=int, default=3600, help="Batch mode — seconds to wait before auto-resuming looks parked by Gemini\'s generation limit (its caps reset on the hour scale).")\n'
+    "    parser.add_argument('--max-limit-cycles', type=int, default=3, help='Batch mode — how many limit-wait cycles to attempt before failing the still-parked looks (guards against hard daily caps).')\n"
+    "    parser.add_argument('--screen-width', type=int, default=1920)\n"
+    "    parser.add_argument('--screen-height', type=int, default=1080)\n"
+    '    parser.add_argument(\'--keep-alive\', action=\'store_true\', help="On success, leave the browser open (in this kernel\'s globals) instead of quitting it, so a later `colab exec` on the same Colab session can reuse it for the NEXT Generate without logging in again. If this run itself reused an existing persistent driver, omitting this flag ends the persistent session (quits the browser) once this job finishes.")\n'
+    '    parser.add_argument(\'--watch-live\', action=\'store_true\', help="Set up the Xvfb+noVNC remote-view pipeline even when reusing an already-logged-in persistent driver (normally skipped entirely on that fast path, since headless automation needs no display for a human to watch) — lets Developer mode show the browser live while a Generate that doesn\'t need a fresh login still runs.")\n'
+    '    args = parser.parse_args()\n'
+    '    os.makedirs(args.output_dir, exist_ok=True)\n'
+    "    cookies_file = args.cookies_file or os.path.join(args.output_dir, 'google_cookies.pkl')\n"
+    '    if EMBEDDED_COOKIES_B64:\n'
+    '        Path(cookies_file).parent.mkdir(parents=True, exist_ok=True)\n'
+    '        Path(cookies_file).write_bytes(base64.b64decode(EMBEDDED_COOKIES_B64))\n'
+    "    profile_dir = args.profile_dir or os.path.join(args.output_dir, 'chrome_profile')\n"
+    "    profile_archive_out = os.path.join(args.output_dir, 'chrome_profile.zip')\n"
+    '    if EMBEDDED_CHROME_PROFILE_REMOTE:\n'
+    '        gl.restore_chrome_profile(profile_dir, EMBEDDED_CHROME_PROFILE_REMOTE)\n'
+    '    image_path = args.image_path\n'
+    '    if EMBEDDED_IMAGE_REMOTE and os.path.exists(EMBEDDED_IMAGE_REMOTE):\n'
+    '        image_path = EMBEDDED_IMAGE_REMOTE\n'
+    '    elif EMBEDDED_IMAGE_B64:\n'
+    '        image_path = os.path.join(args.output_dir, f"reference_image{EMBEDDED_IMAGE_EXT or \'.png\'}")\n'
+    '        Path(image_path).parent.mkdir(parents=True, exist_ok=True)\n'
+    '        Path(image_path).write_bytes(base64.b64decode(EMBEDDED_IMAGE_B64))\n'
+    '    model_image_path = args.model_image_path\n'
+    '    if EMBEDDED_MODEL_IMAGE_REMOTE and os.path.exists(EMBEDDED_MODEL_IMAGE_REMOTE):\n'
+    '        model_image_path = EMBEDDED_MODEL_IMAGE_REMOTE\n'
+    '    elif EMBEDDED_MODEL_IMAGE_B64:\n'
+    '        model_image_path = os.path.join(args.output_dir, f"model_image{EMBEDDED_MODEL_IMAGE_EXT or \'.webp\'}")\n'
+    '        Path(model_image_path).parent.mkdir(parents=True, exist_ok=True)\n'
+    '        Path(model_image_path).write_bytes(base64.b64decode(EMBEDDED_MODEL_IMAGE_B64))\n'
+    '    hologram_image_path = args.hologram_image_path\n'
+    '    if EMBEDDED_HOLOGRAM_IMAGE_B64:\n'
+    '        hologram_image_path = os.path.join(args.output_dir, f"hologram_image{EMBEDDED_HOLOGRAM_IMAGE_EXT or \'.webp\'}")\n'
+    '        Path(hologram_image_path).parent.mkdir(parents=True, exist_ok=True)\n'
+    '        Path(hologram_image_path).write_bytes(base64.b64decode(EMBEDDED_HOLOGRAM_IMAGE_B64))\n'
+    '    batch_combos = None\n'
+    '    if EMBEDDED_BATCH_B64:\n'
+    '        payload = json.loads(base64.b64decode(EMBEDDED_BATCH_B64))\n'
+    "        batch_combos = payload.get('combos') or None\n"
+    '        for c in batch_combos or []:\n'
+    "            if c.get('hologram_remote') and os.path.exists(c['hologram_remote']):\n"
+    "                c['hologram_path'] = c['hologram_remote']\n"
+    "            elif c.get('hologram_b64'):\n"
+    '                hp = os.path.join(args.output_dir, f"hologram_{int(c[\'idx\']):02d}{c.get(\'hologram_ext\') or \'.webp\'}")\n'
+    '                Path(hp).parent.mkdir(parents=True, exist_ok=True)\n'
+    "                Path(hp).write_bytes(base64.b64decode(c['hologram_b64']))\n"
+    "                c['hologram_path'] = hp\n"
+    '    status = gl.Status(args.status_file)\n'
+    '    headless = args.headless or gl.is_colab()\n'
+    "    mode = 'colab' if gl.is_colab() else 'local-headless' if args.headless else 'local'\n"
+    '    status.update(mode=mode, message=f"Starting in \'{mode}\' mode.")\n'
+    '    debug_screenshot_path = None\n'
+    '    global _PERSISTENT_DRIVER, _PERSISTENT_VNC_URL\n'
+    '    try:\n'
+    '        chrome_bin = gl.ensure_deps(status, headless)\n'
+    '        from selenium.webdriver.common.by import By as _By\n'
+    '        from selenium.webdriver.common.keys import Keys as _Keys\n'
+    '        from selenium.webdriver.common.action_chains import ActionChains as _ActionChains\n'
+    '        By = _By\n'
+    '        Keys = _Keys\n'
+    '        ActionChains = _ActionChains\n'
+    '        drv = _PERSISTENT_DRIVER\n'
+    '        reused_driver = False\n'
+    '        if drv is not None:\n'
+    "            status.update(phase='checking_session', message='Checking existing browser session...')\n"
+    '            if gl.is_logged_in(drv):\n'
+    '                reused_driver = True\n'
+    '                if args.watch_live and headless and _PERSISTENT_VNC_URL:\n'
+    '                    status.update(vnc_url=_PERSISTENT_VNC_URL)\n'
+    "                status.update(phase='reusing_session', message='Reusing already-logged-in browser — no login/noVNC needed this time.')\n"
+    '            else:\n'
+    '                try:\n'
+    '                    drv.quit()\n'
+    '                except Exception:\n'
+    '                    pass\n'
+    '                drv = None\n'
+    '                _PERSISTENT_DRIVER = None\n'
+    '        if not reused_driver:\n'
+    '            if headless:\n'
+    '                vnc_url = gl.start_display_and_vnc(status, args.screen_width, args.screen_height)\n'
+    '                _PERSISTENT_VNC_URL = vnc_url\n'
+    "                status.update(vnc_url=vnc_url, message='Virtual display ready — open vnc_url to log in if needed.')\n"
+    "            status.update(phase='launching_browser', message=f'Launching Chrome ({chrome_bin})...')\n"
+    '            drv = gl.make_driver(chrome_bin, args.screen_width, args.screen_height, args.output_dir, profile_dir)\n'
+    '        have_logged_in_driver = reused_driver\n'
+    '        keep_driver_alive = False\n'
+    '        try:\n'
+    '            if not reused_driver:\n'
+    '                if not gl.handle_login(drv, status, cookies_file, args.login_timeout, mark_finished=False, profile_dir=profile_dir, profile_archive_out=profile_archive_out):\n'
+    '                    return\n'
+    '                have_logged_in_driver = True\n'
+    "            status.update(phase='opening_gemini', message='Opening Gemini...')\n"
+    '            if reused_driver:\n'
+    '                if open_gemini_tab(drv, GEMINI_URL):\n'
+    '                    close_other_tabs(drv, drv.current_window_handle)\n'
+    '                else:\n'
+    '                    drv.get(GEMINI_URL)\n'
+    '            else:\n'
+    '                drv.get(GEMINI_URL)\n'
+    '            time.sleep(2.5)\n'
+    "            click_menu_item(drv, ['dismiss'])\n"
+    '            set_download_behavior(drv, args.output_dir)\n'
+    '            if reused_driver:\n'
+    "                status.update(message='Starting a new chat...')\n"
+    '                start_new_chat(drv)\n'
+    '                time.sleep(1.0)\n'
+    '            if batch_combos and image_path:\n'
+    '                run_batch_generation(drv, status, args, batch_combos, image_path, model_image_path, chrome_bin)\n'
+    '                if bool(args.keep_alive):\n'
+    "                    status.update(message=status.data.get('message', '') + ' (browser kept open for reuse)')\n"
+    '                return\n'
+    '            if args.gemini_model:\n'
+    '                status.update(phase=\'selecting_model\', message=f"Trying to select Gemini model matching \'{args.gemini_model}\'...")\n'
+    '                select_gemini_model(drv, args.gemini_model, status)\n'
+    '            prompt = args.prompt\n'
+    '            if image_path:\n'
+    "                status.update(phase='switching_mode', message='Switching to Create image mode...')\n"
+    '                if not activate_create_image_mode(drv, status):\n'
+    '                    raise RuntimeError("could not switch Gemini into \'Create image\' mode")\n'
+    '                image_paths = [image_path]\n'
+    '                if hologram_image_path:\n'
+    '                    image_paths.append(hologram_image_path)\n'
+    '                if model_image_path:\n'
+    '                    image_paths.append(model_image_path)\n'
+    "                status.update(phase='uploading_image', message=f'Uploading {os.path.basename(image_path)}...')\n"
+    '                upload_images(drv, image_paths, status)\n'
+    '            else:\n'
+    "                status.update(phase='switching_mode', message='Switching to Create image mode...')\n"
+    '                if not activate_create_image_mode(drv, status):\n'
+    '                    raise RuntimeError("could not switch Gemini into \'Create image\' mode")\n'
+    "            status.update(phase='typing_prompt', message='Typing prompt...')\n"
+    '            type_prompt(drv, prompt)\n'
+    "            status.update(message='Prompt entered.')\n"
+    '            urls_before = snapshot_urls(drv)\n'
+    "            status.update(phase='sending', message='Sending prompt...')\n"
+    '            if not click_send(drv):\n'
+    "                raise RuntimeError('could not click send')\n"
+    "            status.update(phase='generating', message=f'Waiting for Gemini to generate the image (up to {args.generation_timeout}s)...')\n"
+    '            img_url = wait_for_image(drv, urls_before, timeout=args.generation_timeout)\n'
+    '            if not img_url:\n'
+    "                raise RuntimeError('no image appeared within the generation timeout')\n"
+    "            status.update(message='Gemini generated the image.')\n"
+    "            status.update(phase='downloading_result', message='Downloading generated image...')\n"
+    "            safe_name = re.sub('[^\\\\w\\\\-]+', '_', args.prompt[:40]).strip('_') or 'gemini_output'\n"
+    "            save_path = os.path.join(args.output_dir, 'generated', f'{safe_name}.png')\n"
+    '            if not download_image(drv, save_path, urls_before, args.output_dir):\n'
+    "                raise RuntimeError('image generated but could not be downloaded — neither the direct blob fetch nor a real click-through download ever produced a file; check the debug screenshot.')\n"
+    "            status.update(phase='removing_watermark', message='Removing Gemini watermark...')\n"
+    '            remove_watermark(drv, save_path, args.output_dir, status)\n'
+    '            webp_path = convert_to_webp(save_path)\n'
+    "            status.update(phase='done', message=f'Saved to {save_path}', output_image=save_path, output_image_webp=webp_path, finished=True)\n"
+    '            if bool(args.keep_alive):\n'
+    "                status.update(message=status.data.get('message', '') + ' (browser kept open for reuse)')\n"
+    '        except Exception:\n'
+    "            debug_screenshot_path = save_debug_screenshot(drv, args.output_dir, 'failure')\n"
+    '            raise\n'
+    '        finally:\n'
+    '            keep_driver_alive = have_logged_in_driver and bool(args.keep_alive)\n'
+    '            if keep_driver_alive:\n'
+    '                _PERSISTENT_DRIVER = drv\n'
+    '            else:\n'
+    '                _PERSISTENT_DRIVER = None\n'
+    '                try:\n'
+    '                    drv.quit()\n'
+    '                except Exception:\n'
+    '                    pass\n'
+    '    except Exception as e:\n'
+    "        status.update(phase='error', message=str(e), error=str(e), debug_screenshot=debug_screenshot_path, finished=True)\n"
+    '        raise\n'
+    "if __name__ == '__main__':\n"
+    '    main()'
+), encoding='utf-8')
+print("wrote gemini_generate.py")
+
+
+
+# ----------------------------------------------------------------------------
+# 5. Run the worker (BLOCKS — this is the worker's own loop, picking up and processing jobs until you stop it: Runtime → Interrupt execution)
+# ----------------------------------------------------------------------------
+import asyncio
+import json
+import os
+import subprocess
+import sys
+import time
+import traceback
+import uuid
+from pathlib import Path
+from bullmq import Worker
+import credits
+import db
+import fashion_studio
+QUEUE_NAME = 'generations'
+REDIS_URL = os.environ.get('REDIS_URL', 'redis://127.0.0.1:6379')
+REDIS_KEY_PREFIX = os.environ.get('REDIS_KEY_PREFIX', 'vastralook:')
+WORKER_ID = f'queue_worker-{uuid.uuid4().hex[:8]}'
+
+def log(msg, file=None):
+    ts = time.strftime('%H:%M:%S')
+    print(f'[{ts}] {msg}', file=file)
+WORKER_STATE_DIR = Path('/content/queue_worker_bundle/queue_worker_state')
+WORKER_STATE_DIR.mkdir(exist_ok=True)
+_drive_cookies = Path('/content/drive/MyDrive/gemini-queue-worker/cookies.pkl')
+COOKIES_FILE = _drive_cookies if _drive_cookies.parent.parent.exists() else WORKER_STATE_DIR / 'cookies.pkl'
+COOKIES_FILE.parent.mkdir(parents=True, exist_ok=True)
+REFS_DIR = WORKER_STATE_DIR / 'refs'
+PROFILE_DIR = WORKER_STATE_DIR / 'chrome_profile'
+GENERATE_SCRIPT = Path('/content/queue_worker_bundle/gemini_generate.py')
+PYTHON_BIN = sys.executable
+GENERATION_TIMEOUT_S = 180
+LOGIN_TIMEOUT_S = 900
+SUBPROCESS_TIMEOUT_S = LOGIN_TIMEOUT_S + GENERATION_TIMEOUT_S + 300
+
+def fetch_generation(gen_id):
+    conn = db.borrow()
+    try:
+        cur = conn.cursor()
+        cur.execute('\n            SELECT g.id, g.user_id, g.model_id, g.catalogue_item_id, g.package_id,\n                   g.prompt, g.params, g.attempts, g.max_attempts, g.credits_cost,\n                   ci.hologram_url, ci.thumbnail_url, ci.model_id AS ci_model_id,\n                   pk.primary_outfit_name,\n                   m.image_url AS model_image_url, m.angle_image_url AS model_angle_url\n            FROM image_generations g\n            LEFT JOIN catalogue_items ci ON ci.id = g.catalogue_item_id\n            LEFT JOIN packages pk ON pk.id = COALESCE(g.package_id, ci.package_id)\n            LEFT JOIN models m ON m.id = COALESCE(g.model_id, ci.model_id)\n            WHERE g.id = %s\n            ', (gen_id,))
+        row = cur.fetchone()
+        if not row:
+            return None
+        cols = [d[0] for d in cur.description]
+        return dict(zip(cols, row))
+    finally:
+        conn.close()
+
+def resolve_prompt_and_refs(gen):
+    params = gen.get('params') or {}
+    if isinstance(params, str):
+        params = json.loads(params)
+    garment_url = params.get('garmentImage') or params.get('garmentUrl') or params.get('garment_image_url') or params.get('garmentImageUrl')
+    if not garment_url:
+        garment_images = params.get('garmentImages')
+        if isinstance(garment_images, list):
+            garment_url = next((u for u in garment_images if isinstance(u, str) and u.strip()), None)
+    if not garment_url:
+        raise ValueError(f"generation {gen['id']}: no garment reference found in params (checked garmentImage/garmentUrl/garment_image_url/garmentImageUrl/garmentImages[0]) — params keys were: {list(params.keys())}")
+    model_image_url = params.get('modelImage') or gen.get('model_angle_url') or gen.get('model_image_url')
+    hologram_url = params.get('styleImage') or gen.get('hologram_url')
+    REFS_DIR.mkdir(parents=True, exist_ok=True)
+    garment_path = fashion_studio.download_remote_image(garment_url, REFS_DIR)
+    model_image_path = fashion_studio.download_remote_image(model_image_url, REFS_DIR) if model_image_url else None
+    hologram_path = fashion_studio.download_remote_image(hologram_url, REFS_DIR) if hologram_url else None
+    prompt = gen.get('prompt')
+    if not prompt:
+        prompt = fashion_studio.fashion_tryon_prompt(has_model=bool(model_image_path))
+    return (prompt, garment_path, model_image_path, hologram_path)
+
+def run_generation_subprocess(prompt, garment_path, model_image_path, hologram_path, out_dir):
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    status_file = out_dir / 'status.json'
+    cmd = [PYTHON_BIN, str(GENERATE_SCRIPT), '--status-file', str(status_file), '--output-dir', str(out_dir), '--cookies-file', str(COOKIES_FILE), '--profile-dir', str(PROFILE_DIR), '--login-timeout', str(LOGIN_TIMEOUT_S), '--generation-timeout', str(GENERATION_TIMEOUT_S), '--prompt', prompt, '--image-path', garment_path]
+    if model_image_path:
+        cmd += ['--model-image-path', model_image_path]
+    if hologram_path:
+        cmd += ['--hologram-image-path', hologram_path]
+    gen_id_for_log = out_dir.name
+    proc_log_file = out_dir / 'subprocess.log'
+    log(f'[{WORKER_ID}] {gen_id_for_log}: launching gemini_generate.py (can take a few minutes; login alone may take up to {LOGIN_TIMEOUT_S}s if cookies are stale)')
+    with open(proc_log_file, 'w', encoding='utf-8') as lf:
+        proc = subprocess.Popen(cmd, stdout=lf, stderr=subprocess.STDOUT, text=True)
+        deadline = time.time() + SUBPROCESS_TIMEOUT_S
+        last_phase = None
+        seen_vnc_url = False
+        while proc.poll() is None:
+            if time.time() > deadline:
+                proc.kill()
+                proc.wait(timeout=10)
+                raise RuntimeError(f'gemini_generate.py timed out after {SUBPROCESS_TIMEOUT_S}s')
+            if status_file.exists():
+                try:
+                    live_status = json.loads(status_file.read_text(encoding='utf-8'))
+                except Exception:
+                    live_status = {}
+                vnc_url = live_status.get('vnc_url')
+                if vnc_url and (not seen_vnc_url):
+                    log(f'[{WORKER_ID}] {gen_id_for_log}: noVNC link (open to log in if needed): {vnc_url}')
+                    seen_vnc_url = True
+                phase = live_status.get('phase')
+                if phase and phase != last_phase:
+                    log(f"[{WORKER_ID}] {gen_id_for_log}: phase={phase} {live_status.get('message', '')}".rstrip())
+                    last_phase = phase
+            time.sleep(3)
+    status = {}
+    if status_file.exists():
+        try:
+            status = json.loads(status_file.read_text(encoding='utf-8'))
+        except Exception:
+            pass
+    if proc.returncode != 0 and status.get('phase') != 'done':
+        tail = proc_log_file.read_text(encoding='utf-8', errors='replace')[-2000:] if proc_log_file.exists() else ''
+        raise RuntimeError(status.get('error') or f'gemini_generate.py exited {proc.returncode}: {tail}')
+    if status.get('phase') != 'done':
+        raise RuntimeError(status.get('error') or 'generation did not report success')
+    return status
+
+def record_dead_letter(gen, failed_reason, attempts_made, max_attempts, error_stack=None):
+    conn = db.borrow()
+    try:
+        cur = conn.cursor()
+        summary = json.dumps({'generationId': gen['id']})
+        cur.execute("\n            INSERT INTO dead_letter_jobs\n                (queue_name, job_name, generation_id, payload_summary, failed_reason,\n                 attempts_made, status, worker_id, error_stack)\n            VALUES (%s, %s, %s, %s::jsonb, %s, %s, 'open', %s, %s)\n            ", (QUEUE_NAME, 'process-generation', gen['id'], summary, failed_reason[:4000], attempts_made, WORKER_ID, (error_stack or '')[:8000]))
+        conn.commit()
+    finally:
+        conn.close()
+
+async def process(job, job_token):
+    gen_id = job.data['generationId']
+    log(f'[{WORKER_ID}] picked up generation {gen_id} (attempt {job.attemptsMade + 1})')
+    gen = fetch_generation(gen_id)
+    if gen is None:
+        log(f'[{WORKER_ID}] {gen_id}: no image_generations row found, skipping')
+        return {'skipped': 'row_not_found'}
+    out_dir = WORKER_STATE_DIR / 'jobs' / gen_id
+    try:
+        prompt, garment_path, model_image_path, hologram_path = resolve_prompt_and_refs(gen)
+        status = run_generation_subprocess(prompt, garment_path, model_image_path, hologram_path, out_dir)
+        png_path = status.get('output_image')
+        webp_path = status.get('output_image_webp')
+        result = fashion_studio.push_generation(png_path, prompt, user_id=gen['user_id'], gen_id=gen_id, webp_path=webp_path, force=True, params={'garmentImage': garment_path, 'modelImage': model_image_path, 'styleImage': hologram_path})
+        try:
+            credits.settle_look(gen_id)
+        except Exception as e:
+            log(f'[{WORKER_ID}] {gen_id}: settle_look failed (non-fatal): {e}', file=sys.stderr)
+        log(f"[{WORKER_ID}] {gen_id}: done -> {result['output_url']}")
+        return {'output_url': result['output_url'], 'webp_url': result['webp_url']}
+    except Exception as e:
+        attempts_made = job.attemptsMade + 1
+        max_attempts = job.opts.get('attempts') or 1
+        is_final = attempts_made >= max_attempts
+        log(f'[{WORKER_ID}] {gen_id}: attempt {attempts_made}/{max_attempts} failed: {e}', file=sys.stderr)
+        if is_final:
+            try:
+                record_dead_letter(gen, str(e), attempts_made, max_attempts, traceback.format_exc())
+            except Exception as dlq_err:
+                log(f'[{WORKER_ID}] {gen_id}: DLQ insert also failed: {dlq_err}', file=sys.stderr)
+            try:
+                credits.refund_look(gen_id, str(e)[:500])
+            except Exception as refund_err:
+                log(f'[{WORKER_ID}] {gen_id}: refund also failed: {refund_err}', file=sys.stderr)
+        raise
+
+async def main():
+    log(f'[{WORKER_ID}] connecting to {REDIS_URL} queue={QUEUE_NAME!r} prefix={REDIS_KEY_PREFIX!r}')
+    worker = Worker(QUEUE_NAME, process, {'connection': REDIS_URL, 'prefix': REDIS_KEY_PREFIX, 'concurrency': 1})
+    log(f'[{WORKER_ID}] waiting for jobs (Ctrl+C to stop)...')
+    try:
+        while True:
+            await asyncio.sleep(3600)
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        pass
+    finally:
+        await worker.close()
+if __name__ == '__main__':
+    import nest_asyncio
+    nest_asyncio.apply()
+    asyncio.run(main())
+
+
+now please that improved in V8 becouse now we have introduse direct reddice connect 
+
+also befor process how many in que job that also print please combined best V9 code create that login check if not login complite login manage after that all process manage & output in reddies 
+
+# @title ULTRA-FIXED GOOGLE LOGIN - PROPER DETECTION + FAST EXECUTION
+# ============================================================================
+# ✅ FIXED: Now properly detects existing login (profile avatar, email, etc.)
+# ✅ FIXED: Multiple login check methods
+# ✅ FIXED: Fast password field detection (5 seconds max)
+# ✅ FIXED: Robust Gemini activity toggle
+# ============================================================================
+
+import os, re, json, time, glob, shutil, random, subprocess, socket
+from datetime import datetime
+
+print("="*70)
+print(" INSTALLING DEPENDENCIES")
+print("="*70)
+
+chrome_bin = None
+for path in ["/usr/bin/google-chrome-stable", "/usr/bin/google-chrome"]:
+    if os.path.exists(path):
+        chrome_bin = path
+        break
+
+if chrome_bin:
+    v = subprocess.run([chrome_bin, "--version"], capture_output=True, text=True).stdout.strip()
+    print(f"✅ Chrome already installed: {v}")
+else:
+    print(" Installing Google Chrome...")
+    get_ipython().system("apt-get update -y > /dev/null 2>&1")
+    get_ipython().system("apt-get install -y wget xvfb x11vnc novnc websockify fluxbox > /dev/null 2>&1")
+    get_ipython().system("wget -q https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb")
+    get_ipython().system("apt-get install -y ./google-chrome-stable_current_amd64.deb > /dev/null 2>&1")
+    get_ipython().system("rm -f google-chrome-stable_current_amd64.deb")
+    chrome_bin = "/usr/bin/google-chrome-stable"
+    v = subprocess.run([chrome_bin, "--version"], capture_output=True, text=True).stdout.strip()
+    print(f"✅ Installed: {v}")
+
+cf_path = "/usr/local/bin/cloudflared"
+if not os.path.exists(cf_path):
+    print(" Installing cloudflared...")
+    get_ipython().system(f"wget -q --timeout=20 -O {cf_path} https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64")
+    get_ipython().system(f"chmod +x {cf_path}")
+else:
+    print("✅ cloudflared already installed")
+
+get_ipython().system("pip install -q selenium webdriver-manager pyvirtualdisplay pillow requests 2>/dev/null")
+print("✅ Packages installed")
+print("="*70)
+
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import TimeoutException, NoSuchElementException, StaleElementReferenceException, ElementClickInterceptedException
+from selenium.webdriver.common.action_chains import ActionChains
+from webdriver_manager.chrome import ChromeDriverManager
+from IPython.display import Image as IPImage, display as ipy_display, HTML
+from pyvirtualdisplay import Display
+import pickle
+
+SCREENSHOT_FOLDER = "/content/login_screenshots"
+CHROME_DOWNLOAD_DIR = "/content/downloads"
+COOKIES_FILE = "/content/google_cookies.pkl"
+PROFILE_DIR = "/content/chrome_profile"
+
+TIMEOUT = 15
+SHORT_WAIT = 2
+MAX_VERIFICATION_ATTEMPTS = 3
+
+os.makedirs(SCREENSHOT_FOLDER, exist_ok=True)
+os.makedirs(CHROME_DOWNLOAD_DIR, exist_ok=True)
+os.makedirs(PROFILE_DIR, exist_ok=True)
+
+# ============================================================================
+# 🔍 ULTRA-ROBUST LOGIN DETECTION - MULTIPLE METHODS
+# ============================================================================
+
+def is_logged_in_method_1_profile_avatar(driver):
+    """Method 1: Check for profile avatar (the colored circle with letter)"""
+    try:
+        # Look for the profile avatar - the colored circle with initial
+        avatar_selectors = [
+            "//div[@aria-label='Google Account']//img",
+            "//img[contains(@src, 'lh3.googleusercontent.com')]",
+            "//div[@data-is-profile-button='true']//img",
+            "//a[@aria-label='Google Account']//img",
+            "//img[@alt and contains(@alt, 'Profile')]",
+        ]
+        for selector in avatar_selectors:
+            try:
+                elem = driver.find_element(By.XPATH, selector)
+                if elem.is_displayed():
+                    print("   ✅ Method 1: Profile avatar found!")
+                    return True
+            except:
+                continue
+        return False
+    except:
+        return False
+
+def is_logged_in_method_2_email_text(driver):
+    """Method 2: Check for email address text on page"""
+    try:
+        page_text = driver.find_element(By.TAG_NAME, "body").text
+        # Look for email pattern
+        email_pattern = r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
+        emails = re.findall(email_pattern, page_text)
+        if emails:
+            print(f"   ✅ Method 2: Email found: {emails[0]}")
+            return True
+        return False
+    except:
+        return False
+
+def is_logged_in_method_3_account_elements(driver):
+    """Method 3: Check for Google Account specific elements"""
+    try:
+        account_selectors = [
+            "//a[@aria-label='Google Account']",
+            "//div[contains(text(),'Google Account')]",
+            "//h1[contains(text(),'Google Account')]",
+            "//*[contains(text(),'Personal info')]",
+            "//*[contains(text(),'Security and sign-in')]",
+            "//*[contains(text(),'Data and privacy')]",
+        ]
+        for selector in account_selectors:
+            try:
+                elem = driver.find_element(By.XPATH, selector)
+                if elem.is_displayed():
+                    print(f"   ✅ Method 3: Account element found: {elem.text[:50]}")
+                    return True
+            except:
+                continue
+        return False
+    except:
+        return False
+
+def is_logged_in_method_4_no_signin(driver):
+    """Method 4: Check absence of Sign in button"""
+    try:
+        signin_buttons = driver.find_elements(By.XPATH,
+            "//button[contains(., 'Sign in') or contains(., 'Sign In')] | " +
+            "//a[contains(., 'Sign in') or contains(., 'Sign In')]")
+        visible_signin = [btn for btn in signin_buttons if btn.is_displayed()]
+        if not visible_signin:
+            print("   ✅ Method 4: No 'Sign in' button found!")
+            return True
+        return False
+    except:
+        return False
+
+def is_logged_in_method_5_url_check(driver):
+    """Method 5: Check URL patterns"""
+    try:
+        url = driver.current_url.lower()
+        logged_in_patterns = [
+            "myaccount.google.com",
+            "accounts.google.com/b/0/",
+            "accounts.google.com/ManageAccount",
+        ]
+        not_logged_patterns = ["signin", "login", "identifier", "challenge"]
+
+        for pattern in logged_in_patterns:
+            if pattern in url:
+                for not_pattern in not_logged_patterns:
+                    if not_pattern in url:
+                        return False
+                print(f"   ✅ Method 5: URL indicates logged in: {url[:60]}")
+                return True
+        return False
+    except:
+        return False
+
+def is_logged_in_method_6_cookies(driver):
+    """Method 6: Check for Google auth cookies"""
+    try:
+        cookies = driver.get_cookies()
+        auth_cookies = ['SID', 'HSID', 'SSID', 'APISID', 'SAPISID', 'LOGIN_INFO', 'SIDCC']
+        found = [c['name'] for c in cookies if c['name'] in auth_cookies]
+        if len(found) >= 2:
+            print(f"   ✅ Method 6: Auth cookies found: {found}")
+            return True
+        return False
+    except:
+        return False
+
+def is_logged_in_method_7_profile_button(driver):
+    """Method 7: Check for the profile button in top-right"""
+    try:
+        # The colored circle avatar button in top right
+        profile_btns = driver.find_elements(By.CSS_SELECTOR,
+            "[data-is-profile-button='true'], " +
+            "[aria-label*='Google Account'], " +
+            "[aria-label*='Profile']")
+        for btn in profile_btns:
+            if btn.is_displayed():
+                print(f"   ✅ Method 7: Profile button found!")
+                return True
+        return False
+    except:
+        return False
+
+def comprehensive_login_check(driver, page_name=""):
+    """🎯 COMPREHENSIVE LOGIN CHECK - Uses ALL 7 methods"""
+    print(f"\n🔍 Checking login status{f' ({page_name})' if page_name else ''}...")
+    print(f"   Current URL: {driver.current_url[:80]}")
+
+    methods = [
+        ("Profile Avatar", is_logged_in_method_1_profile_avatar),
+        ("Email Text", is_logged_in_method_2_email_text),
+        ("Account Elements", is_logged_in_method_3_account_elements),
+        ("No Sign-in Button", is_logged_in_method_4_no_signin),
+        ("URL Check", is_logged_in_method_5_url_check),
+        ("Auth Cookies", is_logged_in_method_6_cookies),
+        ("Profile Button", is_logged_in_method_7_profile_button),
+    ]
+
+    passed = 0
+    total = len(methods)
+
+    for name, method in methods:
+        try:
+            if method(driver):
+                passed += 1
+        except Exception as e:
+            pass
+
+    confidence = (passed / total) * 100
+    print(f"\n   📊 Login Confidence: {passed}/{total} methods passed ({confidence:.0f}%)")
+
+    if confidence >= 43:  # At least 3 out of 7 methods
+        print(f"   ✅ CONCLUSION: USER IS LOGGED IN!")
+        return True
+    else:
+        print(f"   ❌ CONCLUSION: USER IS NOT LOGGED IN")
+        return False
+
+def extract_verification_number(driver):
+    """Extract the verification number from page"""
+    try:
+        page_text = driver.find_element(By.TAG_NAME, "body").text
+        verification_patterns = [
+            r'tap\s+(\d+)\s+on\s+your\s+phone',
+            r'then\s+tap\s+(\d+)',
+            r'verification\s+code[:\s]+(\d+)',
+            r'code[:\s]+(\d{2,6})',
+            r'number[:\s]+(\d+)',
+        ]
+        for pattern in verification_patterns:
+            match = re.search(pattern, page_text.lower())
+            if match:
+                return match.group(1)
+
+        all_numbers = re.findall(r'\b(\d{2,6})\b', page_text)
+        for num in all_numbers:
+            if num not in ['2024', '2025', '2026', '1234', '0000', '1000', '911']:
+                idx = page_text.find(num)
+                context = page_text[max(0,idx-100):min(len(page_text),idx+100)].lower()
+                if any(k in context for k in ['verify', 'tap', 'check', 'code', 'number', 'phone']):
+                    return num
+        return None
+    except Exception as e:
+        print(f"⚠️ Error extracting verification number: {e}")
+        return None
+
+def extract_page_details(driver):
+    """Extract ALL visible text, input fields, and buttons from page"""
+    details = {
+        'page_text': '', 'input_fields': [], 'buttons': [],
+        'verification_number': None, 'instructions': [], 'headings': []
+    }
+    try:
+        body = driver.find_element(By.TAG_NAME, "body")
+        details['page_text'] = body.text
+        details['verification_number'] = extract_verification_number(driver)
+
+        input_fields = driver.find_elements(By.CSS_SELECTOR,
+            "input[type='text'], input[type='email'], input[type='password'], input[type='tel']")
+        for field in input_fields:
+            if field.is_displayed():
+                details['input_fields'].append({
+                    'type': field.get_attribute('type'),
+                    'id': field.get_attribute('id'),
+                    'name': field.get_attribute('name'),
+                    'aria_label': field.get_attribute('aria-label'),
+                    'placeholder': field.get_attribute('placeholder'),
+                })
+
+        buttons = driver.find_elements(By.CSS_SELECTOR, "button, div[role='button']")
+        for btn in buttons:
+            if btn.is_displayed():
+                btn_text = btn.text.strip()
+                btn_aria = btn.get_attribute('aria-label')
+                if btn_text or btn_aria:
+                    details['buttons'].append({'text': btn_text, 'aria_label': btn_aria})
+
+        headings = driver.find_elements(By.CSS_SELECTOR, "h1, h2, h3, h4, div[role='heading']")
+        for heading in headings:
+            if heading.is_displayed() and heading.text.strip():
+                details['headings'].append(heading.text.strip())
+    except Exception as e:
+        print(f"️ Error extracting page details: {e}")
+    return details
+
+def display_page_info(details, step_name=""):
+    """Display extracted page information"""
+    print("\n" + "="*70)
+    print(f"📋 PAGE INFORMATION - {step_name}")
+    print("="*70)
+
+    if details['verification_number']:
+        print(f"\n{'='*70}")
+        print(f"🔢 VERIFICATION NUMBER: {details['verification_number']} 🔢🔢")
+        print(f"{'='*70}")
+        print(f"⚠️ You need to tap/enter this number on your phone!")
+        print(f"{'='*70}\n")
+        ipy_display(HTML(f"""
+        <div style='background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
+                    padding: 25px; border-radius: 12px; color: white; text-align: center;
+                    font-size: 32px; font-weight: bold; margin: 20px 0;'>
+            🔢 VERIFICATION NUMBER: {details['verification_number']}
+            <div style='font-size: 16px; margin-top: 10px;'>Tap this number on your phone</div>
+        </div>"""))
+
+    if details['headings']:
+        print(f"\n📌 HEADINGS:")
+        for h in details['headings']:
+            print(f"   • {h}")
+
+    if details['input_fields']:
+        print(f"\n📝 INPUT FIELDS:")
+        for i, field in enumerate(details['input_fields'], 1):
+            print(f"   Field {i}: {field.get('aria_label', field.get('placeholder', field['type']))}")
+            if 'email' in field['type'].lower() or 'identifier' in str(field.get('id','')).lower():
+                print(f"   👉 Enter EMAIL")
+            elif 'password' in field['type'].lower():
+                print(f"   👉 Enter PASSWORD")
+
+    if details['buttons']:
+        print(f"\n BUTTONS:")
+        for btn in details['buttons']:
+            print(f"   • {btn['text'] or btn['aria_label']}")
+
+    print("="*70)
+
+def take_screenshot(driver, step_name):
+    try:
+        timestamp = datetime.now().strftime("%H%M%S")
+        filename = f"{SCREENSHOT_FOLDER}/{timestamp}_{step_name}.png"
+        driver.save_screenshot(filename)
+        print(f"📸 Screenshot saved: {step_name}")
+        return filename
+    except Exception as e:
+        print(f"⚠️ Screenshot error: {e}")
+        return None
+
+def save_cookies(driver):
+    try:
+        cookies = driver.get_cookies()
+        with open(COOKIES_FILE, "wb") as f:
+            pickle.dump(cookies, f)
+        print("💾 ✅ Cookies saved locally")
+        return True
+    except Exception as e:
+        print(f"️ Cookie save error: {e}")
+        return False
+
+def load_cookies(driver):
+    try:
+        if os.path.exists(COOKIES_FILE):
+            with open(COOKIES_FILE, "rb") as f:
+                cookies = pickle.load(f)
+            driver.get("https://www.google.com")
+            time.sleep(1)
+            for cookie in cookies:
+                try:
+                    driver.add_cookie(cookie)
+                except:
+                    pass
+            print("💾 ✅ Cookies loaded from local storage")
+            return True
+        else:
+            print("⚠️ No cookie file found")
+            return False
+    except Exception as e:
+        print(f"⚠️ Cookie load error: {e}")
+        return False
+
+def wait_with_countdown(total_seconds, message="Waiting"):
+    try:
+        for remaining in range(total_seconds, 0, -1):
+            mins, secs = divmod(remaining, 60)
+            time_str = f"{mins:02d}:{secs:02d}"
+            print(f"\r {message}: {time_str} ", end='', flush=True)
+            time.sleep(1)
+        print(f"\r✅ {message}: Complete!           ")
+    except KeyboardInterrupt:
+        print("\n️ Wait interrupted")
+        raise KeyboardInterrupt
+
+def detect_push_notification_verification(driver):
+    try:
+        page_text = driver.find_element(By.TAG_NAME, "body").text
+        push_indicators = ["Check your", "Tap Yes", "notification", "sent a notification", "on your phone", "verify it's you"]
+        match_count = sum(1 for indicator in push_indicators if indicator.lower() in page_text.lower())
+        return match_count >= 2
+    except:
+        return False
+
+def wait_for_push_notification_approval(driver, max_wait_seconds=60):
+    try:
+        verification_num = extract_verification_number(driver)
+        if verification_num:
+            print(f"\n{'='*70}")
+            print(f" VERIFICATION NUMBER: {verification_num}")
+            print(f"{'='*70}")
+            print(f"📱 Please check your phone and tap: '{verification_num}'")
+            print(f"{'='*70}\n")
+
+        ipy_display(HTML("<h4 style='color: #fbbc04;'>📱 PUSH NOTIFICATION SENT TO YOUR PHONE</h4>"))
+
+        checks = max_wait_seconds // 5
+        for check in range(1, checks + 1):
+            print(f"\n🔍 Check {check}/{checks}")
+            wait_with_countdown(5, "Waiting for approval")
+
+            if comprehensive_login_check(driver, "push approval check"):
+                ipy_display(HTML("<h3 style='color: #34a853;'>✅ Push notification approved!</h3>"))
+                return True
+        return False
+    except Exception as e:
+        print(f"❌ Error waiting for push: {e}")
+        return False
+
+def handle_verification_code_with_retry(driver, wait, max_attempts=3):
+    for attempt in range(1, max_attempts + 1):
+        try:
+            ipy_display(HTML(f"<h4 style='color: #ea4335;'>🔢 Verification Check - Attempt {attempt}/{max_attempts}</h4>"))
+            page_details = extract_page_details(driver)
+            display_page_info(page_details, f"Verification Attempt {attempt}")
+
+            if detect_push_notification_verification(driver):
+                ipy_display(HTML("<h4 style='color: #fbbc04;'>📱 Detected: Push notification verification</h4>"))
+                take_screenshot(driver, f"push_notification_attempt_{attempt}")
+
+                if page_details['verification_number']:
+                    print(f"\n{'='*70}")
+                    print(f"🔢 YOUR VERIFICATION NUMBER: {page_details['verification_number']}")
+                    print(f"{'='*70}")
+
+                wait_time = 60 if attempt == 1 else 30
+                if wait_for_push_notification_approval(driver, max_wait_seconds=wait_time):
+                    return True
+                if comprehensive_login_check(driver):
+                    return True
+                continue
+
+            code_input = None
+            code_selectors = ["input[type='tel']", "input[name='totpPin']", "input[id='totpPin']",
+                            "input[type='text'][name='pin']", "input[aria-label*='code']"]
+            for selector in code_selectors:
+                try:
+                    fields = driver.find_elements(By.CSS_SELECTOR, selector)
+                    for field in fields:
+                        if field.is_displayed():
+                            code_input = field
+                            break
+                    if code_input:
+                        break
+                except:
+                    continue
+
+            if not code_input:
+                if attempt < max_attempts:
+                    time.sleep(2)
+                    continue
+                return False
+
+            ipy_display(HTML("<h4 style='color: #4285f4;'>🔢 Detected: Code input verification</h4>"))
+            take_screenshot(driver, f"verification_code_attempt_{attempt}_before")
+
+            print(f"\n{'='*70}")
+            print("🔢 VERIFICATION CODE REQUIRED")
+            print(f"{'='*70}")
+            print("Check your phone for a 6-digit code")
+            print(f"{'='*70}\n")
+
+            otp = input(f"Enter Verification Code (Attempt {attempt}/{max_attempts}): ").strip()
+            if not otp:
+                if attempt < max_attempts:
+                    time.sleep(2)
+                    continue
+                return False
+
+            code_input.clear()
+            code_input.send_keys(otp)
+            time.sleep(SHORT_WAIT)
+
+            next_button_found = False
+            next_selectors = ["//button[@id='next']", "//button[contains(., 'Next')]", "//button[@type='submit']"]
+            for selector in next_selectors:
+                try:
+                    next_btn = driver.find_element(By.XPATH, selector)
+                    if next_btn.is_displayed() and next_btn.is_enabled():
+                        next_btn.click()
+                        next_button_found = True
+                        break
+                except:
+                    continue
+
+            if not next_button_found:
+                code_input.send_keys(Keys.RETURN)
+
+            time.sleep(4)
+            take_screenshot(driver, f"verification_code_attempt_{attempt}_after_submit")
+
+            if comprehensive_login_check(driver):
+                ipy_display(HTML(f"<h3 style='color: #34a853;'>✅ Verification successful on attempt {attempt}!</h3>"))
+                return True
+
+            if attempt < max_attempts:
+                time.sleep(2)
+                continue
+            return False
+        except Exception as e:
+            if attempt < max_attempts:
+                time.sleep(2)
+                continue
+            return False
+    return False
+
+def handle_google_login_fast(driver, wait):
+    """⚡ FAST LOGIN WITH PROPER DETECTION"""
+    try:
+        print("\n" + "="*70)
+        print("🔐 FAST GOOGLE LOGIN")
+        print("="*70)
+
+        # Step 1: Try loading cookies
+        print("\n📍 Step 1: Trying to load saved cookies...")
+        if load_cookies(driver):
+            driver.refresh()
+            time.sleep(2)
+            take_screenshot(driver, "after_cookie_load")
+
+            if comprehensive_login_check(driver, "after cookies"):
+                ipy_display(HTML("<h2 style='color: #34a853;'>✅ LOGGED IN WITH COOKIES!</h2>"))
+                save_cookies(driver)
+                return True
+
+        # Step 2: Navigate to login page
+        print("\n📍 Step 2: Opening Google login page...")
+        driver.get("https://accounts.google.com/")
+        time.sleep(3)
+        take_screenshot(driver, "login_page_initial")
+
+        # Check if already logged in even on accounts page
+        if comprehensive_login_check(driver, "accounts page"):
+            print("✅ Already logged in on accounts page!")
+            save_cookies(driver)
+            return True
+
+        # Step 3: Extract page details
+ 
+<truncated 21930 bytes>
+
+NOTE: The output was truncated because it was too long. Use a more targeted query or a smaller range to get the information you need.

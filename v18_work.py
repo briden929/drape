@@ -62,10 +62,10 @@ print("🔑 STEP 1: INITIALIZING SECRETS & CONFIGURATION")
 print("=" * 80)
 
 _FALLBACKS = {
-    'DATABASE_URL': 'postgresql://postgres.cfgthwsqgmvtftlyoamj:Daxil%4016%3F80!@aws-0-ap-northeast-1.pooler.supabase.com:6543/postgres',
+    'DATABASE_URL': 'postgresql://MASKED',
     'R2_ACCOUNT_ID': '8e22889fff8e7c874800278c4bdcb26c',
-    'R2_ACCESS_KEY_ID': 'e90045f23e9cd55bb08238384b771bf2',
-    'R2_SECRET_ACCESS_KEY': '0b0e32afb39cf06d1682968ee7dc1750526b04c2ea16b200fb6027b070e7d4d6',
+    'R2_ACCESS_KEY_ID': 'MASKED',
+    'R2_SECRET_ACCESS_KEY': 'MASKED',
     'R2_BUCKET_NAME': 'studio-photoshoot',
     'R2_PUBLIC_URL': 'https://pub-943056d53cd64d87aef37136315753a7.r2.dev',
     'REDIS_URL': 'rediss://default:gQAAAAAABH39AAIgcDIzNDM4OTNlMTY0NDU0MWQ0YmYwMDJmZWMxOTc0N2Q4NQ@harmless-orca-294397.upstash.io:6379',
@@ -79,8 +79,15 @@ os.environ.setdefault("REDIS_KEY_PREFIX", "vastralook:")
 QUEUE_NAME = 'generations'
 REDIS_KEY_PREFIX = os.environ.get('REDIS_KEY_PREFIX', 'vastralook:')
 REDIS_URL = os.environ.get('REDIS_URL')
-MAX_CONCURRENT_TABS = 4          # T0, T1, T2, T3
-CHROME_WMR_WORKERS = 4                 # W0, W1, W2, W3
+
+GEMINI_WORKERS = 4
+WMR_WORKERS = 4
+BULLMQ_CONCURRENCY = 8
+GEMINI_ADMISSION_SIZE = 4
+CHROME_WMR_WORKERS = WMR_WORKERS
+MAX_CONCURRENT_TABS = GEMINI_WORKERS
+          # T0, T1, T2, T3
+                 # W0, W1, W2, W3
 GENERATION_TIMEOUT_S = 240
 LOCAL_REDIS_PORT = 16379
 MAX_NEW_CHAT_RETRIES = 3
@@ -1034,336 +1041,6 @@ active_wmr = {}           # job_id -> WMR state dict
 counters = {"completed": 0, "failed": 0}
 last_status_print = 0.0
 
-def find_first_idle_tab():
-    """Strict lowest-ID priority: T0 -> T1 -> T2 -> T3."""
-    for tid, state, cur_jid, start_time in gemini_pool.status():
-        jid = (cur_jid or "---")[:12]
-        elapsed = f"{int(now - start_time)}s" if start_time > 0 else "0s"
-        print(f"  T{tid} = {state:<13} {elapsed:>3}  {jid}")
-
-    print("\nWMR")
-    for wid, state, cur_jid in wmr_status:
-        jid_str = (cur_jid or "---")[:12]
-        print(f"  W{wid} = {state:<13} Job={jid_str}")
-
-    if active_downloads:
-        print("\nDOWNLOADS")
-        for jid, dinfo in list(active_downloads.items()):
-            state_str = dinfo.get('state','?')
-            print(f"  {jid[:12]} = {state_str} {now - dinfo['started_at']:.1f}s")
-            
-    print("=" * 68 + "\n")
-
-
-# ============================================================================
-# GEMINI WORKER POOL
-# ============================================================================
-
-class GeminiWorker:
-    def __init__(self, tid: int):
-        self.tid = tid
-        self.state = "IDLE"
-        self.current_job_id = None
-        self.start_time = 0
-        self.driver = None
-
-    def start(self):
-        self._thread = threading.Thread(
-            target=self._run_loop, daemon=True,
-            name=f"GeminiWorker-T{self.tid}"
-        )
-        self._thread.start()
-        log(f"[T{self.tid}] Gemini worker slot registered (LAZY)")
-
-
-    def _ensure_driver(self):
-        if not self.driver:
-            self.driver = create_gemini_driver(self.tid)
-            self.driver.get("data:,")
-        return self.driver
-        
-
-    def _run_loop(self):
-        while True:
-            try:
-                future = asyncio.run_coroutine_threadsafe(GEMINI_ADMISSION_Q.get(), main_loop)
-                item = future.result()
-            except Exception as e:
-                log(f"[T{self.tid}] GEMINI ADMISSION GET FAILED: {e}")
-                import time
-                time.sleep(1)
-                continue
-                
-            if item is None: break
-            self.current_job_id = item["job_id"]
-            self.state = "SUBMITTING"
-            self.start_time = time.time()
-            
-            try:
-                self._process_job(item)
-            except Exception as e:
-                log(f"[T{self.tid}][{self.current_job_id}] GEMINI_FAILED: {e}")
-                _fail_job(self.current_job_id, item.get("gen"), f"Gemini failed: {e}", item.get("future"), 1)
-            finally:
-                self.state = "IDLE"
-                self.current_job_id = None
-                self.start_time = 0
-                try:
-                    main_loop.call_soon_threadsafe(GEMINI_ADMISSION_Q.task_done)
-                except Exception:
-                    pass
-    def _process_job(self, item):
-        job_id = item["job_id"]
-        prompt = item["prompt"]
-        refs = item["refs"]
-        loop = item.get("loop") or asyncio.new_event_loop()
-        future = item["future"]
-        prefix = f"[T{self.tid}][{job_id}]"
-        
-        drv = self._ensure_driver()
-        
-        # 1. Fresh tab
-        drv.switch_to.new_window('tab')
-        drv.get("https://gemini.google.com/app")
-        log(f"{prefix} FRESH_BROWSER_READY")
-        log(f"{prefix} BASE_URL_READY")
-        log(f"{prefix} NEW_CHAT_SKIPPED_FRESH_BROWSER")
-        
-        # Setup isolated download directory for this job
-        chrome_job_dir, incoming_dir = get_chrome_job_dir(self.tid, job_id)
-        set_tab_download_dir(drv, str(incoming_dir))
-        
-        # 2. Wait for composer
-        _wait_for_composer(drv)
-        log(f"{prefix} CLEAN_COMPOSER_VERIFIED")
-        
-        # 3. Flash mode
-        ensure_flash_mode(drv, self.tid, job_id)
-        
-        # 4. Create Image mode
-        ensure_create_image_mode(drv, self.tid, job_id)
-        
-        # 5. Upload files
-        expected_refs = [p for p in refs if p]
-        ref_paths = [str(Path(p).resolve()) for p in expected_refs]
-        
-        if ref_paths:
-            perform_robust_upload(drv, ref_paths, self.tid, job_id)
-            verified, actual = verify_attachment_count(drv, len(ref_paths), self.tid, job_id)
-            if not verified:
-                raise Exception(f"ATTACHMENT_MISMATCH: expected {len(ref_paths)}, got {actual}")
-                
-        # 6. Prompt
-        _inject_prompt_atomic(drv, prompt, self.tid, job_id)
-        
-        urls_before = snapshot_urls(drv)
-        chat_urls = set()
-        
-        # 7. Send
-        log(f"{prefix} SEND_REQUESTED")
-        if not _click_send_button(drv, self.tid, job_id):
-            raise Exception("SEND_FAILED: Could not click send button")
-        log(f"{prefix} SEND_CLICKED")
-        
-        # 8. Verify generation started
-        log(f"{prefix} GENERATION_SIGNAL_SEARCH")
-        if not verify_generation_started(drv):
-            raise Exception("GEN_START_FAILED: No generation signal after Send")
-            
-        self.state = "GENERATING"
-        log(f"{prefix} GENERATING ✅")
-        
-        # 9. Wait for image detection (Inline polling instead of global scheduler)
-        t0 = time.time()
-        image_detected = False
-        hover_ok = False
-        cdp_ok = False
-        
-        while time.time() - t0 < GENERATION_TIMEOUT_S:
-            status, new_src = nb_check_image(drv, urls_before, chat_urls)
-            if status == 'SUCCESS':
-                image_detected = True
-                if new_src:
-                    urls_before.add(new_src)
-                break
-            time.sleep(1.0)
-            
-        if not image_detected:
-            raise Exception("GENERATION_TIMEOUT")
-            
-        log(f"{prefix} IMAGE_DETECTED")
-        
-        # 10. Click Download
-        hover_ok = _hover_and_dl_single_click(drv, urls_before, chat_urls)
-        log(f"{prefix} DOWNLOAD_CLICKED (hover_ok={hover_ok})")
-        
-        raw_path = chrome_job_dir / f"{job_id}_raw.png"
-        download_state = "DOWNLOAD_WAITING"
-        
-        if not hover_ok:
-            cdp_ok = _direct_fetch_cdp(drv, str(raw_path), urls_before)
-            if cdp_ok:
-                log(f"{prefix} CDP_FALLBACK_CAPTURE ({raw_path.stat().st_size // 1024} KB)")
-                download_state = "CHROME_RAW_READY"
-
-        self.state = "DOWNLOAD_WAITING"
-        
-        # 11. Wait for .crdownload
-        files_before = set(os.listdir(incoming_dir)) if incoming_dir.exists() else set()
-        dl_confirmed = False
-        
-        if not cdp_ok:
-            t1 = time.time()
-            while time.time() - t1 < DOWNLOAD_START_WINDOW_S:
-                if incoming_dir.exists():
-                    cur = set(os.listdir(incoming_dir))
-                    new_files = cur - files_before
-                    if any(fn.endswith('.crdownload') or fn.lower().endswith(('.png','.jpg','.jpeg','.webp')) for fn in new_files):
-                        dl_confirmed = True
-                        break
-                time.sleep(0.3)
-                
-            if not dl_confirmed:
-                raise Exception("DOWNLOAD_START_FAILED")
-                
-            log(f"{prefix} DOWNLOAD_START_CONFIRMED")
-        
-        dinfo = {
-            "gen": item.get("gen") or {"id": job_id},
-            "tid": self.tid,
-            "incoming_dir": incoming_dir,
-            "chrome_job_dir": chrome_job_dir,
-            "files_before": files_before,
-            "started_at": time.time(),
-            "state": download_state,
-            "future": future,
-            "attempt": 1,
-            "loop": loop
-        }
-        
-        # Register for background filesystem polling
-        active_downloads[job_id] = dinfo
-        
-        if cdp_ok:
-            _enqueue_wmr(job_id, dinfo)
-        
-        # 12. Close Tab & Release Worker
-        try:
-            drv.close()
-        except Exception:
-            pass
-            
-        # Ensure we switch back to dummy tab so driver doesn't hang
-        try:
-            drv.switch_to.window(drv.window_handles[0])
-        except Exception:
-            pass
-            
-        log(f"{prefix} PHYSICAL_TAB_CLOSED")
-        log(f"{prefix} T WORKER RELEASED")
-
-class GeminiWorkerPool:
-    def __init__(self, max_workers=MAX_CONCURRENT_TABS):
-        self.workers = [GeminiWorker(i) for i in range(max_workers)]
-
-    def start_all(self):
-        for w in self.workers:
-            w.start()
-
-        
-    def status(self):
-        return [(w.tid, w.state, w.current_job_id, w.start_time) for w in self.workers]
-        
-
-
-
-
-
-redis_queue_stats = {
-    "wait": 0,
-    "active": 0,
-    "delayed": 0,
-    "prioritized": 0,
-    "waiting-children": 0,
-}
-
-async def update_redis_queue_stats_loop():
-    from bullmq import Queue
-    q = Queue(
-        QUEUE_NAME,
-        {
-            "connection": REDIS_URL,
-            "prefix": REDIS_KEY_PREFIX,
-        }
-    )
-
-    try:
-        while True:
-            try:
-                counts = await q.getJobCounts()
-
-                redis_queue_stats["wait"] = counts.get("waiting", 0)
-                redis_queue_stats["active"] = counts.get("active", 0)
-                redis_queue_stats["delayed"] = counts.get("delayed", 0)
-                redis_queue_stats["prioritized"] = counts.get("prioritized", 0)
-                redis_queue_stats["waiting-children"] = counts.get("waiting-children", 0)
-
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                log(f"Redis stats update failed: {e}", file=sys.stderr)
-
-            await asyncio.sleep(2.5)
-
-    finally:
-        try:
-            await q.close()
-        except Exception:
-            pass
-
-
-redis_queue_stats = {
-    "wait": 0,
-    "active": 0,
-    "delayed": 0,
-    "prioritized": 0,
-    "waiting-children": 0,
-}
-
-async def update_redis_queue_stats_loop():
-    from bullmq import Queue
-    q = Queue(
-        QUEUE_NAME,
-        {
-            "connection": REDIS_URL,
-            "prefix": REDIS_KEY_PREFIX,
-        }
-    )
-    try:
-        while True:
-            try:
-                counts = await q.getJobCounts()
-                redis_queue_stats["wait"] = counts.get("waiting", 0)
-                redis_queue_stats["active"] = counts.get("active", 0)
-                redis_queue_stats["delayed"] = counts.get("delayed", 0)
-                redis_queue_stats["prioritized"] = counts.get("prioritized", 0)
-                redis_queue_stats["waiting-children"] = counts.get("waiting-children", 0)
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                log(f"Redis stats update failed: {e}", file=sys.stderr)
-            await asyncio.sleep(2.5)
-    finally:
-        try:
-            await q.close()
-        except Exception:
-            pass
-
-# ============================================================================
-# COMPACT PIPELINE STATUS
-# ============================================================================
-
-last_status_print = 0
 def print_pipeline_status():
     global last_status_print
     now = time.time()
@@ -1405,9 +1082,43 @@ def print_pipeline_status():
     print(f"  DONE={counters['completed']} | FAIL={counters['failed']}")
     print("=" * 68 + "\n")
 
+
+redis_queue_stats = {
+    "wait": 0, "active": 0, "delayed": 0, "prioritized": 0, "waiting-children": 0,
+}
+
+async def update_redis_queue_stats_loop():
+    from bullmq import Queue
+    q = Queue(QUEUE_NAME, {"connection": REDIS_URL, "prefix": REDIS_KEY_PREFIX})
+    try:
+        while True:
+            try:
+                counts = await q.getJobCounts()
+                redis_queue_stats.update({k: counts.get(k, 0) for k in redis_queue_stats.keys()})
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                log(f"Redis stats update failed: {e}", file=sys.stderr)
+            await asyncio.sleep(2.5)
+    finally:
+        try:
+            await q.close()
+        except Exception:
+            pass
+
+
 async def central_scheduler_loop():
     while True:
         try:
+            # Stage 0: Assign Gemini jobs
+            for w in gemini_pool.workers:
+                if w.state == "IDLE" and w.job_queue.empty():
+                    try:
+                        job = GEMINI_ADMISSION_Q.get_nowait()
+                        w.job_queue.put(job)
+                    except asyncio.QueueEmpty:
+                        break
+
             # Stage 1: Poll Chrome filesystem download watchers
             await poll_active_downloads()
 
@@ -1418,6 +1129,7 @@ async def central_scheduler_loop():
             print_pipeline_status()
 
         except Exception as e:
+            import sys
             log(f"Scheduler loop error: {e}", file=sys.stderr)
 
         await asyncio.sleep(0.1)
@@ -1557,7 +1269,7 @@ async def main():
     WMR_GLOBAL_Q = queue.Queue()
     
     gemini_pool = GeminiWorkerPool(MAX_CONCURRENT_TABS)
-    wmr_pool = WmrWorkerPool(MAX_WMR_WORKERS)
+    wmr_pool = WmrWorkerPool(CHROME_WMR_WORKERS)
     
     preflight_validate_runtime()
     run_startup_self_test()
@@ -1606,4 +1318,47 @@ async def main():
 if __name__ == '__main__':
     import nest_asyncio
     nest_asyncio.apply()
-    asyncio.run(main())
+    asyncio.run(main()
+    def _run_loop(self):
+        while True:
+            item = self.job_queue.get()
+            if item is None: break
+            
+            self.current_job_id = item["job_id"]
+            self.state = "SUBMITTING"
+            self.start_time = time.time()
+            
+            try:
+                self._process_job(item)
+            except Exception as e:
+                log(f"[T{self.tid}][{self.current_job_id}] GEMINI_FAILED: {e}")
+                _fail_job(self.current_job_id, item.get("gen"), f"Gemini failed: {e}", item.get("future"), 1)
+            finally:
+                if self.driver and self.current_window_handle:
+                    try:
+                        self.driver.switch_to.window(self.current_window_handle)
+                        
+                    except Exception as ex:
+                        log(f"[T{self.tid}] Failed to close tab: {ex}", file=sys.stderr)
+                        try:
+                            self.driver.quit()
+                        except: pass
+                        self.driver = None
+                
+                # If window handles are messed up, just quit to be safe
+                if self.driver:
+                    try:
+                        if len(self.driver.window_handles) == 0:
+                            self.driver.quit()
+                            self.driver = None
+                    except:
+                        try: self.driver.quit()
+                        except: pass
+                        self.driver = None
+
+                self.state = "IDLE"
+                self.current_job_id = None
+                self.start_time = 0
+                self.current_window_handle = None
+                self.job_queue.task_done()
+

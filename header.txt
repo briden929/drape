@@ -1,0 +1,191 @@
+﻿# @title 🚀 ECOM PHOTOSHOOT N2N QUEUE WORKER - V16
+# ============================================================================
+# PURPOSE:
+#   Production BullMQ worker for AI ECOM fashion photoshoot generation.
+#
+# COMPLETE N2N FLOW:
+#   BullMQ Job
+#       ↓
+#   PostgreSQL generation lookup
+#       ↓
+#   Resolve prompt + ALL reference images
+#       ↓
+#   Gemini Chrome T0-T3
+#       ↓
+#   Generate image
+#       ↓
+#   REAL Browser.downloadWillBegin
+#       ↓
+#   RELEASE GEMINI RESOURCE IMMEDIATELY
+#       ↓
+#   Raw PNG continues downloading independently
+#       ↓
+#   RAW PNG filesystem validation
+#       ↓
+#   WMR Chrome W0-T0 ... W3-T1
+#       ↓
+#   REAL watermark-removal operation
+#       ↓
+#   REAL Browser.downloadWillBegin
+#       ↓
+#   RELEASE WMR RESOURCE IMMEDIATELY
+#       ↓
+#   Clean PNG continues downloading independently
+#       ↓
+#   PNG validation
+#       ↓
+#   WebP conversion + validation
+#       ↓
+#   Cloudflare R2 upload
+#       ↓
+#   PostgreSQL finalization
+#       ↓
+#   Credit settlement
+#       ↓
+#   BullMQ SUCCESS
+#
+# ============================================================================
+# INPUT SOURCE:
+#   BullMQ queue:
+#       generations
+#
+#   Each BullMQ job resolves:
+#       generationId
+#       prompt
+#       garment reference
+#       mannequin/model reference
+#       hologram/style reference when required
+#       user_id
+#       generation metadata
+#
+# ============================================================================
+# GEMINI RESOURCES:
+#   T0
+#   T1
+#   T2
+#   T3
+#
+#   Total logical Gemini resources = 4
+#   Gemini resources are persistent/lazy.
+#
+# ============================================================================
+# WMR RESOURCES:
+#   W0-T0
+#   W0-T1
+#   W1-T0
+#   W1-T1
+#   W2-T0
+#   W2-T1
+#   W3-T0
+#   W3-T1
+#
+#   Total logical WMR resources = 8
+#
+#   IMPORTANT:
+#   Every logical WMR slot must have isolated Chrome ownership.
+#   Never share the same Chrome profile between W0-T0 and W0-T1.
+#
+# ============================================================================
+# LOCAL STORAGE:
+#
+#   Base:
+#       /content/queue_worker_bundle/
+#
+#   Reference cache:
+#       /content/queue_worker_bundle/queue_worker_state/refs/
+#
+#   Gemini downloads:
+#       /content/downloads/chrome/T0/<job_id>/incoming/
+#       /content/downloads/chrome/T1/<job_id>/incoming/
+#       /content/downloads/chrome/T2/<job_id>/incoming/
+#       /content/downloads/chrome/T3/<job_id>/incoming/
+#
+#   WMR downloads:
+#       /content/downloads/wmr_staging/W0-T0/<job_id>/
+#       /content/downloads/wmr_staging/W0-T1/<job_id>/
+#       /content/downloads/wmr_staging/W1-T0/<job_id>/
+#       /content/downloads/wmr_staging/W1-T1/<job_id>/
+#       /content/downloads/wmr_staging/W2-T0/<job_id>/
+#       /content/downloads/wmr_staging/W2-T1/<job_id>/
+#       /content/downloads/wmr_staging/W3-T0/<job_id>/
+#       /content/downloads/wmr_staging/W3-T1/<job_id>/
+#
+#   Final:
+#       /content/downloads/final_output/<job_id>/
+#
+# ============================================================================
+# RESOURCE RULE:
+#
+#   Gemini:
+#       generation complete
+#           ↓
+#       REAL download start detected
+#           ↓
+#       release T immediately
+#           ↓
+#       raw download continues independently
+#
+#   WMR:
+#       watermark removal complete
+#           ↓
+#       REAL download start detected
+#           ↓
+#       release W slot immediately
+#           ↓
+#       clean download continues independently
+#
+# ============================================================================
+# BROWSER:
+#   Chrome ONLY
+#   No Microsoft Edge
+#   No EdgeOptions
+#   No msedgedriver
+#   No Playwright replacement
+#
+# ============================================================================
+# REMOTE UI:
+#   Xvfb
+#   x11vnc
+#   noVNC
+#   Cloudflare tunnel
+#
+#   Used for:
+#   - Google login
+#   - CAPTCHA
+#   - 2FA / manual intervention
+#
+# ============================================================================
+# SECURITY:
+#   Secrets ONLY from environment / Colab Secrets.
+#   Never print:
+#       DATABASE_URL
+#       REDIS_URL
+#       R2_ACCESS_KEY_ID
+#       R2_SECRET_ACCESS_KEY
+#       cookies
+#       Google credentials
+#
+# ============================================================================
+# FAILURE ISOLATION:
+#   One failed Gemini/WMR resource must not kill the entire worker.
+#   Resource failure:
+#       mark DEAD
+#       recover/restart resource
+#       return resource to broker only after health verification
+#
+# ============================================================================
+# RUNTIME MODEL:
+#   ONE BullMQ Worker
+#   ONE central pipeline scheduler
+#   ONE download monitor
+#   ONE Gemini broker
+#   ONE WMR broker
+#   ONE runtime supervisor
+#   ONE shutdown path
+#
+# ============================================================================
+# IMPORTANT:
+#   Preserve proven Steps 1-10.
+#   Existing V9.1 browser DOM operations remain the source of truth.
+#   V15/V16 controls orchestration, lifecycle, recovery and persistence.
+# ============================================================================

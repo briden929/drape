@@ -1,0 +1,42 @@
+def push_generation(image_path, prompt, user_id=None, params=None, gen_id=None, webp_path=None, force=False):
+    if not fs_configured():
+        raise RuntimeError('fashion-studio push not configured')
+    target_user_id = user_id or FASHION_STUDIO_USER_ID
+    if not target_user_id:
+        raise RuntimeError('no fashion-studio account linked')
+    ext = Path(image_path).suffix.lstrip('.').lower() or 'png'
+    if ext == 'jpeg':
+        ext = 'jpg'
+    content_type = mimetypes.guess_type(image_path)[0] or 'image/png'
+    gen_id = gen_id or str(uuid.uuid4())
+    key = f'generations/{target_user_id}/{gen_id}.{ext}'
+    with open(image_path, 'rb') as f:
+        data = f.read()
+    _r2_client().put_object(Bucket=R2_BUCKET_NAME, Key=key, Body=data, ContentType=content_type, CacheControl='public, max-age=31536000, immutable')
+    output_url = f'{R2_PUBLIC_URL}/{key}'
+    webp_url = None
+    if webp_path and os.path.exists(webp_path):
+        webp_key = f'generations/{target_user_id}/{gen_id}.webp'
+        with open(webp_path, 'rb') as f:
+            webp_data = f.read()
+        _r2_client().put_object(Bucket=R2_BUCKET_NAME, Key=webp_key, Body=webp_data, ContentType='image/webp', CacheControl='public, max-age=31536000, immutable')
+        webp_url = f'{R2_PUBLIC_URL}/{webp_key}'
+    conn = sys.modules['db'].borrow()
+    try:
+        cur = conn.cursor()
+        cur.execute("UPDATE image_generations SET output_url = %s, webp_url = %s, status = 'done', completed_at = NOW() WHERE id = %s", (output_url, webp_url, gen_id))
+        conn.commit()
+    finally:
+        conn.close()
+    return {'output_url': output_url, 'webp_url': webp_url, 'gen_id': gen_id}
+_mod_fs.configured = fs_configured
+_mod_fs.fashion_tryon_prompt = fashion_tryon_prompt
+_mod_fs.download_remote_image = download_remote_image
+_mod_fs.push_generation = push_generation
+print("  ✅ Backend module 'fashion_studio' loaded.\n")
+print('=' * 80)
+print('🖥️ STEP 5: INITIALIZING VIRTUAL DISPLAY & NOVNC STREAMING')
+print('=' * 80)
+_display_obj = _x11vnc_proc = _novnc_proc = _cf_proc = None
+
+def 

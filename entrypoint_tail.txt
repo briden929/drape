@@ -1,0 +1,149 @@
+    except Exception as _startup_err:
+        log(f"[V14] STARTUP FAILED: {_startup_err}")
+        _worker_started = False
+        raise
+
+    finally:
+        log("[V14] Shutdown started")
+
+        for task in (download_task,):
+            task.cancel()
+
+        await asyncio.gather(
+            download_task,
+            return_exceptions=True,
+        )
+
+        try:
+            await worker.close()
+        except Exception as e:
+            log(f"[V14] BullMQ shutdown warning: {e}")
+
+        try:
+            if gemini_pool:
+                gemini_pool.quit_all()
+        except Exception as e:
+            log(f"[V14] Gemini shutdown warning: {e}")
+
+        try:
+            if wmr_pool:
+                wmr_pool.quit_all()
+        except Exception as e:
+            log(f"[V14] WMR shutdown warning: {e}")
+
+        log("[V14] Shutdown complete")
+
+# ==============================================================================
+# ENTRYPOINT — DUAL MODE: Colab/Jupyter + Terminal
+# ==============================================================================
+# Colab (inside running event loop):
+#     await main()
+#   OR — if source executed via exec() in a cell:
+#     start_in_current_environment() is called automatically at module level
+#
+# Terminal:
+#     python FULL_QUEUE_WORKER_V14_FINAL.py
+#   -> asyncio.run(main()) via run_worker_terminal()
+# ==============================================================================
+
+def is_running_in_notebook():
+    """Detect whether we are inside an IPython/Colab/Jupyter environment."""
+    try:
+        from IPython import get_ipython
+        shell = get_ipython()
+        if shell is None:
+            return False
+        return type(shell).__name__ in (
+            "ZMQInteractiveShell",   # Jupyter / Colab
+            "TerminalInteractiveShell",  # IPython terminal
+            "InteractiveShell",
+        )
+    except Exception:
+        return False
+
+
+def start_in_current_environment():
+    """
+    Universal entrypoint.  Call from any context:
+
+      • Colab cell that exec()s the source
+      • import + manual call
+      • terminal (fallback)
+
+    Returns:
+      asyncio.Task  — when scheduled onto an existing running loop
+      None          — when asyncio.run(main()) is used (blocking terminal path)
+    """
+    global worker_main_task, _worker_started
+
+    # ── Double-start guard ──────────────────────────────────────────────────
+    if _worker_started:
+        if worker_main_task is not None and not worker_main_task.done():
+            log("[WARN] V14 worker is already running — ignoring duplicate start")
+            return worker_main_task
+        # Previous task finished/crashed — allow restart
+        _worker_started = False
+
+    # ── Detect whether an event loop is already running ─────────────────────
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+
+    if loop is not None and loop.is_running():
+        # ── Colab / Jupyter path ────────────────────────────────────────────
+        # We are inside an already-running event loop (IPython's).
+        # Schedule main() as a task on that loop — never call asyncio.run().
+        log("[V14] Colab/Jupyter event loop detected — scheduling worker task")
+        _worker_started = True
+        worker_main_task = loop.create_task(main(), name="v14-worker-main")
+        # Add a done-callback so we can see if it crashes silently
+        def _on_done(t):
+            if t.cancelled():
+                log("[V14] Worker task cancelled")
+            elif t.exception():
+                log(f"[V14] Worker task CRASHED: {t.exception()}")
+            else:
+                log("[V14] Worker task completed normally")
+        worker_main_task.add_done_callback(_on_done)
+        return worker_main_task
+    else:
+        # ── Terminal / subprocess path ───────────────────────────────────────
+        log("[V14] No running event loop — using asyncio.run()")
+        _worker_started = True
+        try:
+            asyncio.run(main())
+        finally:
+            _worker_started = False
+        return None
+
+
+def run_worker_terminal():
+    """Blocking terminal entrypoint.  Use: python FULL_QUEUE_WORKER_V14_FINAL.py"""
+    return asyncio.run(main())
+
+
+# ── Auto-exec when this file is the __main__ module ────────────────────────
+# Also auto-exec when exec()'d from a Colab cell (since __name__ won't be
+# "__main__" there, we rely on the module-level call below).
+
+if __name__ == "__main__":
+    # Terminal execution: python FULL_QUEUE_WORKER_V14_FINAL.py
+    start_in_current_environment()
+
+
+# ── Colab exec() auto-start ─────────────────────────────────────────────────
+# When the user does: exec(open("FULL_QUEUE_WORKER_V14_FINAL.py").read())
+# inside a Colab cell, __name__ is NOT "__main__".
+# We detect a running IPython loop and auto-schedule if that's the case.
+# The guard _worker_started prevents double-scheduling on import.
+
+if __name__ != "__main__" and not _worker_started:
+    try:
+        _loop = asyncio.get_running_loop()
+        if _loop is not None and _loop.is_running():
+            # Running inside Colab cell via exec() — auto-start
+            start_in_current_environment()
+    except RuntimeError:
+        pass  # No running loop — module was imported, not exec()'d
+

@@ -1,0 +1,2336 @@
+<USER_REQUEST>
+===============================================================
+REDIS / BULLMQ / GEMINI / WMR WORKER
+FULL 466-FILE FORENSIC RECONSTRUCTION
+PHASE 1 + PHASE 2 MASTER INSTRUCTION
+===============================================================
+
+PROJECT ROOT:
+
+C:\Users\PC\.gemini\antigravity\scratch\Reddis
+
+IMPORTANT:
+This folder currently contains approximately 466 files.
+
+These files are NOT assumed to be clean.
+They are NOT assumed to be independent.
+They are NOT assumed to be current.
+They are NOT assumed to be correct.
+They are NOT assumed to be production-ready.
+
+The folder contains multiple generations of:
+- production workers
+- partial workers
+- V9/V11/V12/V13/V14 implementations
+- N2N rebuilds
+- browser-operation references
+- ECOM implementations
+- login implementations
+- extraction scripts
+- source generators
+- patch scripts
+- repair scripts
+- validation scripts
+- audit reports
+- test scripts
+- prompts
+- intermediate files
+- duplicate versions
+- failed experiments
+- architecture experiments
+- source dumps
+- extracted functions
+- historical references
+
+Your job now is NOT to blindly continue patching the latest file.
+
+Your first job is to understand the ENTIRE repository and reconstruct its
+actual technical history.
+
+===============================================================
+CORE OBJECTIVE
+===============================================================
+
+Before making architectural changes, determine:
+
+1. WHAT every file is.
+2. WHY every file exists.
+3. WHICH source/version it came from.
+4. WHAT functionality it contains.
+5. WHICH functionality is proven to work.
+6. WHICH functionality is only static/mock/test evidence.
+7. WHICH functionality was broken and later repaired.
+8. WHICH implementation contains the strongest real browser operations.
+9. WHICH implementation contains the strongest queue architecture.
+10. WHICH implementation contains the strongest login flow.
+11. WHICH implementation contains the strongest download handling.
+12. WHICH implementation contains the strongest WMR flow.
+13. WHICH implementation contains the strongest R2/DB/credits flow.
+14. WHICH implementation contains the strongest asyncio architecture.
+15. WHICH implementation contains dependency bootstrap.
+16. WHICH code must be preserved.
+17. WHICH code must NOT be copied.
+18. WHICH code is obsolete.
+19. WHICH code is duplicate.
+20. WHICH code is generated from another file.
+21. WHICH scripts modified which other scripts.
+22. WHICH final architecture should be reconstructed.
+
+Do not infer these answers from filenames alone.
+
+Read the actual source.
+
+===============================================================
+ABSOLUTE RULE #1
+READ THE ENTIRE FOLDER
+===============================================================
+
+Recursively inspect:
+
+C:\Users\PC\.gemini\antigravity\scratch\Reddis
+
+Do NOT only inspect *.py.
+
+Inventory ALL file types, including:
+
+.py
+.txt
+.md
+.json
+.yaml
+.yml
+.log
+.csv
+.html
+.js
+.ps1
+.bat
+.sh
+.ipynb
+.env examples
+configuration files
+reports
+prompts
+generated artifacts
+test outputs
+source dumps
+anything else present
+
+First produce:
+
+PROJECT_FILE_INVENTORY.md
+
+The inventory must contain one row per file.
+
+For EVERY file record:
+
+- relative path
+- filename
+- extension
+- size
+- modified timestamp if available
+- file type
+- likely purpose
+- source generation/version
+- whether it is source/reference/test/tool/report/prompt/etc.
+- imports/dependencies if applicable
+- files it appears to read
+- files it appears to generate
+- files it appears to modify
+- whether it contains production logic
+- whether it contains browser logic
+- whether it contains queue logic
+- whether it contains authentication logic
+- whether it contains download logic
+- whether it contains WMR logic
+- whether it contains R2/DB/credits logic
+- whether it contains tests
+- whether it is historical
+- whether it is a patch/generator
+- whether it should be preserved
+- confidence level
+
+Do not stop at the first 20, 50, or 100 files.
+
+Process ALL approximately 466 files.
+
+===============================================================
+ABSOLUTE RULE #2
+DO NOT MODIFY THE EXISTING SOURCE DURING FORENSIC ANALYSIS
+===============================================================
+
+During the initial forensic phase:
+
+DO NOT:
+- overwrite production files
+- delete files
+- rename files
+- concatenate files
+- patch files
+- "clean up" files
+- automatically fix code
+- regenerate V14
+- replace N2N
+- run destructive scripts
+- delete old versions
+- assume the newest file is best
+
+The existing repository is evidence.
+
+Preserve it exactly while reconstructing the architecture.
+
+If a script itself is designed to modify another file, DO NOT execute it
+against the production source during Phase 1.
+
+You may statically inspect the script to determine what it WOULD modify.
+
+===============================================================
+ABSOLUTE RULE #3
+READ SOURCE FILES, NOT JUST FILENAMES
+===============================================================
+
+For every Python source file:
+
+Read the complete source.
+
+Do NOT rely only on:
+- filename
+- first 100 lines
+- imports
+- grep results
+- function names
+- previous audit reports
+
+For each Python file extract:
+
+IMPORTS
+GLOBALS
+CONFIGURATION
+CLASSES
+FUNCTIONS
+ASYNC FUNCTIONS
+THREADS
+EXECUTORS
+EVENT LOOPS
+SELENIUM
+CHROME
+CDP
+BULLMQ
+REDIS
+POSTGRES
+R2
+S3
+GEMINI
+WMR
+DOWNLOADS
+AUTHENTICATION
+LOGIN
+COOKIES
+FILE UPLOAD
+IMAGE VALIDATION
+WEBP
+CREDITS
+DATABASE STATES
+FAILURE HANDLING
+RECOVERY
+RETRY
+TESTS
+ENTRYPOINTS
+
+Also inspect nested functions and helper functions.
+
+Do not assume a helper is irrelevant simply because it looks small.
+
+===============================================================
+FILE CLASSIFICATION SYSTEM
+===============================================================
+
+Classify every file into one or more categories.
+
+A. PRODUCTION CANDIDATE
+B. PRODUCTION SOURCE
+C. BROWSER REFERENCE
+D. ECOM REFERENCE
+E. LOGIN REFERENCE
+F. DOWNLOAD REFERENCE
+G. WMR REFERENCE
+H. QUEUE/BULLMQ REFERENCE
+I. DATABASE/R2/CREDITS REFERENCE
+J. ARCHITECTURE EXPERIMENT
+K. PATCH SCRIPT
+L. GENERATOR SCRIPT
+M. EXTRACTION SCRIPT
+N. SOURCE-DUMP SCRIPT
+O. VALIDATION SCRIPT
+P. UNIT TEST
+Q. MOCK TEST
+R. RUNTIME TEST
+S. AUDIT REPORT
+T. PROMPT
+U. DOCUMENTATION
+V. FAILED EXPERIMENT
+W. DUPLICATE
+X. OBSOLETE
+Y. UNKNOWN
+
+A file can have multiple classifications.
+
+Explain why.
+
+===============================================================
+RECONSTRUCT THE VERSION HISTORY
+===============================================================
+
+Build a source lineage graph.
+
+At minimum investigate:
+
+V9
+V10 if present
+V11
+V12
+V13
+V14
+V14 FINAL
+V14 N2N
+V14 N2N V1
+V14 N2N V2
+V14 N2N FINAL
+ECOM implementations
+login implementations
+browser references
+patch generations
+generator generations
+
+Do NOT assume version numbers represent quality.
+
+Determine:
+
+Which version introduced what?
+
+For example:
+
+- Chrome-only architecture
+- Gemini T0-T3
+- WMR W0-W3
+- WMR multiple tabs
+- First-Free scheduling
+- persistent Gemini tabs
+- download-start resource release
+- CDP download GUID correlation
+- Google login detection
+- login recovery
+- exact attachment validation
+- Flash/Create Image navigation
+- upload
+- prompt
+- send
+- generation detection
+- generated-image download
+- WMR upload
+- WMR processing detection
+- exact Download PNG
+- WebP conversion
+- R2
+- database
+- credits
+- BullMQ completion
+- dependency bootstrap
+- Colab asyncio
+- shutdown
+- failure isolation
+
+Create:
+
+SOURCE_LINEAGE.md
+
+===============================================================
+IMPORTANT SOURCE-OF-TRUTH INVESTIGATION
+===============================================================
+
+Identify the strongest source for each subsystem independently.
+
+DO NOT select one entire file as "the source of truth" merely because it
+is the newest version.
+
+Create a SOURCE_OF_TRUTH_MATRIX.md.
+
+Use this structure:
+
+SUBSYSTEM
+------------
+Dependency bootstrap
+Chrome creation
+Gemini profile creation
+Gemini T0-T3 lifecycle
+Gemini login detection
+Google login flow
+Cookie persistence
+New chat
+Flash/Create Image navigation
+File upload
+Attachment validation
+Prompt
+Send
+Generation detection
+Generated-image download
+CDP download events
+Download GUID correlation
+Raw image validation
+Gemini resource release
+WMR Chrome creation
+WMR profile lifecycle
+WMR tab lifecycle
+WMR multi-tab scheduling
+WMR global First-Free
+WMR upload
+WMR processing
+Exact Download PNG
+WMR download GUID
+WMR resource release
+PNG validation
+WebP conversion
+R2 upload
+Database state transition
+Credits settlement
+BullMQ job completion
+BullMQ failure
+Retry
+Timeout handling
+Thread safety
+Asyncio
+Colab entrypoint
+Standalone entrypoint
+Shutdown
+Crash isolation
+Logging
+Testing
+
+For each subsystem identify:
+
+- best file
+- exact function/class
+- approximate line range
+- version
+- why it is preferred
+- whether it was actually runtime-tested
+- whether it is only static-tested
+- dependencies
+- known defects
+- whether it should be preserved
+
+===============================================================
+BROWSER OPERATION MUST BE ANALYZED DEEPLY
+===============================================================
+
+The most important historical browser references are believed to include
+V11 and ECOM/browser-operation sources.
+
+Do NOT assume this is correct.
+
+Verify it from the actual files.
+
+For every candidate browser implementation inspect:
+
+1. Chrome startup
+2. Chrome profile creation
+3. remote debugging
+4. CDP
+5. Selenium connection
+6. login detection
+7. Google login
+8. cookie loading
+9. cookie saving
+10. Gemini navigation
+11. New Chat
+12. Flash/Create Image selection
+13. file upload
+14. attachment verification
+15. prompt insertion
+16. send button
+17. generation detection
+18. generated image detection
+19. download initiation
+20. download-start detection
+21. download completion
+22. image validation
+23. WMR navigation
+24. WMR upload
+25. WMR processing
+26. Download PNG
+27. PNG validation
+28. WebP conversion
+
+Identify exact DOM strategies used.
+
+Record:
+- selectors
+- XPath
+- CSS
+- JS
+- Selenium operations
+- CDP operations
+- filesystem operations
+- timing logic
+- ownership logic
+
+Do NOT replace a proven browser operation with a theoretically cleaner
+operation without evidence.
+
+===============================================================
+CRITICAL RESOURCE LIFECYCLE
+===============================================================
+
+Reconstruct the intended resource lifecycle exactly.
+
+GEMINI:
+
+T0
+T1
+T2
+T3
+
+These are persistent logical browser resources.
+
+They are NOT jobs.
+
+A T resource must be:
+
+FREE
+->
+RESERVED
+->
+GENERATING
+->
+DOWNLOAD_START_CONFIRMED
+->
+FREE
+
+IMPORTANT:
+
+The T resource becomes FREE immediately after the actual generated-image
+download START is confirmed.
+
+It does NOT remain occupied until:
+
+- raw download finishes
+- PIL validation finishes
+- WMR finishes
+- WebP finishes
+- R2 finishes
+- DB finishes
+- credits finish
+- BullMQ completes
+
+Those stages are independent from Gemini T resource ownership.
+
+Never close/recreate a Gemini T tab merely because its previous download
+is still continuing.
+
+Persistent T tabs must remain reusable.
+
+===============================================================
+FIRST-FREE-WINS
+===============================================================
+
+The scheduler must use:
+
+FIRST FREE WINS
+
+NOT:
+
+lowest ID wins.
+
+Example:
+
+T0 busy
+T1 busy
+T2 becomes free
+T3 becomes free later
+
+The next job must receive T2.
+
+It must NOT always search:
+
+T0 -> T1 -> T2 -> T3
+
+if that changes release order.
+
+The broker must preserve actual release order.
+
+Investigate every historical implementation of:
+- FirstFreeBroker
+- queue
+- heap
+- release sequence
+- admission queue
+- resource reservation
+
+Determine which implementation is correct.
+
+===============================================================
+WMR RESOURCE MODEL
+===============================================================
+
+WMR has persistent Chrome profiles:
+
+W0
+W1
+W2
+W3
+
+Each profile may contain multiple tabs.
+
+Current intended configuration:
+
+WMR_TABS_PER_PROFILE = 2
+
+Therefore potentially:
+
+W0-T0
+W0-T1
+W1-T0
+W1-T1
+W2-T0
+W2-T1
+W3-T0
+W3-T1
+
+These are logical resources.
+
+WMR scheduling must be GLOBAL FIRST-FREE-WINS.
+
+Example:
+
+W0-T0 busy
+W0-T1 free
+W1-T0 free
+
+Next WMR job MUST be able to use W0-T1.
+
+It must not unnecessarily wait for W1.
+
+Investigate all historical WMR implementations.
+
+===============================================================
+WMR RESOURCE RELEASE
+===============================================================
+
+WMR resource release happens when:
+
+ACTUAL WMR "Download PNG" START
+
+is confirmed.
+
+NOT when:
+- WMR processing begins
+- PNG download finishes
+- clean file is fully written
+- WebP is created
+- R2 upload completes
+
+Again:
+
+RESOURCE LIFECYCLE != DOWNLOAD LIFECYCLE
+
+This separation is mandatory.
+
+===============================================================
+DOWNLOAD OWNERSHIP
+===============================================================
+
+Investigate every historical download implementation.
+
+The system must NOT correlate downloads by:
+
+- newest file
+- filename only
+- extension only
+- directory scan alone
+- timestamp alone
+
+The preferred correlation model is:
+
+Chrome download GUID
+
+using:
+
+Browser.downloadWillBegin
+Browser.downloadProgress
+
+and, where appropriate:
+
+Browser.setDownloadBehavior
+
+with:
+
+allowAndName
+
+plus filesystem evidence.
+
+Determine exactly which historical source has the strongest implementation.
+
+Document:
+
+DOWNLOAD_REGISTRY
+
+with concepts such as:
+
+job_id
+resource_id
+browser/profile
+download_guid
+suggested_filename
+target_path
+state
+start_time
+completion_time
+
+and ownership verification.
+
+===============================================================
+RAW DOWNLOAD PIPELINE
+===============================================================
+
+For every job:
+
+Gemini generated image
+|
+v
+raw download starts
+|
+v
+Gemini T resource immediately released
+|
+v
+raw download continues independently
+|
+v
+download complete
+|
+v
+stability check
+|
+v
+PIL validation
+|
+v
+WMR admission
+|
+v
+WMR upload
+|
+v
+WMR processing
+|
+v
+exact Download PNG
+|
+v
+WMR resource immediately released
+|
+v
+clean PNG download continues
+|
+v
+validate
+|
+v
+WebP
+|
+v
+R2
+|
+v
+DB
+|
+v
+credits
+|
+v
+BullMQ completion
+
+Verify whether every historical implementation actually follows this.
+
+Identify deviations.
+
+===============================================================
+JOB ISOLATION
+===============================================================
+
+Every job must be isolated by job_id.
+
+Investigate historical directory logic.
+
+Expected conceptual structure:
+
+/content/downloads/
+chrome_staging/
+T0/
+T1/
+T2/
+T3/
+
+chrome/
+T0/
+JOB_ID/
+incoming/
+
+wmr_staging/
+W0/
+W1/
+W2/
+W3/
+
+final_output/
+T0/
+JOB_ID/
+
+If historical sources use another structure, document it.
+
+DO NOT silently normalize during forensic analysis.
+
+===============================================================
+JOB CONTEXT
+===============================================================
+
+Inspect all historical JobContext / job state implementations.
+
+Determine what state is actually required.
+
+Expected conceptual information includes:
+
+job_id
+bullmq_job
+current_state
+chrome_tab_id
+wmr_resource_id
+download_guid
+raw_path
+clean_path
+webp_path
+timestamps
+error
+retry_count
+resource ownership
+future references
+task references
+
+Do not blindly copy a JobContext from one version.
+
+Compare all versions.
+
+===============================================================
+STATE MACHINE
+===============================================================
+
+Reconstruct the actual intended job state machine.
+
+At minimum investigate states like:
+
+QUEUED
+GEMINI_RESERVED
+GEMINI_GENERATING
+RAW_DOWNLOAD_START
+GEMINI_RELEASED
+RAW_DOWNLOADING
+RAW_READY
+RAW_VALIDATED
+WMR_QUEUED
+WMR_RESERVED
+WMR_PROCESSING
+WMR_DOWNLOAD_START
+WMR_RELEASED
+CLEAN_READY
+WEBP_READY
+R2_READY
+DB_FINALIZING
+DB_READY
+CREDITS_SETTLED
+COMPLETED
+FAILED
+
+If historical sources use different names, document them.
+
+Do not assume the exact names above are mandatory.
+
+Determine the correct state transitions from the repository.
+
+===============================================================
+FAILURE ISOLATION
+===============================================================
+
+Investigate whether the architecture isolates failures.
+
+Required conceptual isolation:
+
+T0 browser failure
+must NOT kill:
+T1
+T2
+T3
+
+W0 failure
+must NOT kill:
+W1
+W2
+W3
+
+A single job failure
+must NOT kill:
+the entire worker.
+
+A raw download failure
+must NOT leave T permanently occupied.
+
+A WMR download failure
+must NOT leave WMR tab permanently occupied.
+
+A DB failure
+must not corrupt another job.
+
+Document historical implementations and defects.
+
+===============================================================
+LOGIN FORENSICS
+===============================================================
+
+Analyze all login-related files.
+
+Especially inspect:
+
+google_login_raw.py
+read_login.py
+read_login2.py
+dump_ecom_login.py
+dump_ecom_login2.py
+dump_ecom_login3.py
+check_v14_login.py
+apply_login.py
+new_login.py
+extract_login.py
+
+and any other login-related source discovered during inventory.
+
+Reconstruct:
+
+1. Already logged-in detection
+2. Google accounts detection
+3. Gemini access detection
+4. Cookie loading
+5. Cookie persistence
+6. Login navigation
+7. email entry
+8. password entry
+9. verification handling
+10. session validation
+11. retry behavior
+12. timeout behavior
+13. recovery
+
+Identify which login logic is proven browser logic.
+
+Do NOT choose based on filename.
+
+===============================================================
+ECOM REFERENCE ANALYSIS
+===============================================================
+
+Analyze:
+
+ecom_source.py
+ecom_source_clean.py
+extract_ecom.py
+extract_ecom2.py
+check_ecom.py
+check_ecom2.py
+
+and all other ECOM-related files.
+
+The ECOM implementation may contain browser operations that are more
+mature than V14.
+
+Compare it against V11/V14.
+
+Extract useful concepts such as:
+
+- login detection
+- browser startup
+- session handling
+- navigation
+- upload
+- download
+- error handling
+- retries
+- selectors
+- waits
+- recovery
+
+Do NOT copy ECOM's architecture blindly.
+
+Extract proven browser operations only where they are demonstrably stronger.
+
+===============================================================
+PATCH HISTORY ANALYSIS
+===============================================================
+
+Analyze every file that appears to modify another file.
+
+Examples include:
+
+apply_patch.py
+apply_patch2.py
+apply_patch3.py
+apply_patch4.py
+apply_patch5.py
+apply_patch6.py
+apply_v14_fixes.py
+fix_v14_entrypoint.py
+fix_v14_final_audit.py
+fix_missing_again.py
+fix_import.py
+fix_nbcheck.py
+fix_unicode.py
+fix_preflight_indent.py
+fix_preflight_regex.py
+update_omits.py
+update_omits_2.py
+clean_mojibake.py
+
+and all similar files discovered.
+
+For each patch script determine:
+
+- input source
+- output source
+- exact changes
+- intended reason
+- whether patch succeeded
+- whether later patches reversed it
+- whether it introduced duplicate code
+- whether it introduced regressions
+- whether the result exists in current V14
+- whether the patch is obsolete
+
+Create:
+
+PATCH_HISTORY.md
+
+===============================================================
+GENERATOR FORENSICS
+===============================================================
+
+Analyze:
+
+generator.py
+build_v14.py
+build_n2n_v1.py
+build_n2n_v2.py
+create_final.py
+gen_v14_clean_2.py
+gen_v14_clean_3.py
+gen_v14_clean_4.py
+refactor_n2n_v15.py
+
+and all generator/build files.
+
+Determine:
+
+SOURCE -> TRANSFORMATION -> OUTPUT
+
+for each.
+
+Construct a lineage graph.
+
+For example:
+
+V11 source
+->
+extraction
+->
+function JSON
+->
+generator
+->
+V14
+->
+patch
+->
+N2N
+->
+N2N V2
+->
+FINAL
+
+Do not assume this example is the actual lineage.
+
+Prove the lineage from file contents.
+
+===============================================================
+EXTRACTED SOURCE FILES
+===============================================================
+
+Investigate:
+
+v11_funcs.json
+v11_raw.py
+extract.py
+extract_v11.py
+extract_master_prompt.py
+dump_v14_login.py
+dump_main.py
+main_body.txt
+entrypoint_tail.txt
+extract_tail.py
+extract_prompt.py
+
+Determine whether these are:
+
+- authoritative source
+- intermediate extraction
+- generated data
+- stale data
+- partial data
+- useful reference
+
+Do not treat extracted JSON or text as production source unless proven.
+
+===============================================================
+DUPLICATE FUNCTION ANALYSIS
+===============================================================
+
+For every production candidate:
+
+Find duplicate definitions of:
+
+- main
+- run_worker
+- start_worker
+- process_bullmq_job
+- GeminiWorker
+- GeminiWorkerPool
+- WmrWorker
+- WmrWorkerPool
+- FirstFreeBroker
+- create_gemini_driver
+- create_wmr_chrome_driver
+- comprehensive_login_check
+- handle_google_login_fast
+- upload functions
+- download functions
+- R2 functions
+- DB functions
+- credits functions
+- preflight functions
+- validation functions
+
+Detect:
+
+- same function defined twice
+- old function shadowed by later function
+- class redefined
+- global overwritten
+- imported name overwritten
+- stale implementation still reachable
+
+This is especially important because previous patch-generation cycles may
+have produced duplicate or shadowed code.
+
+===============================================================
+ASYNCIO / COLAB FORENSICS
+===============================================================
+
+Analyze every occurrence of:
+
+asyncio.run
+run_until_complete
+get_event_loop
+get_running_loop
+create_task
+ensure_future
+await main
+main()
+run_worker
+start_worker
+is_running_in_notebook
+nest_asyncio
+
+The intended environment includes Google Colab/Jupyter.
+
+The worker must support:
+
+COLAB:
+
+await main()
+
+or an equivalent safe current-loop architecture.
+
+It must NOT do:
+
+asyncio.run(main())
+
+from inside an already running notebook loop.
+
+Also support:
+
+STANDALONE PYTHON:
+
+python FULL_QUEUE_WORKER.py
+
+where asyncio.run(main()) is valid because there is no active event loop.
+
+Determine the cleanest architecture.
+
+Do not patch yet.
+
+Document the current and historical behavior.
+
+===============================================================
+DEPENDENCY BOOTSTRAP FORENSICS
+===============================================================
+
+Analyze:
+
+fix_import.py
+new_startup.py
+preflight scripts
+N2N startup files
+V14 startup files
+dependency-related source
+requirements references
+Colab setup scripts
+
+Determine the correct dependency lifecycle.
+
+Required conceptual architecture:
+
+PHASE A
+Minimal standard-library bootstrap only.
+
+PHASE B
+Dependency bootstrap.
+
+Use:
+
+sys.executable -m pip
+
+NOT a random `pip`.
+
+Check/install missing packages.
+
+PHASE C
+invalidate import caches.
+
+PHASE D
+import third-party/application modules.
+
+Only then initialize:
+
+Selenium
+BullMQ
+PIL
+Postgres
+Boto3
+etc.
+
+Dependency bootstrap must happen before:
+
+from selenium ...
+from bullmq ...
+from PIL ...
+
+Do NOT import third-party packages before bootstrap.
+
+Also determine required SYSTEM dependencies for Colab:
+
+Chrome
+Xvfb
+display support
+noVNC if required
+X11VNC if required
+Fluxbox if required
+other browser runtime dependencies
+
+Do NOT automatically install Microsoft Edge.
+
+Chrome only.
+
+===============================================================
+CHROME-ONLY RULE
+===============================================================
+
+Search the entire folder for:
+
+Edge
+msedge
+Microsoft Edge
+edge_options
+edge_driver
+EdgeOptions
+webdriver.Edge
+msedgedriver
+
+Classify every occurrence.
+
+Distinguish:
+
+historical/reference
+from
+active production logic.
+
+The final architecture must contain NO Microsoft Edge runtime dependency.
+
+Chrome is the only browser runtime.
+
+===============================================================
+SECURITY FORENSICS
+===============================================================
+
+Search all 466 files for:
+
+API keys
+passwords
+cookies
+tokens
+AWS keys
+R2 credentials
+Redis credentials
+database URLs
+Google credentials
+hardcoded secrets
+
+Do not print actual secret values into reports.
+
+Report:
+
+FILE
+LINE
+SECRET TYPE
+ACTION REQUIRED
+
+The final architecture must use:
+
+environment variables
+Colab Secrets
+or another secure secret provider.
+
+Do not hardcode credentials.
+
+===============================================================
+MOJIBAKE / ENCODING FORENSICS
+===============================================================
+
+Search all files for common corruption:
+
+ð
+Ÿ
+â
+š
+œ
+©
+Â
+�
+\x8f
+\x90
+
+and similar encoding artifacts.
+
+Separate:
+- actual corrupted source
+- escaped bytes that are intentionally represented
+- binary data
+- legitimate Unicode
+
+Final production Python should be UTF-8.
+
+Prefer ASCII logging where possible:
+
+[OK]
+[WARN]
+[ERROR]
+[INFO]
+[RETRY]
+[FREE]
+[BUSY]
+
+===============================================================
+TEST FORENSICS
+===============================================================
+
+Analyze ALL test scripts.
+
+Examples:
+
+test_v14.py
+test_v14_mock.py
+run_unit_tests.py
+run_final_tests.py
+run_arch_tests.py
+test_firstfree.py
+check_*.py
+audit_*.py
+verify_*.py
+
+For every test determine:
+
+TEST TYPE:
+- static
+- AST
+- unit
+- mock
+- integration
+- browser
+- runtime
+- production
+
+Determine exactly what it proves.
+
+A test named "PASS" does NOT automatically prove browser runtime behavior.
+
+Create a:
+
+TEST_EVIDENCE_MATRIX.md
+
+with:
+
+TEST
+WHAT IT TESTS
+WHAT IT DOES NOT TEST
+SOURCE
+RESULT
+RUNTIME LEVEL
+TRUST LEVEL
+
+===============================================================
+AUDIT REPORT FORENSICS
+===============================================================
+
+Read every audit/report file.
+
+Examples:
+
+FULL_QUEUE_WORKER_V14_FINAL_REPORT.txt
+FULL_QUEUE_WORKER_V14_ASYNC_RUNTIME_AUDIT.txt
+FULL_QUEUE_WORKER_V14_FINAL_AUDIT_REPORT.txt
+and all similar reports.
+
+Do NOT blindly trust their PASS/READY statements.
+
+For every PASS ask:
+
+WHAT EXACTLY WAS EXECUTED?
+
+Was it:
+
+STATIC
+AST
+MOCK
+UNIT
+BROWSER
+REAL GEMINI
+REAL WMR
+REAL R2
+REAL DB
+REAL REDIS
+FULL JOB
+
+Clearly separate these.
+
+===============================================================
+IMPORTANT HISTORICAL FACT
+===============================================================
+
+Previous analysis has already identified that some V14 audits reported:
+
+STATIC PASS
+
+while real:
+
+Chrome
+Google
+Gemini
+WMR
+R2
+DB
+Redis
+full-job
+
+execution was not actually performed in the available environment.
+
+Therefore:
+
+DO NOT describe static PASS as runtime proof.
+
+This distinction is mandatory.
+
+===============================================================
+KNOWN HISTORICAL PROBLEMS TO TRACE
+===============================================================
+
+Investigate whether these occurred and where:
+
+1. coroutine main never awaited
+2. asyncio.run inside Colab
+3. selenium imported before installation
+4. missing `_ensure_driver`
+5. missing `_fail_job`
+6. tuple-vs-Path job directory bug
+7. duplicate top-level definitions
+8. Edge contamination
+9. mojibake
+10. hardcoded credentials
+11. incomplete WMR worker loop
+12. incorrect job payload fields
+13. T resource released at wrong lifecycle point
+14. WMR resource released at wrong lifecycle point
+15. download correlation by filename/newest file
+16. no real download GUID ownership
+17. browser crash affecting entire worker
+18. WMR crash affecting entire worker
+19. missing retry
+20. weak driver recovery
+21. credits failure incorrectly affecting job completion
+22. notebook entrypoint failure
+23. dependency bootstrap occurring too late
+24. production imports before bootstrap
+
+For every issue identify:
+
+FIRST APPEARANCE
+AFFECTED VERSION
+FIX ATTEMPT
+FIX LOCATION
+CURRENT STATUS
+REGRESSION RISK
+
+===============================================================
+RESOURCE STATE ANALYSIS
+===============================================================
+
+For each Gemini T resource and WMR resource identify:
+
+CREATION
+INITIALIZATION
+RESERVATION
+BUSY STATE
+RELEASE CONDITION
+CRASH CONDITION
+RECOVERY
+REUSE
+DESTRUCTION
+
+Draw textual state machines.
+
+Example:
+
+T0:
+NOT_CREATED
+|
+v
+CREATED
+|
+v
+READY
+|
+v
+RESERVED(job)
+|
+v
+GENERATING
+|
+v
+DOWNLOAD_START_CONFIRMED
+|
+v
+READY
+
+Then separately:
+
+RAW DOWNLOAD:
+START
+->
+DOWNLOADING
+->
+COMPLETE
+->
+STABLE
+->
+VALIDATED
+
+These must not be the same lifecycle.
+
+===============================================================
+THREAD SAFETY FORENSICS
+===============================================================
+
+Inspect all:
+
+threading.Thread
+Lock
+RLock
+Queue
+ThreadPoolExecutor
+asyncio.Lock
+asyncio.Queue
+call_soon_threadsafe
+
+Determine:
+
+Which thread owns Selenium?
+Which thread owns WMR Selenium?
+Which thread owns Gemini Selenium?
+How are browser events transferred?
+How are asyncio Futures resolved?
+Can a worker thread directly mutate asyncio state?
+Can two threads use the same Selenium driver?
+Can two jobs mutate the same tab?
+
+Verify patterns such as:
+
+main_loop.call_soon_threadsafe(...)
+
+and idempotent future resolution.
+
+===============================================================
+BULLMQ / REDIS FORENSICS
+===============================================================
+
+Inspect:
+
+Worker
+Queue
+Redis connection
+job processing
+concurrency
+completion
+failure
+retry
+heartbeat
+shutdown
+
+Determine exact BullMQ behavior.
+
+Check whether:
+
+BullMQ job concurrency
+resource concurrency
+Gemini concurrency
+WMR concurrency
+
+are incorrectly conflated.
+
+They are separate concepts.
+
+===============================================================
+DATABASE / R2 / CREDITS FORENSICS
+===============================================================
+
+Analyze every implementation of:
+
+upload_to_r2
+DB state transitions
+credits
+settlement
+completion
+
+Determine:
+
+raw
+clean PNG
+WebP
+R2 key
+database state
+credits
+BullMQ completion
+
+ordering.
+
+Look for:
+
+DB_READY
+DB_FINALIZING
+COMPLETED
+FAILED
+
+and all state transitions.
+
+Determine whether credits failure should:
+- fail the job
+- log warning
+- retry
+- allow completion
+
+Do not decide based on assumption.
+Determine intended behavior from historical source and reports.
+
+===============================================================
+FINAL ARCHITECTURAL COMPARISON
+===============================================================
+
+After reading all sources, construct a comparison:
+
+V11 V12 V13 V14 N2N ECOM
+Browser ops
+Login
+Gemini
+Download
+CDP
+WMR
+FirstFree
+Asyncio
+Dependency bootstrap
+R2
+DB
+Credits
+BullMQ
+Recovery
+Tests
+
+Do not score them.
+
+Instead describe:
+
+STRONG
+WEAK
+MISSING
+BROKEN
+PROVEN
+STATIC ONLY
+
+No arbitrary ranking.
+
+===============================================================
+DO NOT BUILD YET
+===============================================================
+
+After completing the forensic analysis, create:
+
+1. PROJECT_FILE_INVENTORY.md
+2. SOURCE_LINEAGE.md
+3. SOURCE_OF_TRUTH_MATRIX.md
+4. BROWSER_OPERATION_SOURCE_OF_TRUTH.md
+5. PATCH_HISTORY.md
+6. TEST_EVIDENCE_MATRIX.md
+7. DEPENDENCY_BOOTSTRAP_ANALYSIS.md
+8. ASYNCIO_COLAB_ANALYSIS.md
+9. RESOURCE_LIFECYCLE_ANALYSIS.md
+10. DOWNLOAD_OWNERSHIP_ANALYSIS.md
+11. LOGIN_FORENSICS.md
+12. WMR_FORENSICS.md
+13. GEMINI_FORENSICS.md
+14. BULLMQ_REDIS_FORENSICS.md
+15. R2_DB_CREDITS_FORENSICS.md
+16. SECURITY_FORENSICS.md
+17. DUPLICATE_CODE_ANALYSIS.md
+18. DO_NOT_COPY.md
+19. PRESERVE_LOGIC.md
+20. V14_FORENSIC_MASTER_REPORT.md
+
+===============================================================
+PRESERVE_LOGIC.md
+===============================================================
+
+This file must explicitly identify code that should be preserved.
+
+For example:
+
+FUNCTION
+SOURCE FILE
+VERSION
+WHY PRESERVE
+DEPENDENCIES
+KNOWN LIMITATIONS
+
+Do not simply say "keep V11".
+
+Identify exact functionality.
+
+===============================================================
+DO_NOT_COPY.md
+===============================================================
+
+Explicitly identify dangerous historical code.
+
+Examples may include:
+
+- old Edge implementation
+- obsolete resource lifecycle
+- filename-based download matching
+- old notebook entrypoint
+- stale generated code
+- broken patch output
+- duplicate definitions
+- incomplete WMR worker
+- mock-only code
+- source with hardcoded credentials
+- code known to cause tuple/Path issues
+- code with stale job payload assumptions
+
+Again, prove each one.
+
+===============================================================
+FINAL FORENSIC MASTER REPORT
+===============================================================
+
+V14_FORENSIC_MASTER_REPORT.md must answer:
+
+1. What is the true history of this project?
+2. Which files matter?
+3. Which files are obsolete?
+4. Which files are references?
+5. Which files are generated?
+6. Which files modify other files?
+7. What is the strongest browser implementation?
+8. What is the strongest architecture implementation?
+9. What is the strongest login implementation?
+10. What is the strongest download implementation?
+11. What is the strongest WMR implementation?
+12. What is the strongest queue implementation?
+13. What is the strongest R2/DB implementation?
+14. What is the strongest dependency bootstrap?
+15. What is the correct Colab architecture?
+16. What is the correct standalone architecture?
+17. What historical bugs remain?
+18. What functionality is actually proven?
+19. What functionality is only static-tested?
+20. What must be reconstructed?
+21. What must never be copied?
+22. What should the final production architecture look like?
+
+===============================================================
+THEN BUILD A RECONSTRUCTION BLUEPRINT
+===============================================================
+
+Only AFTER the entire forensic analysis is complete, create:
+
+V14_FINAL_REBUILD_BLUEPRINT.md
+
+This is NOT code yet.
+
+It must describe the final architecture you recommend based ONLY on
+the evidence collected from the repository.
+
+The blueprint must include:
+
+A. Startup sequence
+B. Dependency bootstrap
+C. Environment preflight
+D. Chrome initialization
+E. Gemini T0-T3 initialization
+F. WMR W0-W3 initialization
+G. WMR tabs
+H. First-Free brokers
+I. BullMQ admission
+J. Job state machine
+K. Download registry
+L. CDP event flow
+M. Raw download pipeline
+N. WMR pipeline
+O. WebP
+P. R2
+Q. DB
+R. Credits
+S. BullMQ completion
+T. Failure isolation
+U. Browser recovery
+V. Login recovery
+W. Asyncio/Colab
+X. Standalone execution
+Y. Shutdown
+Z. Testing strategy
+
+===============================================================
+IMPORTANT: YOU ARE THE ENGINEER
+===============================================================
+
+Do not ask me trivial questions such as:
+
+"Which file should I use?"
+
+"Should I use V11?"
+
+"Should I use V14?"
+
+"Which code is better?"
+
+You must determine this by analyzing the repository.
+
+Do not blindly follow the newest file.
+
+Do not blindly follow the oldest file.
+
+Do not blindly follow an audit report.
+
+Do not blindly follow a generator.
+
+Do not blindly follow a patch.
+
+Determine the correct architecture from the evidence.
+
+===============================================================
+AFTER FORENSIC ANALYSIS
+===============================================================
+
+Once:
+
+V14_FORENSIC_MASTER_REPORT.md
+and
+V14_FINAL_REBUILD_BLUEPRINT.md
+
+are complete,
+
+you may proceed to BUILD.
+
+The build must be performed into a NEW production candidate file.
+
+DO NOT destroy the historical sources.
+
+Suggested target:
+
+FULL_QUEUE_WORKER_V15_FORENSIC_REBUILT.py
+
+or another clearly named new file.
+
+The exact filename may be chosen based on your lineage findings.
+
+===============================================================
+FINAL REBUILD PRINCIPLES
+===============================================================
+
+The final rebuilt worker must preserve the proven browser behavior while
+reconstructing the architecture cleanly.
+
+MANDATORY:
+
+CHROME ONLY.
+
+NO MICROSOFT EDGE.
+
+NO FAKE DUMMY DRIVER.
+
+NO SILENT FAILURE.
+
+NO MASKED EXCEPTION.
+
+NO BLIND RETRY LOOP.
+
+NO FILENAME-ONLY DOWNLOAD OWNERSHIP.
+
+NO "NEWEST FILE" DOWNLOAD DETECTION.
+
+NO GLOBAL BROWSER FAILURE.
+
+NO GLOBAL WMR FAILURE.
+
+NO CLOSE-GEMINI-TAB-AFTER-DOWNLOAD-BEGIN.
+
+NO WAITING FOR RAW DOWNLOAD COMPLETION TO FREE GEMINI.
+
+NO WAITING FOR WMR DOWNLOAD COMPLETION TO FREE WMR.
+
+NO asyncio.run() INSIDE RUNNING COLAB LOOP.
+
+NO THIRD-PARTY IMPORT BEFORE DEPENDENCY BOOTSTRAP.
+
+NO HARD-CODED CREDENTIALS.
+
+NO MOJIBAKE.
+
+NO PRODUCTION `except: pass`.
+
+===============================================================
+TARGET RESOURCE ARCHITECTURE
+===============================================================
+
+Gemini:
+
+T0
+T1
+T2
+T3
+
+Persistent.
+
+First-Free-Wins.
+
+Actual release:
+
+DOWNLOAD START CONFIRMED.
+
+WMR:
+
+W0
+W1
+W2
+W3
+
+Each profile:
+
+configurable number of persistent tabs.
+
+Global First-Free-Wins.
+
+Actual release:
+
+DOWNLOAD PNG START CONFIRMED.
+
+===============================================================
+TARGET DOWNLOAD ARCHITECTURE
+===============================================================
+
+Every download must have:
+
+job_id
+resource_id
+download_guid
+expected owner
+staging directory
+target directory
+state
+
+Correlation must be based on actual browser/CDP download identity plus
+filesystem confirmation.
+
+===============================================================
+TARGET JOB PIPELINE
+===============================================================
+
+BullMQ
+|
+v
+Admission
+|
+v
+First-Free Gemini T
+|
+v
+Gemini generation
+|
+v
+Download START confirmed
+|
++----> RELEASE T IMMEDIATELY
+|
+v
+Raw download
+|
+v
+Stable
+|
+v
+PIL validation
+|
+v
+WMR global First-Free
+|
+v
+WMR upload
+|
+v
+WMR processing
+|
+v
+Exact Download PNG
+|
++----> RELEASE WMR IMMEDIATELY
+|
+v
+Clean PNG
+|
+v
+WebP
+|
+v
+R2
+|
+v
+DB
+|
+v
+Credits
+|
+v
+BullMQ COMPLETE
+
+===============================================================
+TEST REQUIREMENTS AFTER BUILD
+===============================================================
+
+Before calling the rebuilt source production-ready, test:
+
+TEST 1:
+dependency bootstrap
+
+TEST 2:
+missing dependency installation
+
+TEST 3:
+dependency verification
+
+TEST 4:
+Chrome-only verification
+
+TEST 5:
+Colab active event loop
+
+TEST 6:
+standalone Python entrypoint
+
+TEST 7:
+double-start prevention
+
+TEST 8:
+shutdown
+
+TEST 9:
+First-Free Gemini
+
+TEST 10:
+actual release-order behavior
+
+TEST 11:
+persistent Gemini tab reuse
+
+TEST 12:
+4 simultaneous Gemini jobs
+
+TEST 13:
+download GUID correlation
+
+TEST 14:
+overlapping downloads on same resource
+
+TEST 15:
+raw download stability
+
+TEST 16:
+PIL validation
+
+TEST 17:
+WMR multi-tab per profile
+
+TEST 18:
+global WMR First-Free
+
+TEST 19:
+WMR Download PNG ownership
+
+TEST 20:
+WMR download GUID correlation
+
+TEST 21:
+WMR resource release at download START
+
+TEST 22:
+T0 crash isolation
+
+TEST 23:
+W0 crash isolation
+
+TEST 24:
+single job failure isolation
+
+TEST 25:
+R2 failure isolation
+
+TEST 26:
+DB failure handling
+
+TEST 27:
+credits failure handling
+
+TEST 28:
+BullMQ completion/failure
+
+TEST 29:
+duplicate definition scan
+
+TEST 30:
+hardcoded secret scan
+
+TEST 31:
+Edge scan
+
+TEST 32:
+mojibake scan
+
+TEST 33:
+AST validation
+
+TEST 34:
+py_compile
+
+TEST 35:
+import-order/dependency bootstrap validation
+
+TEST 36:
+full static architecture validation
+
+Where real browser execution is unavailable, explicitly mark:
+
+NOT RUNTIME TESTED
+
+Do NOT mark it PASS.
+
+===============================================================
+VERY IMPORTANT FINAL REPORTING RULE
+===============================================================
+
+At the end, clearly separate:
+
+PROVEN BY REAL RUNTIME
+----------------------
+
+PROVEN BY UNIT TEST
+--------------------
+
+PROVEN BY MOCK TEST
+-------------------
+
+PROVEN BY STATIC ANALYSIS
+-------------------------
+
+INFERRED FROM SOURCE
+--------------------
+
+NOT YET VERIFIED
+-----------------
+
+BLOCKED BY ENVIRONMENT
+----------------------
+
+This distinction must appear in the final report.
+
+===============================================================
+EXECUTION ORDER
+===============================================================
+
+FOLLOW THIS EXACT ORDER:
+
+PHASE 1
+--------
+Inventory all 466 files.
+
+PHASE 2
+--------
+Read all relevant source files completely.
+
+PHASE 3
+--------
+Reconstruct source lineage.
+
+PHASE 4
+--------
+Compare V9/V11/V12/V13/V14/N2N/ECOM/browser/login sources.
+
+PHASE 5
+--------
+Extract subsystem source-of-truth.
+
+PHASE 6
+--------
+Analyze patches and generators.
+
+PHASE 7
+--------
+Analyze tests and audit evidence.
+
+PHASE 8
+--------
+Analyze resource lifecycle and download lifecycle.
+
+PHASE 9
+--------
+Analyze asyncio/Colab/dependency bootstrap.
+
+PHASE 10
+---------
+Produce forensic reports.
+
+PHASE 11
+---------
+Produce final rebuild blueprint.
+
+PHASE 12
+---------
+Only after the above is complete, construct the new rebuilt production
+candidate.
+
+PHASE 13
+---------
+Run static validation.
+
+PHASE 14
+---------
+Run available runtime/integration tests.
+
+PHASE 15
+---------
+Produce final verification report.
+
+===============================================================
+MOST IMPORTANT INSTRUCTION
+===============================================================
+
+DO NOT RUSH TO CODE.
+
+The previous development process accumulated many patch files because
+changes were being made before the entire source lineage was understood.
+
+This time:
+
+UNDERSTAND FIRST.
+TRACE SECOND.
+COMPARE THIRD.
+DESIGN FOURTH.
+BUILD FIFTH.
+TEST SIXTH.
+
+Do not destroy historical evidence.
+
+Do not make the newest file automatically authoritative.
+
+Do not make an old file authoritative merely because it worked previously.
+
+Reconstruct the system from evidence.
+
+===============================================================
+START NOW
+===============================================================
+
+Start at:
+
+C:\Users\PC\.gemini\antigravity\scratch\Reddis
+
+First recursively inventory all approximately 466 files.
+
+Then read and analyze them.
+
+Do not modify the existing production candidates during the forensic phase.
+
+Do not skip files merely because their names look like:
+check_*
+fix_*
+apply_*
+dump_*
+extract_*
+build_*
+gen_*
+update_*
+test_*
+audit_*
+
+Those files are potentially critical to reconstructing how the final code
+was produced.
+
+When the analysis is complete, produce the complete forensic reports and
+the final rebuild blueprint.
+
+Only then begin the new reconstruction.
+===============================================================
+END MASTER INSTRUCTION
+===============================================================
+</USER_REQUEST>
+<ADDITIONAL_METADATA>
+The current local time is: 2026-09-25T01:24:02+05:30.
+</ADDITIONAL_METADATA>

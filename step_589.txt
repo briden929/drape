@@ -1,0 +1,1412 @@
+<USER_REQUEST>
+======================================================================
+ECOM 2 ITERATION — FINAL FIX
+PROMPT ATOMIC INJECTION + ZERO-BLOCK DOWNLOAD + TRUE TAB REUSE
+======================================================================
+
+You are modifying the existing ECOM 2 ITERATION Queue Worker.
+
+DO NOT rewrite unrelated business logic.
+
+Preserve:
+- pack-wise processing
+- model matching
+- cloth matching
+- output filenames
+- manifests
+- existing Gemini image detection logic
+- retry semantics unless explicitly changed below
+- Flash selector
+- Create Image selector
+- existing Edge WMR pipeline
+
+This task fixes THREE critical areas:
+
+1. PROMPT MUST BE INJECTED AS ONE COMPLETE TEXT BLOCK
+2. DOWNLOAD DETECTION MUST NEVER BLOCK OTHER TABS
+3. A FREED TAB MUST IMMEDIATELY RECEIVE THE NEXT JOB
+
+======================================================================
+PART A — ROOT CAUSE FIX: PROMPT WAS ENTERED CHUNK BY CHUNK
+======================================================================
+
+CURRENT PROBLEM:
+
+The current _inject_prompt_fast() has this fallback:
+
+    for i in range(0, len(text), 500):
+        editor.send_keys(text[i:i+500])
+
+This is FORBIDDEN.
+
+Do NOT inject a production prompt using:
+- 500 character chunks
+- paragraph loops
+- line loops
+- repeated send_keys()
+- repeated Ctrl+V
+- repeated append operations
+
+The prompt must be inserted as ONE atomic text operation.
+
+======================================================================
+NEW FUNCTION:
+_inject_prompt_atomic(drv, text)
+======================================================================
+
+Replace the current multi-fallback prompt injection logic with a
+single atomic strategy.
+
+REQUIRED ORDER:
+
+1. Find the real Gemini image prompt editor.
+2. Focus it.
+3. Select all existing text.
+4. Delete existing text.
+5. Insert the ENTIRE prompt in ONE operation.
+6. Verify the complete prompt.
+7. If verification fails, CLEAR EVERYTHING.
+8. Retry the entire prompt ONCE as one operation.
+9. If still failing, mark PromptFail.
+10. NEVER fall back to character/chunk/paragraph typing.
+
+======================================================================
+PRIMARY METHOD — CHROME CDP Input.insertText
+======================================================================
+
+Use Chrome DevTools Protocol:
+
+    drv.execute_cdp_cmd(
+        "Input.insertText",
+        {"text": text}
+    )
+
+This should be the PRIMARY full-text insertion method.
+
+Before Input.insertText:
+
+    focus editor
+    Ctrl+A
+    Delete
+
+Then:
+
+    Input.insertText(text)
+
+This inserts the complete string in one browser input operation.
+
+Do NOT loop.
+
+Do NOT split the text.
+
+Do NOT call send_keys() for the prompt body.
+
+======================================================================
+FALLBACK METHOD
+======================================================================
+
+If CDP Input.insertText fails:
+
+Use xclip clipboard ONE TIME:
+
+    set clipboard = entire text
+    focus editor
+    Ctrl+A
+    Delete
+    Ctrl+V
+
+Then verify.
+
+There must be ONLY ONE Ctrl+V attempt per injection attempt.
+
+Do NOT:
+
+    paste
+    verify
+    paste again
+
+because that can duplicate the prompt.
+
+======================================================================
+NO send_keys PROMPT FALLBACK
+======================================================================
+
+ABSOLUTELY REMOVE:
+
+    for i in range(...):
+        editor.send_keys(...)
+
+ABSOLUTELY REMOVE:
+
+    editor.send_keys(text)
+
+for long production prompts.
+
+send_keys may ONLY be used for:
+
+    ENTER
+    ESC
+    CTRL+A
+    DELETE
+    navigation keys
+
+It must NOT be used to type the full prompt body.
+
+======================================================================
+PROMPT VERIFICATION
+======================================================================
+
+The expected prompt must be verified using:
+
+- normalized text
+- length comparison
+- beginning fingerprint
+- ending fingerprint
+
+Do NOT verify only:
+
+    first 40 characters
+
+because that can falsely report success.
+
+Create:
+
+    normalize_prompt_text(text)
+
+Normalize:
+
+    \r\n → \n
+    multiple spaces → single spaces
+    trailing whitespace → removed
+
+Then compare:
+
+    expected_normalized
+    actual_normalized
+
+Required match:
+
+    >= 98% character coverage
+
+AND:
+
+    first 80 normalized characters match
+
+AND:
+
+    last 80 normalized characters match
+
+For a very long prompt, also verify:
+
+    expected length
+    actual length
+
+Do NOT accept a partial paragraph.
+
+Log:
+
+    [T0] PROMPT LENGTH expected=XXXX actual=XXXX
+    [T0] PROMPT START VERIFIED
+    [T0] PROMPT END VERIFIED
+    [T0] PROMPT COMPLETE VERIFIED
+
+Only after this may Send be clicked.
+
+======================================================================
+PROMPT INJECTION STATE MACHINE
+======================================================================
+
+Use:
+
+    PROMPT_EMPTY
+    PROMPT_INJECTING
+    PROMPT_VERIFYING
+    PROMPT_READY
+    PROMPT_FAILED
+
+Flow:
+
+    PROMPT_EMPTY
+        ↓
+    PROMPT_INJECTING
+        ↓
+    ONE COMPLETE INSERT
+        ↓
+    PROMPT_VERIFYING
+        ↓
+    PROMPT_READY
+
+Never:
+
+    PROMPT_INJECTING
+        ↓
+    paragraph 1
+        ↓
+    paragraph 2
+        ↓
+    paragraph 3
+
+======================================================================
+IMPORTANT:
+PROMPT TEXT MUST NEVER BE MODIFIED
+======================================================================
+
+Do not:
+- trim internal paragraphs
+- split paragraphs
+- rebuild the prompt line by line
+- add artificial line breaks
+- remove blank lines
+- reorder sections
+
+The exact original prompt string must be delivered to Gemini.
+
+======================================================================
+PART B — STRICT FLASH + CREATE IMAGE ORDER
+======================================================================
+
+For EVERY job and EVERY tab:
+
+    OPEN GEMINI
+        ↓
+    FLASH
+        ↓
+    VERIFY FLASH
+        ↓
+    CREATE IMAGE
+        ↓
+    VERIFY CREATE IMAGE
+        ↓
+    UPLOAD REFERENCES
+        ↓
+    VERIFY REFERENCES
+        ↓
+    INJECT COMPLETE PROMPT
+        ↓
+    VERIFY COMPLETE PROMPT
+        ↓
+    SEND
+        ↓
+    VERIFY GENERATION STARTED
+
+No step may be skipped.
+
+======================================================================
+FLASH ERROR FIX
+======================================================================
+
+Current code catches generic Flash errors and continues.
+
+That is NOT allowed.
+
+BAD:
+
+    try:
+        switch_to_flash(drv)
+    except Exception:
+        print("warning")
+
+    upload...
+
+GOOD:
+
+    try:
+        switch_to_flash(drv)
+    except ModelLimitReached:
+        return "LIMIT"
+    except Exception as e:
+        log("Flash failed")
+        return "FLASH_FAILED"
+
+If Flash is not verified:
+
+    DO NOT:
+        upload
+        prompt
+        send
+
+Stop the submission attempt.
+
+======================================================================
+CREATE IMAGE MUST BE SEPARATE
+======================================================================
+
+Remove the combined responsibility from:
+
+    _activate_image_mode_and_upload()
+
+Replace it with:
+
+    ensure_create_image_mode()
+    is_create_image_mode()
+    upload_reference_images()
+
+The upload function MUST NOT select Create Image.
+
+======================================================================
+CREATE IMAGE VERIFICATION
+======================================================================
+
+After clicking Create Image:
+
+Verify:
+
+    div.ql-editor[data-placeholder='Describe your image']
+
+AND at least one additional signal showing image-generation mode.
+
+Only then permit upload.
+
+Log:
+
+    [T0] CREATE IMAGE VERIFIED
+
+======================================================================
+PART C — CRITICAL DOWNLOAD ARCHITECTURE
+======================================================================
+
+The current runtime log shows:
+
+    IMAGE DETECTED
+    DOWNLOAD CLICKED
+    TAB FREED
+
+That part is correct conceptually.
+
+But the downloaded file may only physically appear 2–10 seconds later
+because Gemini may finish preparing/upscaling the downloadable asset
+after the UI image has already been detected.
+
+Therefore:
+
+    IMAGE DETECTED
+and
+    FILE AVAILABLE
+
+are TWO DIFFERENT EVENTS.
+
+Never wait for the second event before freeing the Chrome tab.
+
+======================================================================
+REQUIRED DOWNLOAD FLOW
+======================================================================
+
+Generation:
+
+    IMAGE DETECTED
+         ↓
+    CLICK DOWNLOAD
+         ↓
+    VERIFY DOWNLOAD STARTED
+         ↓
+    TAB FREE
+         ↓
+    NEXT JOB IMMEDIATELY
+
+Separately:
+
+    FILE APPEARS
+         ↓
+    FILE SIZE STABILIZES
+         ↓
+    IMAGE VALIDATED
+         ↓
+    RENAME/MOVE
+         ↓
+    WMR
+         ↓
+    WEBP
+         ↓
+    R2
+         ↓
+    COMPLETE
+
+======================================================================
+NEVER CALL A LONG DOWNLOAD WAIT FROM THE ACTIVE TAB POLLER
+======================================================================
+
+REMOVE this architecture:
+
+    GEN_SUCCESS
+        ↓
+    download_generated_image()
+        ↓
+    _wait_for_dl_file()
+        ↓
+    wait 6–60 seconds
+        ↓
+    only then free tab
+
+That blocks the scheduler.
+
+======================================================================
+CORRECT ARCHITECTURE
+======================================================================
+
+When GEN_SUCCESS occurs:
+
+    1. switch to the tab
+    2. detect the correct generated image
+    3. configure the download target for this JOB
+    4. click Download
+    5. confirm click
+    6. register an active download record
+    7. mark TAB as IDLE
+    8. continue scheduler
+    9. assign next queued job to SAME TAB
+
+======================================================================
+ACTIVE DOWNLOAD RECORD
+======================================================================
+
+Create:
+
+    active_downloads = {}
+
+Each entry:
+
+    active_downloads[job_id] = {
+        "job": job,
+        "tab_id": tid,
+        "download_dir": job_download_dir,
+        "started_at": time.time(),
+        "files_before": files_before,
+        "state": "WAITING",
+        "target_filename": None,
+        "raw_path": raw_path
+    }
+
+The tab state and download state are separate.
+
+IMPORTANT:
+
+    TAB IDLE != JOB COMPLETE
+
+======================================================================
+PART D — SAME TAB MUST BE REUSED
+======================================================================
+
+Example:
+
+    T0 Job A
+    T1 Job B
+    T2 Job C
+    T3 Job D
+
+If T0 detects image first:
+
+    T0 Job A
+       ↓
+    Download clicked
+       ↓
+    T0 FREE
+       ↓
+    NEXT JOB → T0
+
+Do NOT assign the job to T3.
+Do NOT rotate to another tab unnecessarily.
+
+The scheduler must always search in ascending order:
+
+    T0
+    T1
+    T2
+    T3
+
+and select the FIRST IDLE tab.
+
+======================================================================
+STRICT LOWEST-ID PRIORITY
+======================================================================
+
+Create:
+
+    find_first_idle_tab()
+
+Equivalent logic:
+
+    for tid in sorted(tab_states):
+        if state == IDLE:
+            return tid
+
+Never:
+- randomize
+- round robin
+- choose highest-numbered free tab
+- choose "least recently used" tab
+
+If T0 becomes free, T0 gets the next job.
+
+======================================================================
+PART E — SLOW TAB MUST NEVER BLOCK OTHER TABS
+======================================================================
+
+Example:
+
+    T0 Job A = 30 sec
+    T1 Job B = 45 sec
+    T2 Job C = 40 sec
+    T3 Job D = 200 sec
+
+Required behavior:
+
+    T0 finishes → T0 gets Job E
+    T1 finishes → T1 gets Job F
+    T2 finishes → T2 gets Job G
+    T3 continues Job D
+
+T3 must NOT block:
+- polling
+- assignment
+- downloads
+- retries
+- new jobs
+- other tabs
+
+======================================================================
+PER-TAB TIMEOUT
+======================================================================
+
+MAX_STATE_TIMEOUT applies independently.
+
+If T3 reaches timeout:
+
+    T3 only:
+        refresh
+        retry/requeue its job
+        clear T3 state
+        set T3 IDLE
+        immediately assign next job to T3
+
+Do NOT:
+- stop main pipeline
+- wait for other tabs
+- refresh all tabs
+- reset all tab states
+
+======================================================================
+PER-TAB SOFT-STUCK
+======================================================================
+
+stuck_polls belongs to a single tab.
+
+If:
+
+    Gemini stopped processing
+    AND
+    send button enabled
+    AND
+    no generated image
+    AND
+    no error
+    AND
+    no refusal
+
+then:
+
+    T3.stuck_polls += 1
+
+Only when T3 reaches threshold:
+
+    refresh T3
+    requeue T3 job
+    free T3
+
+Other tabs continue normally.
+
+======================================================================
+PART F — DO NOT NAVIGATE GEMINI EVERY TIME
+======================================================================
+
+Current upload_and_send_fast() does:
+
+    drv.get(GEMINI_APP_URL)
+
+for every new job.
+
+This is expensive and is one reason you see long gaps between:
+
+    ASSIGNED
+and:
+    PROMPT SENT
+
+The log shows examples like a tab being assigned and taking a long
+time before sending.
+
+Do NOT reload the whole Gemini page for every normal successful tab
+reuse.
+
+======================================================================
+NEW TAB RESET STRATEGY
+======================================================================
+
+When a tab becomes free after a successful generation:
+
+    switch_to_tab(tid)
+
+Then:
+
+    start_new_chat(drv)
+
+Then:
+
+    ensure_flash_mode(drv)
+
+Then:
+
+    ensure_create_image_mode(drv)
+
+Then:
+
+    upload references
+
+This should be the normal reuse path.
+
+Only use:
+
+    driver.get(GEMINI_APP_URL)
+
+when:
+
+    - tab recovery is required
+    - page is corrupted
+    - Gemini UI cannot be reset
+    - hard timeout
+    - Selenium stale/broken state
+    - explicit retry after failed setup
+
+This will significantly reduce unnecessary navigation.
+
+======================================================================
+PART G — DOWNLOAD DIRECTORY ISOLATION
+======================================================================
+
+Current code still has:
+
+    set_tab_download_dir(drv, CHROME_DL_BASE)
+
+inside upload_and_send_fast().
+
+Do NOT use the global root:
+
+    /content/downloads
+
+as the active target for every job.
+
+Use:
+
+    /content/downloads/jobs/<job_id>/
+
+Example:
+
+    /content/downloads/jobs/
+        dccc39.../
+        eff9c8.../
+        8f7a35.../
+        a7f407.../
+
+Before clicking Download for Job A:
+
+    set_tab_download_dir(
+        drv,
+        /content/downloads/jobs/<JobA>
+    )
+
+Then click Download.
+
+The file watcher tracks ONLY that job directory.
+
+======================================================================
+IMPORTANT FOR SAME-TAB REUSE
+======================================================================
+
+The Chrome tab can immediately be reused after the click.
+
+However, the previous job's filesystem download is still tracked by:
+
+    active_downloads[JobA]
+
+The next Job B receives:
+
+    /jobs/JobB/
+
+This prevents Job A from being mistaken for Job B.
+
+======================================================================
+PART H — DOWNLOAD WATCHER
+======================================================================
+
+Create:
+
+    poll_active_downloads()
+
+Run it every scheduler cycle.
+
+For each job:
+
+    files_before
+    ↓
+    look for newly created files
+    ↓
+    ignore:
+        .crdownload
+        .tmp
+        .part
+        .download
+    ↓
+    detect completed image
+    ↓
+    verify minimum size
+    ↓
+    verify file is stable
+    ↓
+    optionally PIL-open the image
+    ↓
+    rename:
+        <job_id>_raw.png
+    ↓
+    remove from active_downloads
+    ↓
+    enqueue Edge WMR
+
+======================================================================
+FILE STABILITY
+======================================================================
+
+Do NOT consider a file complete just because it exists.
+
+Require:
+
+    size > minimum
+
+AND:
+
+    size unchanged across 2–3 consecutive polls
+
+Example:
+
+    7320 KB
+    7320 KB
+    7320 KB
+
+then:
+
+    DOWNLOAD_COMPLETE
+
+This is especially important because Gemini may take several seconds
+after Download was clicked before the final high-resolution file is
+fully written.
+
+======================================================================
+PART I — IMPORTANT: DO NOT USE A LONG WAIT IN poll_active_downloads()
+======================================================================
+
+poll_active_downloads() must do:
+
+    scan
+    decide
+    return
+
+NOT:
+
+    scan
+    sleep(10)
+    scan
+    sleep(10)
+
+The scheduler remains fast.
+
+Example:
+
+    LOOP 1 → not present
+    LOOP 2 → .crdownload
+    LOOP 3 → .crdownload
+    LOOP 4 → final file
+    LOOP 5 → stable → COMPLETE
+
+Other tabs are checked during every loop.
+
+======================================================================
+PART J — DOWNLOAD CLICK EXACTLY ONCE
+======================================================================
+
+A job may enter:
+
+    IMAGE_DETECTED
+
+only once.
+
+Use:
+
+    download_started = False
+
+When image detected:
+
+    if not download_started:
+        click Download
+        download_started = True
+        register active_download
+        free tab
+
+On subsequent scheduler cycles:
+
+    DO NOT click Download again.
+
+Never use:
+
+    if status == GEN_SUCCESS or target_src:
+
+because target_src remains truthy and can repeatedly enter the branch.
+
+Correct:
+
+    if status == GEN_SUCCESS and not download_started:
+
+======================================================================
+PART K — NO BLOCKING SELENIUM OPERATIONS
+======================================================================
+
+The central scheduler must NOT contain:
+
+    download waiting
+    long sleep
+    WMR processing
+    WebP conversion
+    R2 upload
+
+The Chrome scheduler only controls:
+
+    browser setup
+    generation
+    detection
+    download click
+
+Everything after download initiation becomes background work.
+
+======================================================================
+PART L — MAIN LOOP ORDER
+======================================================================
+
+The main loop MUST become:
+
+    while True:
+
+        now = time.time()
+
+        ------------------------------------------------------------
+        STEP 1 — POLL ACTIVE FILE DOWNLOADS
+        ------------------------------------------------------------
+
+        poll_active_downloads()
+
+        ------------------------------------------------------------
+        STEP 2 — ASSIGN IDLE TABS
+        ------------------------------------------------------------
+
+        for tid in sorted(tab_states):
+
+            if tab is IDLE:
+                if queue has job:
+                    assign job to THIS TAB
+                    submit job
+                    break/continue
+
+        ------------------------------------------------------------
+        STEP 3 — POLL ALL GENERATING TABS
+        ------------------------------------------------------------
+
+        for tid in sorted(tab_states):
+
+            if state != GEN_WAITING:
+                continue
+
+            if now < next_poll:
+                continue
+
+            switch_to_tab(tid)
+
+            check:
+                timeout
+                page error
+                image detection
+                refusal
+                limit
+                processing
+                stuck
+
+            If image detected:
+
+                click download
+                register active download
+                FREE TAB IMMEDIATELY
+
+        ------------------------------------------------------------
+        STEP 4 — WMR / FINALIZATION
+        ------------------------------------------------------------
+
+        Do NOT execute WMR synchronously here.
+
+        WMR receives completed raw files from the download watcher.
+
+        ------------------------------------------------------------
+        STEP 5 — SHORT SCHEDULER SLEEP
+        ------------------------------------------------------------
+
+        time.sleep(0.05 - 0.15)
+
+======================================================================
+PART M — TRUE PIPELINE
+======================================================================
+
+The final architecture MUST behave like:
+
+                     ┌────────── T0 ────────────┐
+                     │ Generate                 │
+                     │ Detect                   │
+                     │ Download CLICK           │
+                     └──────────┬───────────────┘
+                                │
+                                ▼
+                            T0 FREE
+                                │
+                                ▼
+                         T0 → NEXT JOB
+
+
+                     ┌────────── T1 ────────────┐
+                     │ Generate                 │
+                     │ Detect                   │
+                     │ Download CLICK           │
+                     └──────────┬───────────────┘
+                                │
+                                ▼
+                            T1 FREE
+                                │
+                                ▼
+                         T1 → NEXT JOB
+
+
+Job A:
+    Download waiting
+        ↓
+    File stable
+        ↓
+    WMR
+        ↓
+    WebP
+        ↓
+    R2
+
+Job B:
+    Download waiting
+        ↓
+    WMR
+
+Job C:
+    Generate
+
+Job D:
+    Generate
+
+ALL FOUR MAY EXIST AT DIFFERENT PIPELINE STAGES
+SIMULTANEOUSLY.
+
+======================================================================
+PART N — RUNTIME STATUS
+======================================================================
+
+Change status reporting to distinguish:
+
+    Queue
+    Generating
+    Download Waiting
+    WMR
+    Finalizing
+    Completed
+    Failed
+
+Example:
+
+    QUEUE: 12
+    GENERATING: 3
+    DOWNLOAD_WAITING: 2
+    WMR: 1
+    FINALIZING: 1
+    COMPLETED: 40
+
+Tabs:
+
+    T0 = GEN JobA  32s
+    T1 = IDLE
+    T2 = GEN JobC  84s
+    T3 = GEN JobD  210s
+
+Downloads:
+
+    JobB = WAITING 4.2s
+    JobE = WAITING 1.7s
+
+This lets us see that a download is still being prepared while the
+Chrome tab is already reused.
+
+======================================================================
+PART O — SUBMISSION SPEED IMPROVEMENT
+======================================================================
+
+Optimize upload_and_send_fast().
+
+Current expensive normal path includes:
+
+    driver.get(GEMINI_APP_URL)
+    wait
+    Flash selection
+    Create Image setup
+    upload
+    prompt
+    send
+
+For an already healthy reused tab:
+
+    start_new_chat()
+    ensure Flash
+    ensure Create Image
+    upload
+    atomic prompt insertion
+    verify
+    send
+
+Do NOT reload Gemini unless required.
+
+======================================================================
+PART P — ATTACHMENT VERIFICATION
+======================================================================
+
+Current code can print:
+
+    ⚠️NoChip(cont)
+
+and still return True.
+
+This is NOT acceptable.
+
+If expected_count = 3:
+
+    3 attachments must be verified
+
+before prompt injection.
+
+Required:
+
+    ✅ ATTACHED 3/3
+
+Otherwise:
+
+    ATTACHMENT_FAILED
+
+and do not send.
+
+======================================================================
+PART Q — SEND VERIFICATION
+======================================================================
+
+A successful click is NOT enough.
+
+After clicking Send:
+
+    verify_generation_started()
+
+Accept signals such as:
+
+    Stop generating
+    Cancel
+    processing indicator
+    image-loading overlay
+    generated response container
+
+Only then:
+
+    state = GEN_WAITING
+
+Otherwise:
+
+    send failed
+    retry setup according to retry policy
+
+======================================================================
+PART R — CRITICAL STATE SEPARATION
+======================================================================
+
+Use:
+
+    TAB STATE
+
+separately from:
+
+    JOB STATE
+
+Tab:
+
+    IDLE
+    SUBMITTING
+    GENERATING
+    FREE
+
+Job:
+
+    QUEUED
+    GENERATING
+    DOWNLOAD_WAITING
+    WMR
+    FINALIZING
+    COMPLETE
+    FAILED
+
+A tab can be IDLE while its associated job is:
+
+    DOWNLOAD_WAITING
+
+This is intentional.
+
+======================================================================
+PART S — EXAMPLE OF CORRECT BEHAVIOR
+======================================================================
+
+At 05:29:00:
+
+    T0 Job A → IMAGE DETECTED
+    T0 Job A → DOWNLOAD CLICKED
+    T0 → FREE
+
+Immediately:
+
+    T0 Job B → SUBMITTING
+
+At same moment:
+
+    Job A → DOWNLOAD_WAITING
+
+5 seconds later:
+
+    Job A → DOWNLOAD COMPLETE
+
+while:
+
+    T0 → Job B → GENERATING
+    T1 → Job C → GENERATING
+    T2 → Job D → GENERATING
+    T3 → Job E → GENERATING
+
+This is the required behavior.
+
+======================================================================
+PART T — YOUR SPECIFIC LOG ANALYSIS
+======================================================================
+
+The runtime showed:
+
+    T0 Job A
+    IMAGE DETECTED
+    DOWNLOAD CLICKED
+    TAB FREED
+
+This is correct.
+
+Then:
+
+    T0 → next job
+
+This is also correct.
+
+However, the source code still needs to guarantee that the physical
+download remains associated with Job A and does not depend on T0.
+
+The download must belong to:
+
+    Job A directory
+
+NOT:
+
+    current T0 directory
+
+because T0 can immediately become Job B.
+
+======================================================================
+PART U — PROMPT ERROR MUST BE ELIMINATED COMPLETELY
+======================================================================
+
+Remove all long-prompt chunking.
+
+No:
+
+    500 characters
+    paragraph-by-paragraph
+    line-by-line
+    repeated send_keys
+    repeated paste
+
+The final prompt path must be:
+
+    clear editor
+    ↓
+    CDP Input.insertText(full_prompt)
+    ↓
+    verify 98%+ exact normalized content
+    ↓
+    SEND
+
+One prompt.
+One insertion.
+One verification.
+One send.
+
+======================================================================
+PART V — SECURITY
+======================================================================
+
+The uploaded source contains live-looking database, Redis and R2
+credentials in _HARDCODED.
+
+DO NOT print these credentials in logs.
+DO NOT duplicate them.
+DO NOT move them into new functions.
+
+Replace them with environment/Colab secrets in the final code.
+
+Rotate the exposed credentials before production use.
+
+======================================================================
+PART W — REQUIRED FINAL TESTS
+======================================================================
+
+TEST 1:
+Long prompt > 3000 characters.
+
+Expected:
+ONE atomic insertion.
+No chunked send_keys.
+Prompt verification passes.
+
+TEST 2:
+T0 detects image first.
+
+Expected:
+T0 downloads-clicked.
+T0 FREE.
+Next job → T0.
+
+TEST 3:
+Download file takes 10 seconds.
+
+Expected:
+T0 remains FREE during those 10 seconds.
+
+TEST 4:
+T3 takes 200 seconds.
+
+Expected:
+T0/T1/T2 continue generating and cycling.
+
+TEST 5:
+T3 reaches timeout.
+
+Expected:
+Only T3 requeues/resets.
+
+TEST 6:
+T1 and T2 detect images at nearly the same time.
+
+Expected:
+Both initiate their own downloads.
+Neither waits for the other.
+
+TEST 7:
+Job A download appears after Job B has already started on the same
+Chrome tab.
+
+Expected:
+Job A file still belongs to Job A and is not assigned to Job B.
+
+TEST 8:
+Current mode is Pro.
+
+Expected:
+Select Flash → verify Flash.
+
+TEST 9:
+Current mode is Flash Lite.
+
+Expected:
+Reject Lite → select actual Flash.
+
+TEST 10:
+Create Image already active.
+
+Expected:
+Do not click Create Image twice.
+
+TEST 11:
+Create Image not active.
+
+Expected:
+
+    Flash
+    ↓
+    Create Image
+    ↓
+    verify
+    ↓
+    upload
+
+TEST 12:
+Attachment count mismatch.
+
+Expected:
+Do not send.
+
+TEST 13:
+Prompt verification mismatch.
+
+Expected:
+Do not send.
+
+======================================================================
+FINAL REPORT REQUIRED
+======================================================================
+
+After modification report:
+
+1. Exact functions modified.
+2. Exact functions added.
+3. Exact old functions removed/replaced.
+4. How prompt atomic insertion works.
+5. How prompt verification works.
+6. How download watcher works.
+7. How the same tab is immediately reused.
+8. How job download ownership is preserved.
+9. How slow tabs remain independent.
+10. How timeout affects only one tab.
+11. How Flash is verified.
+12. How Create Image is verified.
+13. Exact test results.
+
+Do not claim a test passed unless it was actually executed.
+======================================================================
+
+====================================================================== 🔑 STEP 1: INITIALIZING SECRETS & CONFIGURATION ================================================================================ Worker ID: queue_worker-4da6a760 Redis Tunnel: [https://envelope-daniel-pages-lean.trycloudflare.com](https://envelope-daniel-pages-lean.trycloudflare.com/) Chrome Profile: /content/queue_worker_bundle/queue_worker_state/chrome_profile Edge Profile: /content/queue_worker_bundle/queue_worker_state/edge_profile Max Parallel Tabs: 4 (T0, T1, T2, T3) ✅ Secrets and directories configured successfully. ================================================================================ 📦 STEP 2: VERIFYING & INSTALLING DEPENDENCIES ================================================================================ Installing Python packages... ✅ Python packages ready. Installing Xvfb, x11vnc, noVNC, xclip, and utilities... ✅ Cloudflared tunnel client: /usr/local/bin/cloudflared ✅ Virtual display stack ready. Verifying Google Chrome... ✅ Google Chrome available at: /usr/bin/google-chrome Verifying Microsoft Edge (for dedicated watermark removal)... ✅ Microsoft Edge ready at: /usr/bin/microsoft-edge ================================================================================ ⚙️ STEP 3: REGISTERING FULL BACKEND SYSTEM MODULES ================================================================================ ✅ Backend module 'db' loaded. ✅ Backend module 'credits' loaded. ✅ Backend module 'fashion_studio' loaded. ================================================================================ 🌐 STEP 4: CONNECTING TO REDIS VIA SECURE TUNNEL ================================================================================ ✅ Redis tunnel bridge verified! (127.0.0.1:16379 -> PONG) ================================================================================ 🖥️ STEP 5: INITIALIZING VIRTUAL DISPLAY & NOVNC STREAMING ================================================================================ ⚠️ Warning during pkill xvfb: ✅ Display :0 running at 1920x1080. ⚠️ Warning during pkill x11vnc: ⚠️ Warning during pkill websockify: ⚠️ Warning during pkill fluxbox: ⚠️ Warning during kill port: ⚠️ Warning during kill port: ✅ x11vnc ready on port :5900 ✅ noVNC/websockify ready on port :6080 ⚠️ Warning during pkill cloudflared:
+🖥️ noVNC Remote Desktop Stream:
+🌐 [Open Live UI (https://exceptions-chess-clothing-bottle.trycloudflare.com/vnc.html?autoconnect=true&resize=scale)](https://exceptions-chess-clothing-bottle.trycloudflare.com/vnc.html?autoconnect=true&resize=scale)
+🌐 noVNC Public Link: [https://exceptions-chess-clothing-bottle.trycloudflare.com/vnc.html?autoconnect=true&resize=scale](https://exceptions-chess-clothing-bottle.trycloudflare.com/vnc.html?autoconnect=true&resize=scale) ================================================================================ 🌐 STEP 6: INITIALIZING PERSISTENT CHROME & EDGE DRIVERS ================================================================================ Launching Google Chrome with persistent profile... ✅ Google Chrome driver ready (PID: 72931). ================================================================================ 🔐 STEP 7: VERIFYING GOOGLE / GEMINI LOGIN STATE ================================================================================ ✅ Google Gemini session is ACTIVE and verified. ================================================================================ 🧼 STEP 8: STARTING INDEPENDENT EDGE WATERMARK REMOVER ================================================================================ ✅ Edge Watermark Remover worker thread active. ================================================================================ 📑 STEP 9: CONFIGURING CHROME MULTI-TAB POOL (4 TABS: T0, T1, T2, T3) ================================================================================ ✅ Tab T0 ready (initial window). ✅ Tab T1 ready. ✅ Tab T2 ready. ✅ Tab T3 ready. ✅ All 4 Chrome tabs ready with lowest-ID priority. ================================================================================ 🎯 STEP 10: INITIALIZING GEMINI DOM & INTERACTION ENGINE ================================================================================ [05:28:28] [queue_worker-4da6a760] connecting to redis://127.0.0.1:16379 queue='generations' prefix='vastralook:' [05:28:28] [queue_worker-4da6a760] waiting for jobs (Ctrl+C to stop)... ================================================================= 📊 PIPELINE STATUS [05:28:28] Queue: 0 | Downloading: 0 | Completed: 0 | Failed: 0 T0 = IDLE Job=--- (0s) T1 = IDLE Job=--- (0s) T2 = IDLE Job=--- (0s) T3 = IDLE Job=--- (0s) ================================================================= [05:28:33] [queue_worker-4da6a760] picked up generation dccc39aa-9e11-4e73-bda1-f4c0ebf27f6f (attempt 1) [05:28:35] [T0][dccc39aa-9e11-4e73-bda1-f4c0ebf27f6f] ASSIGNED -> Submitting prompt & refs... [05:28:43] [T0][dccc39aa-9e11-4e73-bda1-f4c0ebf27f6f] PROMPT SENT! Lock released — Tab T0 generating in background. ================================================================= 📊 PIPELINE STATUS [05:28:43] Queue: 0 | Downloading: 0 | Completed: 0 | Failed: 0 T0 = GEN_WAITING Job=dccc39aa (7s) T1 = IDLE Job=--- (0s) T2 = IDLE Job=--- (0s) T3 = IDLE Job=--- (0s) ================================================================= [05:28:44] [queue_worker-4da6a760] picked up generation eff9c8f8-3006-4df5-bffa-c891af1b15b6 (attempt 1) [05:28:44] [T1][eff9c8f8-3006-4df5-bffa-c891af1b15b6] ASSIGNED -> Submitting prompt & refs... [05:28:54] [T1][eff9c8f8-3006-4df5-bffa-c891af1b15b6] PROMPT SENT! Lock released — Tab T1 generating in background. [05:28:54] [queue_worker-4da6a760] picked up generation 8f7a35a0-c5ec-49ae-9b7d-9ab775c27e8c (attempt 1) [05:28:54] [T2][8f7a35a0-c5ec-49ae-9b7d-9ab775c27e8c] ASSIGNED -> Submitting prompt & refs... [05:28:59] [T0][dccc39aa-9e11-4e73-bda1-f4c0ebf27f6f] IMAGE DETECTED! Initiating immediate capture... [05:29:00] [T0][dccc39aa-9e11-4e73-bda1-f4c0ebf27f6f] DOWNLOAD CLICKED (success=True) -> Handing off to disk watcher. [05:29:00] [T0][dccc39aa-9e11-4e73-bda1-f4c0ebf27f6f] TAB FREED! Immediately available for next queued job. ================================================================= 📊 PIPELINE STATUS [05:29:00] Queue: 0 | Downloading: 1 | Completed: 0 | Failed: 0 T0 = IDLE Job=--- (0s) T1 = GEN_WAITING Job=eff9c8f8 (15s) T2 = SUBMITTING Job=8f7a35a0 (5s) T3 = IDLE Job=--- (0s) ================================================================= [05:29:05] [T2][8f7a35a0-c5ec-49ae-9b7d-9ab775c27e8c] PROMPT SENT! Lock released — Tab T2 generating in background. [05:29:05] [queue_worker-4da6a760] picked up generation a7f40753-0814-467f-b5c4-08a92620e68f (attempt 1) [05:29:06] [T0][a7f40753-0814-467f-b5c4-08a92620e68f] ASSIGNED -> Submitting prompt & refs... [05:29:08] [T0][a7f40753-0814-467f-b5c4-08a92620e68f] ⚠️ Attachment notice, continuing... [05:29:27] [T0][a7f40753-0814-467f-b5c4-08a92620e68f] PROMPT SENT! Lock released — Tab T0 generating in background. [05:29:27] [queue_worker-4da6a760] picked up generation 5b7bce74-66ad-4737-b057-973fd08bc213 (attempt 1) [05:29:27] [T3][5b7bce74-66ad-4737-b057-973fd08bc213] ASSIGNED -> Submitting prompt & refs... [05:29:29] [T1][eff9c8f8-3006-4df5-bffa-c891af1b15b6] IMAGE DETECTED! Initiating immediate capture... [05:29:31] [T1][eff9c8f8-3006-4df5-bffa-c891af1b15b6] DOWNLOAD CLICKED (success=True) -> Handing off to disk watcher. [05:29:31] [T1][eff9c8f8-3006-4df5-bffa-c891af1b15b6] TAB FREED! Immediately available for next queued job. [05:29:32] [T2][8f7a35a0-c5ec-49ae-9b7d-9ab775c27e8c] IMAGE DETECTED! Initiating immediate capture... [05:29:32] [T2][8f7a35a0-c5ec-49ae-9b7d-9ab775c27e8c] DOWNLOAD CLICKED (success=True) -> Handing off to disk watcher. [05:29:33] [T2][8f7a35a0-c5ec-49ae-9b7d-9ab775c27e8c] TAB FREED! Immediately available for next queued job. ================================================================= 📊 PIPELINE STATUS [05:29:33] Queue: 0 | Downloading: 3 | Completed: 0 | Failed: 0 T0 = GEN_WAITING Job=a7f40753 (26s) T1 = IDLE Job=--- (0s) T2 = IDLE Job=--- (0s) T3 = SUBMITTING Job=5b7bce74 (5s) ================================================================= [05:29:38] [T3][5b7bce74-66ad-4737-b057-973fd08bc213] PROMPT SENT! Lock released — Tab T3 generating in background. [05:29:38] [queue_worker-4da6a760] picked up generation a6c4f7de-fb85-45c9-b5bf-52e2549c2fc0 (attempt 1) [05:29:38] [dccc39aa-9e11-4e73-bda1-f4c0ebf27f6f] DOWNLOAD DETECTED & RENAMED to dccc39aa-9e11-4e73-bda1-f4c0ebf27f6f_raw.png (7320 KB) -> Enqueuing for Edge WMR. [05:29:38] [T1][a6c4f7de-fb85-45c9-b5bf-52e2549c2fc0] ASSIGNED -> Submitting prompt & refs... [05:29:40] [queue_worker-4da6a760] dccc39aa-9e11-4e73-bda1-f4c0ebf27f6f: [STEP_EDGE_WMR_START] Removing watermark in Edge... [05:29:40] [queue_worker-4da6a760] [STEP_LAUNCH_EDGE] Launching independent Microsoft Edge for watermark removal... [05:29:47] [T1][a6c4f7de-fb85-45c9-b5bf-52e2549c2fc0] ⚠️ Attachment notice, continuing... [05:30:37] [T1][a6c4f7de-fb85-45c9-b5bf-52e2549c2fc0] PROMPT SENT! Lock released — Tab T1 generating in background. [05:30:41] [T0][a7f40753-0814-467f-b5c4-08a92620e68f] IMAGE DETECTED! Initiating immediate capture... [05:30:45] [T0][a7f40753-0814-467f-b5c4-08a92620e68f] DOWNLOAD CLICKED (success=True) -> Handing off to disk watcher. [05:30:45] [T0][a7f40753-0814-467f-b5c4-08a92620e68f] TAB FREED! Immediately available for next queued job. [05:30:52]
+
+
+</USER_REQUEST>
+<ADDITIONAL_METADATA>
+The current local time is: 2026-09-23T11:05:59+05:30.
+
+The user has uploaded 5 image(s):
+- C:/Users/PC/.gemini/antigravity/brain/81552632-81a7-4eef-a137-f9f74093c534/.user_uploaded/media_1790141741497.png
+- C:/Users/PC/.gemini/antigravity/brain/81552632-81a7-4eef-a137-f9f74093c534/.user_uploaded/media_1790141741499.png
+- C:/Users/PC/.gemini/antigravity/brain/81552632-81a7-4eef-a137-f9f74093c534/.user_uploaded/media_1790141741501.png
+- C:/Users/PC/.gemini/antigravity/brain/81552632-81a7-4eef-a137-f9f74093c534/.user_uploaded/media_1790141741511.png
+- C:/Users/PC/.gemini/antigravity/brain/81552632-81a7-4eef-a137-f9f74093c534/.user_uploaded/media_1790141741584.png
+You can embed these images in an artifact if you need the USER to review them.
+</ADDITIONAL_METADATA>
