@@ -2871,67 +2871,91 @@ def _snapshot_file_inputs(drv):
         return set()
 
 
-def _poll_for_file_input(drv, timeout: float, before_markers=None):
-    """Prefer a file input that appeared AFTER before_markers was snapshotted
-    (i.e. the one Gemini just created/exposed for the upload action that was
-    just clicked) over blindly taking the first input on the page -- the
-    real cause of tagging/sending files to an unrelated input and then
-    verify_attachment_count() timing out at expected=3, actual!=3."""
+def _describe_file_input(drv, el):
+    """Forensic snapshot of one candidate file input -- used only to log
+    why an ambiguous set of candidates couldn't be resolved. Never used to
+    pick a winner by guessing."""
+    try:
+        return drv.execute_script(
+            "var e=arguments[0]; if(!e) return {exists:false};"
+            "var r=e.getBoundingClientRect();"
+            "return {exists:true, connected:e.isConnected,"
+            "visible:!!(e.offsetWidth||e.offsetHeight||e.getClientRects().length),"
+            "disabled:!!e.disabled, multiple:!!e.multiple, accept:e.accept||'',"
+            "rect:{x:r.x,y:r.y,w:r.width,h:r.height},"
+            "files:e.files?e.files.length:0, outer:e.outerHTML.slice(0,500)};",
+            el,
+        )
+    except Exception as e:
+        return {'exists': False, 'error': str(e)}
+
+
+def _poll_for_file_input(drv, timeout: float, before_markers, prefix=''):
+    """Return ONLY a file input that appeared AFTER before_markers was
+    snapshotted -- i.e. one Gemini just created/exposed for the upload
+    action that was just clicked. NEVER falls back to inputs[0]/any
+    pre-existing input: that fallback was the actual root cause of
+    tagging/sending files to an unrelated input and
+    verify_attachment_count() timing out at expected=3, actual!=3.
+    Returns None (never a guess) if no new input appears, or if more than
+    one new input appears and none can be disambiguated."""
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
-            drv.execute_script('\n                document.querySelectorAll(\'input[type="file"]\').forEach(function(el){\n                    el.style.cssText=\'display:block!important;opacity:1!important;position:fixed!important;top:0;left:0;z-index:99999;width:200px;height:50px;\';\n                    el.removeAttribute(\'hidden\'); el.removeAttribute(\'disabled\');\n                });\n            ')
+            inputs = drv.find_elements(By.CSS_SELECTOR, "input[type='file']")
         except Exception:
-            pass
-        inputs = drv.find_elements(By.CSS_SELECTOR, "input[type='file']")
-        if inputs:
-            if before_markers:
-                for el in inputs:
-                    try:
-                        marker = drv.execute_script(
-                            "var m = arguments[0].getAttribute('data-vl-input-marker');"
-                            "if (!m) { m = 'm' + Date.now() + '_' + Math.random().toString(36).slice(2); "
-                            "arguments[0].setAttribute('data-vl-input-marker', m); } return m;", el)
-                    except Exception:
-                        marker = None
-                    if marker and marker not in before_markers:
-                        return el
-            return inputs[0]
-        time.sleep(0.3)
+            inputs = []
+        candidates = []
+        for el in inputs:
+            try:
+                marker = drv.execute_script(
+                    "var m = arguments[0].getAttribute('data-vl-input-marker');"
+                    "if (!m) { m = 'vlm_' + Date.now() + '_' + Math.random().toString(36).slice(2); "
+                    "arguments[0].setAttribute('data-vl-input-marker', m); } return m;", el)
+            except Exception:
+                continue
+            if marker not in before_markers:
+                candidates.append((marker, el))
+        if len(candidates) == 1:
+            el = candidates[0][1]
+            # Only THIS element gets made interactable -- never every file
+            # input on the page (that used to force-expose unrelated
+            # inputs elsewhere, making it easier to grab the wrong one).
+            try:
+                drv.execute_script(
+                    "arguments[0].style.cssText='display:block!important;opacity:1!important;"
+                    "position:fixed!important;top:0;left:0;z-index:99999;width:200px;height:50px;';"
+                    "arguments[0].removeAttribute('hidden'); arguments[0].removeAttribute('disabled');", el)
+            except Exception:
+                pass
+            return el
+        if len(candidates) > 1:
+            descriptions = [_describe_file_input(drv, el) for _, el in candidates]
+            append_runtime_log(f'{prefix} FILE_INPUT_AMBIGUOUS count={len(candidates)} candidates={json.dumps(descriptions, default=str)[:1500]}')
+            return None
+        time.sleep(0.15)
     return None
 
 def find_file_input_strict(drv, tid=0, job_id=''):
     """
-    Finds the file input element. Raises FileInputMissing if not found.
+    Finds the NEW file input Gemini exposes for an "Upload files" click.
+    Raises FileInputMissing if one can't be uniquely identified -- never
+    guesses (see _poll_for_file_input()).
 
-    The file input only exists in the DOM once the upload drawer is open
-    (+ button -> "Upload files") -- it is not a persistent hidden element.
-    open_upload_drawer()/click_upload_files_in_drawer() open it, but were
-    never actually wired into this path (dead code -- defined, never
-    called), so this used to just poll raw DOM for 4s and give up even
-    though nothing had ever asked the drawer to open. It now opens the
-    drawer itself before polling, and retries the whole open+poll sequence
-    up to 3 times before raising.
+    Sequence: open the + drawer -> snapshot existing file inputs -> click
+    "Upload files" -> poll for a NEW input only. Snapshotting must happen
+    AFTER the drawer opens and BEFORE "Upload files" is clicked, not
+    before anything (the previous version snapshotted/polled before ever
+    opening the drawer at all, which could match a stale/unrelated input
+    that already existed on the page).
     """
     prefix = f'[T{tid}][{job_id}]' if job_id else f'[T{tid}]'
-    # PART 1/2 (attachment-mismatch root cause): grabbing
-    # querySelectorAll('input[type="file"]')[0] with no regard for WHICH
-    # input Gemini just exposed for THIS click can tag/send files to an
-    # unrelated (possibly stale/hidden) input elsewhere on the page --
-    # the actual attachment UI never receives them, and
-    # verify_attachment_count() then polls forever at
-    # expected=3/actual!=3. Snapshot existing inputs BEFORE doing
-    # anything, so every subsequent poll can prefer one that's new since
-    # this call started.
-    before_markers = _snapshot_file_inputs(drv)
-    fi = _poll_for_file_input(drv, timeout=1.5, before_markers=before_markers)
-    if fi:
-        return fi
     for attempt in range(1, 4):
         if not open_upload_drawer(drv, tid, job_id):
             append_runtime_log(f'{prefix} FILE_INPUT_RETRY (attempt {attempt}/3): could not open + drawer')
             time.sleep(0.5)
             continue
+        before_markers = _snapshot_file_inputs(drv)
         if not click_upload_files_in_drawer(drv):
             append_runtime_log(f'{prefix} FILE_INPUT_RETRY (attempt {attempt}/3): "Upload files" not found in drawer')
             try:
@@ -2940,10 +2964,16 @@ def find_file_input_strict(drv, tid=0, job_id=''):
                 pass
             time.sleep(0.5)
             continue
-        fi = _poll_for_file_input(drv, timeout=3.0, before_markers=before_markers)
-        if fi:
+        fi = _poll_for_file_input(drv, timeout=4.0, before_markers=before_markers, prefix=prefix)
+        if fi is not None:
             return fi
-    raise FileInputMissing(f'Tab T{tid}: file input not found after {3} drawer-open attempts')
+        append_runtime_log(f'{prefix} FILE_INPUT_RETRY (attempt {attempt}/3): no NEW file input could be uniquely identified')
+        try:
+            drv.find_element(By.TAG_NAME, 'body').send_keys(Keys.ESCAPE)
+        except Exception:
+            pass
+        time.sleep(0.5)
+    raise FileInputMissing(f'Tab T{tid}: NEW upload file input could not be uniquely identified after 3 drawer-open attempts')
 
 def _tag_upload_input(drv, file_input, job_id: str) -> str:
     """Marks the exact <input type=file> element used for this upload with
@@ -3247,14 +3277,33 @@ def _verify_editor_prompt(drv, editor, expected_text, tid=0, job_id=''):
         append_runtime_log(f'{prefix} PROMPT_VERIFY_FAILED reason=ERROR detail={e}')
         return False
 
-def _clear_editor(drv, editor):
+def _clear_editor(drv, editor, tid=0, job_id=''):
+    """Clear the composer and PROVE it's actually empty afterward -- a
+    clear that silently didn't take (e.g. focus was stolen mid-sequence)
+    previously proceeded straight to injection, letting new text get
+    appended after leftover content instead of replacing it. Returns
+    True only if a fresh read of the live composer confirms zero visible
+    text; callers that ignore a False return are exactly reintroducing
+    this bug."""
     drv.execute_script('arguments[0].focus();', editor)
     time.sleep(0.1)
     ActionChains(drv).click(editor).key_down(Keys.CONTROL).send_keys('a').key_up(Keys.CONTROL).perform()
     time.sleep(0.05)
     ActionChains(drv).send_keys(Keys.DELETE).perform()
-    drv.execute_script("document.execCommand('selectAll',false,null);document.execCommand('delete',false,null);")
-    time.sleep(0.1)
+    drv.execute_script(
+        "arguments[0].focus();"
+        "document.execCommand('selectAll',false,null);"
+        "document.execCommand('delete',false,null);", editor)
+    time.sleep(0.15)
+    fresh = get_active_gemini_image_composer(drv, tid=tid, job_id=job_id)
+    if not fresh:
+        return False
+    try:
+        actual = drv.execute_script(
+            "return (arguments[0].innerText || arguments[0].textContent || '');", fresh) or ''
+    except Exception:
+        return False
+    return not normalize_prompt_text(actual)
 
 
 def _focus_and_verify_composer(drv, editor, prefix='') -> bool:
@@ -3285,12 +3334,28 @@ def _focus_and_verify_composer(drv, editor, prefix='') -> bool:
 def _prep_composer_for_tier(drv, tid, job_id, prefix):
     """Re-find the CURRENT visible composer, clear it, and prove focus --
     run at the start of every tier so no tier ever operates on a stale
-    WebElement left over from a previous tier's DOM re-render."""
+    WebElement left over from a previous tier's DOM re-render. Fails
+    closed (returns None) if the composer can't be found, clearing
+    raises, or focus is never actually proven to land -- a tier used to
+    proceed to inject text regardless of whether focus verification
+    passed, which meant CDP/execCommand/send_keys could all fire against
+    an unfocused element and still "work" by accident, masking a real
+    focus problem instead of surfacing it."""
     editor = get_active_gemini_image_composer(drv, tid=tid, job_id=job_id)
     if not editor:
+        append_runtime_log(f'{prefix} PROMPT_PREP FAIL=COMPOSER_NOT_FOUND')
         return None
-    _clear_editor(drv, editor)
-    _focus_and_verify_composer(drv, editor, prefix=prefix)
+    try:
+        cleared = _clear_editor(drv, editor, tid=tid, job_id=job_id)
+    except Exception as e:
+        append_runtime_log(f'{prefix} PROMPT_PREP FAIL=CLEAR_ERROR {e}')
+        return None
+    if not cleared:
+        append_runtime_log(f'{prefix} PROMPT_PREP FAIL=CLEAR_NOT_VERIFIED')
+        return None
+    if not _focus_and_verify_composer(drv, editor, prefix=prefix):
+        append_runtime_log(f'{prefix} PROMPT_PREP FAIL=FOCUS_NOT_VERIFIED')
+        return None
     return editor
 
 
@@ -3305,7 +3370,10 @@ def _inject_prompt_clipboard_first(drv, text, tid=0, job_id=''):
         return False
     ActionChains(drv).click(editor).key_down(Keys.CONTROL).send_keys('v').key_up(Keys.CONTROL).perform()
     time.sleep(0.4)
-    verify_editor = get_active_gemini_image_composer(drv, tid=tid, job_id=job_id) or editor
+    verify_editor = get_active_gemini_image_composer(drv, tid=tid, job_id=job_id)
+    if verify_editor is None:
+        append_runtime_log(f'{prefix} PROMPT_VERIFY FAIL=FRESH_COMPOSER_NOT_FOUND')
+        return False
     return _verify_editor_prompt(drv, verify_editor, text, tid=tid, job_id=job_id)
 
 
@@ -3331,7 +3399,10 @@ def _inject_prompt_exec_command(drv, text, tid=0, job_id=''):
         append_runtime_log(f'{prefix} PROMPT_EXECCOMMAND_ERROR: {e}')
         return False
     time.sleep(0.4)
-    verify_editor = get_active_gemini_image_composer(drv, tid=tid, job_id=job_id) or editor
+    verify_editor = get_active_gemini_image_composer(drv, tid=tid, job_id=job_id)
+    if verify_editor is None:
+        append_runtime_log(f'{prefix} PROMPT_VERIFY FAIL=FRESH_COMPOSER_NOT_FOUND')
+        return False
     return _verify_editor_prompt(drv, verify_editor, text, tid=tid, job_id=job_id)
 
 
@@ -3350,7 +3421,10 @@ def _inject_prompt_send_keys(drv, text, tid=0, job_id=''):
         append_runtime_log(f'{prefix} PROMPT_SENDKEYS_ERROR: {e}')
         return False
     time.sleep(0.4)
-    verify_editor = get_active_gemini_image_composer(drv, tid=tid, job_id=job_id) or editor
+    verify_editor = get_active_gemini_image_composer(drv, tid=tid, job_id=job_id)
+    if verify_editor is None:
+        append_runtime_log(f'{prefix} PROMPT_VERIFY FAIL=FRESH_COMPOSER_NOT_FOUND')
+        return False
     return _verify_editor_prompt(drv, verify_editor, text, tid=tid, job_id=job_id)
 
 
@@ -3368,7 +3442,10 @@ def _inject_prompt_cdp(drv, text, tid=0, job_id=''):
         append_runtime_log(f'{prefix} PROMPT_CDP_ERROR: {e}')
         return False
     time.sleep(0.4)
-    verify_editor = get_active_gemini_image_composer(drv, tid=tid, job_id=job_id) or editor
+    verify_editor = get_active_gemini_image_composer(drv, tid=tid, job_id=job_id)
+    if verify_editor is None:
+        append_runtime_log(f'{prefix} PROMPT_VERIFY FAIL=FRESH_COMPOSER_NOT_FOUND')
+        return False
     return _verify_editor_prompt(drv, verify_editor, text, tid=tid, job_id=job_id)
 
 
@@ -4639,6 +4716,12 @@ class WmrDriverThread(threading.Thread):
         self.resource_id = resource_id
         self.command_queue = queue.Queue()
         self.driver = None
+        # Single-flight guard: the broker's recovery-timer thread can fire
+        # again while a previous RECOVER is still queued/running for this
+        # same resource -- without this, multiple RECOVER commands could
+        # stack up on one owner thread's command_queue.
+        self.recovery_lock = threading.Lock()
+        self.recovery_pending = False
 
     def run(self):
         while True:
@@ -4812,13 +4895,27 @@ def request_wmr_recover(thread: 'WmrDriverThread', timeout_s: float = 30.0) -> b
     thread.driver from the broker's recovery-timer thread -- that races
     with whatever this thread's EXECUTE loop is doing with the same
     driver. Returns True only if the owner thread confirmed the new
-    driver is responsive."""
-    ack = queue.Queue(maxsize=1)
-    thread.command_queue.put(("RECOVER", ack))
+    driver is responsive.
+
+    Single-flight: if a RECOVER is already pending/running for this
+    resource, a second recovery-timer firing must not enqueue another
+    one -- that could stack multiple RECOVER commands on one owner
+    thread's queue."""
+    with thread.recovery_lock:
+        if thread.recovery_pending:
+            append_runtime_log(f'[WMR-{thread.resource_id}] RECOVER_ALREADY_PENDING')
+            return False
+        thread.recovery_pending = True
     try:
-        return bool(ack.get(timeout=timeout_s))
-    except queue.Empty:
-        return False
+        ack = queue.Queue(maxsize=1)
+        thread.command_queue.put(("RECOVER", ack))
+        try:
+            return bool(ack.get(timeout=timeout_s))
+        except queue.Empty:
+            return False
+    finally:
+        with thread.recovery_lock:
+            thread.recovery_pending = False
 
 # V16: Only initialize at runtime. Reuse the previous run's WmrDriverThread
 # instances -- each owns a live WMR Chrome driver in its own thread;
