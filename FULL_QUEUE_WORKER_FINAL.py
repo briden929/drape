@@ -1005,7 +1005,20 @@ def _kill_port(port):
     time.sleep(0.3)
 
 def _proc_alive(proc):
-    return proc is not None and proc.poll() is None
+    """Most callers pass a real subprocess.Popen (x11vnc/websockify/
+    cloudflared), where .poll() is the correct liveness check. But
+    V16_STATE.display_obj is a pyvirtualdisplay.Display instance on the
+    cell-rerun reuse path -- it has no .poll() at all, so calling this on
+    it raised AttributeError instead of ever reaching the real liveness
+    check. Every call site already ANDs this with an independent liveness
+    proof (_xdisplay_healthy()/_port_open()), so for a non-Popen object we
+    just confirm it's not None and defer to that other check."""
+    if proc is None:
+        return False
+    poll = getattr(proc, 'poll', None)
+    if callable(poll):
+        return poll() is None
+    return True
 
 def _xdisplay_healthy(display_name):
     try:
