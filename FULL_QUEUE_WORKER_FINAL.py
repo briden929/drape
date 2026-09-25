@@ -3405,6 +3405,33 @@ def _prep_composer_for_tier(drv, tid, job_id, prefix):
     return editor
 
 
+def _wait_for_editor_text_stable(drv, editor, timeout=2.5, poll_interval=0.15, stable_polls=2):
+    """Poll the live editor's text length until it stops changing for
+    `stable_polls` consecutive reads, instead of a single fixed sleep --
+    a long clipboard paste / execCommand insert / send_keys can still be
+    asynchronously rendering past a fixed 0.4s wait on a loaded machine,
+    which risked verifying (and needlessly retrying tiers) against
+    content that hadn't finished landing yet."""
+    deadline = time.time() + timeout
+    last_len = -1
+    stable_count = 0
+    while time.time() < deadline:
+        try:
+            cur_len = drv.execute_script(
+                "var e=arguments[0]; if(!e||!document.body.contains(e)) return -1;"
+                "return (e.innerText||e.textContent||'').length;", editor)
+        except Exception:
+            cur_len = -1
+        if cur_len == last_len and cur_len >= 0:
+            stable_count += 1
+            if stable_count >= stable_polls:
+                return
+        else:
+            stable_count = 0
+        last_len = cur_len
+        time.sleep(poll_interval)
+
+
 def _inject_prompt_clipboard_first(drv, text, tid=0, job_id=''):
     """TIER 1 (primary): xclip clipboard + Ctrl+V."""
     prefix = f'[T{tid}][{job_id}]' if job_id else f'[T{tid}]'
@@ -3415,7 +3442,7 @@ def _inject_prompt_clipboard_first(drv, text, tid=0, job_id=''):
         append_runtime_log(f'{prefix} PROMPT_CLIPBOARD_SET_FAIL')
         return False
     ActionChains(drv).click(editor).key_down(Keys.CONTROL).send_keys('v').key_up(Keys.CONTROL).perform()
-    time.sleep(0.4)
+    _wait_for_editor_text_stable(drv, editor)
     verify_editor = get_active_gemini_image_composer(drv, tid=tid, job_id=job_id)
     if verify_editor is None:
         append_runtime_log(f'{prefix} PROMPT_VERIFY FAIL=FRESH_COMPOSER_NOT_FOUND')
@@ -3444,7 +3471,7 @@ def _inject_prompt_exec_command(drv, text, tid=0, job_id=''):
     except Exception as e:
         append_runtime_log(f'{prefix} PROMPT_EXECCOMMAND_ERROR: {e}')
         return False
-    time.sleep(0.4)
+    _wait_for_editor_text_stable(drv, editor)
     verify_editor = get_active_gemini_image_composer(drv, tid=tid, job_id=job_id)
     if verify_editor is None:
         append_runtime_log(f'{prefix} PROMPT_VERIFY FAIL=FRESH_COMPOSER_NOT_FOUND')
@@ -3466,7 +3493,7 @@ def _inject_prompt_send_keys(drv, text, tid=0, job_id=''):
     except Exception as e:
         append_runtime_log(f'{prefix} PROMPT_SENDKEYS_ERROR: {e}')
         return False
-    time.sleep(0.4)
+    _wait_for_editor_text_stable(drv, editor)
     verify_editor = get_active_gemini_image_composer(drv, tid=tid, job_id=job_id)
     if verify_editor is None:
         append_runtime_log(f'{prefix} PROMPT_VERIFY FAIL=FRESH_COMPOSER_NOT_FOUND')
@@ -3487,7 +3514,7 @@ def _inject_prompt_cdp(drv, text, tid=0, job_id=''):
     except Exception as e:
         append_runtime_log(f'{prefix} PROMPT_CDP_ERROR: {e}')
         return False
-    time.sleep(0.4)
+    _wait_for_editor_text_stable(drv, editor)
     verify_editor = get_active_gemini_image_composer(drv, tid=tid, job_id=job_id)
     if verify_editor is None:
         append_runtime_log(f'{prefix} PROMPT_VERIFY FAIL=FRESH_COMPOSER_NOT_FOUND')
@@ -4582,6 +4609,17 @@ class GeminiWorker:
 
                 ctx.transition_sync(JobState.GEMINI_SEND_PENDING)
                 job_mark(ctx.job_id, 'send', 'run')
+                # Final gate immediately before Send: re-read the CURRENT live
+                # composer and re-verify it still holds the full prompt.
+                # _inject_prompt_atomic() already verified this moments ago,
+                # but re-checking here catches anything that could have
+                # altered the composer between that verification and this
+                # click (a stray re-render, a leftover async event from an
+                # earlier tier attempt) instead of trusting a stale result.
+                presend_editor = get_active_gemini_image_composer(self.driver, tid=tid_int, job_id=ctx.job_id)
+                if presend_editor is None or not _verify_editor_prompt(self.driver, presend_editor, ctx.prompt, tid=tid_int, job_id=ctx.job_id):
+                    job_mark(ctx.job_id, 'send', 'fail')
+                    raise RuntimeError("SEND_ABORT_PROMPT_NOT_VERIFIED: composer no longer holds the full verified prompt immediately before Send")
                 urls_before = snapshot_urls(self.driver)
                 append_runtime_log(f'{prefix} GEMINI_SEND_REQUESTED')
                 if not _click_send_button(self.driver, tid_int, ctx.job_id):
