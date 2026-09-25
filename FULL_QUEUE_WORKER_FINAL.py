@@ -227,6 +227,44 @@ from typing import Dict, Any, Optional, List, Tuple
 from enum import Enum
 import heapq
 
+# This whole file is designed to be pasted into and re-run inside a single
+# long-lived Colab/notebook cell. Every stateful, expensive resource this
+# file creates at module scope (chrome_driver, GEMINI_BROKER, WMR_BROKER,
+# GEMINI_WORKERS, WMR_THREADS, and the BullMQ runtime task) gets
+# UNCONDITIONALLY recreated every time the cell re-executes, unless guarded.
+# Without a guard, re-running the cell (without Runtime > Restart) launches
+# a brand new Chrome process and brand new brokers while the PREVIOUS run's
+# Chrome/brokers/main() task are all still alive and in use -- orphaning the
+# old Chrome session (whose window handles then go stale) while doing
+# nothing with the new one, since start_worker() correctly refuses to start
+# a second main(). That orphaning is what produced repeated
+# "[GEMINI BROKER] T0 RECOVERY_HEALTH_CHECK = FAILED: no such window:
+# target window already closed" spam: the OLD broker's background recovery
+# timers kept firing against the OLD (now-abandoned) Chrome tabs.
+#
+# Stashing these in sys.modules -- which, unlike a plain module global,
+# survives this file being re-executed in the same kernel -- lets every
+# creation site below check for and reuse a previous run's live resource
+# instead of creating an orphaned duplicate.
+_V16_STATE_KEY = "__v16_runtime_singleton__"
+if _V16_STATE_KEY not in sys.modules:
+    _v16_state = types.ModuleType(_V16_STATE_KEY)
+    _v16_state.BACKGROUND_TASKS = set()
+    _v16_state.BULLMQ_WORKER = None
+    _v16_state.QUEUE_MONITOR = None
+    _v16_state.QUEUE_MONITOR_TASK = None
+    _v16_state.HEARTBEAT_TASK = None
+    _v16_state.WATCHER_TASK = None
+    _v16_state.WORKER_MAIN_TASK = None
+    _v16_state.RUNTIME_INITIALIZED = False
+    _v16_state.chrome_driver = None
+    _v16_state.GEMINI_BROKER = None
+    _v16_state.WMR_BROKER = None
+    _v16_state.GEMINI_WORKERS = None
+    _v16_state.WMR_THREADS = None
+    sys.modules[_V16_STATE_KEY] = _v16_state
+V16_STATE = sys.modules[_V16_STATE_KEY]
+
 def bootstrap_dependencies():
     pkg_map = {'selenium': 'selenium', 'bullmq': 'bullmq', 'boto3': 'boto3', 'psycopg2': 'psycopg2-binary', 'PIL': 'Pillow', 'websockets': 'websockets', 'undetected_chromedriver': 'undetected-chromedriver', 'pyvirtualdisplay': 'pyvirtualdisplay'}
     missing = []
@@ -858,8 +896,20 @@ def create_wmr_chrome_driver(resource_id: str) -> webdriver.Chrome:
         pass
     log(f'[WMR-{resource_id}] Browser = Google Chrome  staging={staging_dir}')
     return drv
-print('  Launching Google Chrome with persistent profile...')
-chrome_driver = create_chrome_driver()
+chrome_driver = None
+if V16_STATE.chrome_driver is not None:
+    try:
+        _ = V16_STATE.chrome_driver.window_handles  # proves the old session is actually alive
+        chrome_driver = V16_STATE.chrome_driver
+        print('  Reusing existing Chrome driver from a previous run of this cell...')
+    except Exception:
+        print('  Previous Chrome driver is dead (window/session gone) -- launching a fresh one...')
+        chrome_driver = None
+
+if chrome_driver is None:
+    print('  Launching Google Chrome with persistent profile...')
+    chrome_driver = create_chrome_driver()
+    V16_STATE.chrome_driver = chrome_driver
 print(f'  ✅ Google Chrome driver ready (PID: {chrome_driver.service.process.pid}).\n')
 print('=' * 80)
 print('🔐 STEP 7: VERIFYING GOOGLE / GEMINI LOGIN STATE')
@@ -2626,8 +2676,24 @@ def _detect_download_start(drv, staging_dir: Path, timeout: float = 60.0) -> Tup
         time.sleep(0.5)
     raise RuntimeError(f"Download start timeout after {timeout}s (dir={staging_dir})")
 
-GEMINI_BROKER = FirstFreeBroker("GEMINI", [f"T{i}" for i in range(4)])
-WMR_BROKER = FirstFreeBroker("WMR", [f"W{i}-T{j}" for i in range(4) for j in range(2)])
+# Reuse the previous run's brokers if this cell is re-running against a
+# reused chrome_driver -- a fresh broker here would forget every resource's
+# real state (BUSY/DEAD/failure counts) and, worse, its own background
+# recovery timers would be orphaned from whichever chrome_driver a fresh
+# create_chrome_driver() call just launched (see the V16_STATE comment near
+# the top of this file for the full "target window already closed" story).
+if V16_STATE.GEMINI_BROKER is not None:
+    GEMINI_BROKER = V16_STATE.GEMINI_BROKER
+else:
+    GEMINI_BROKER = FirstFreeBroker("GEMINI", [f"T{i}" for i in range(4)])
+    V16_STATE.GEMINI_BROKER = GEMINI_BROKER
+
+if V16_STATE.WMR_BROKER is not None:
+    WMR_BROKER = V16_STATE.WMR_BROKER
+else:
+    WMR_BROKER = FirstFreeBroker("WMR", [f"W{i}-T{j}" for i in range(4) for j in range(2)])
+    V16_STATE.WMR_BROKER = WMR_BROKER
+
 CHROME_DRIVER_LOCK = threading.RLock()
 
 def _recover_gemini_resource(resource_id: str) -> bool:
@@ -2808,7 +2874,15 @@ class GeminiWorker:
                 self.driver = None
                 release_gemini_once(ctx)
 
-GEMINI_WORKERS = {f"T{i}": GeminiWorker(f"T{i}") for i in range(4)}
+# Reuse the previous run's GeminiWorker instances -- each holds a live
+# `.handle`/`.driver` pointing at an actual open Chrome tab; a fresh dict
+# here would forget every real tab and force _recover_gemini_resource to
+# treat all of them as needing recreation even when they're fine.
+if V16_STATE.GEMINI_WORKERS is not None:
+    GEMINI_WORKERS = V16_STATE.GEMINI_WORKERS
+else:
+    GEMINI_WORKERS = {f"T{i}": GeminiWorker(f"T{i}") for i in range(4)}
+    V16_STATE.GEMINI_WORKERS = GEMINI_WORKERS
 
 class WmrDriverThread(threading.Thread):
     def __init__(self, resource_id: str):
@@ -2890,8 +2964,18 @@ class WmrDriverThread(threading.Thread):
             else:
                 self.command_queue.task_done()
 
-# V16: Only initialize at runtime
-WMR_THREADS = {}
+# V16: Only initialize at runtime. Reuse the previous run's WmrDriverThread
+# instances -- each owns a live WMR Chrome driver in its own thread;
+# resetting this to {} every re-run (this dict used to be recreated fresh
+# every time, deceiving initialize_runtime_once()'s `if not WMR_THREADS`
+# guard into always firing) silently launched 8 brand new WMR Chrome
+# processes/threads on every cell re-run while the previous 8 kept running
+# orphaned.
+if V16_STATE.WMR_THREADS is not None:
+    WMR_THREADS = V16_STATE.WMR_THREADS
+else:
+    WMR_THREADS = {}
+    V16_STATE.WMR_THREADS = WMR_THREADS
 
 def _fmt_span(start, end):
     if start is None or end is None:
@@ -3187,33 +3271,10 @@ def run_architecture_self_test():
     ):
         assert _name in globals(), f"PREFLIGHT_MISSING_SYMBOL: {_name}"
 
-# This whole file is designed to be pasted into and re-run inside a single
-# long-lived Colab/notebook cell. A plain module global (`WORKER_MAIN_TASK =
-# None`, `_RUNTIME_INITIALIZED = False`, ...) gets reset to that literal
-# value every time the cell re-executes -- but a PREVIOUS run's main() task
-# (with its own live BULLMQ_WORKER and Redis Queue client) keeps running on
-# the same persistent kernel event loop, since nothing ever cancelled it.
-# Without this, every re-run (without a full Runtime > Restart) silently
-# spawned ANOTHER concurrent BullMQ Worker pulling from the same queue,
-# while the orphaned previous one's Redis client eventually surfaced as an
-# "Unclosed Redis client" asyncio warning when garbage collected. Stashing
-# the runtime singleton in sys.modules -- which, unlike a plain global,
-# survives this file being re-executed in the same kernel -- lets
-# start_worker() detect and reuse the still-running previous task instead.
-_V16_STATE_KEY = "__v16_runtime_singleton__"
-if _V16_STATE_KEY not in sys.modules:
-    _v16_state = types.ModuleType(_V16_STATE_KEY)
-    _v16_state.BACKGROUND_TASKS = set()
-    _v16_state.BULLMQ_WORKER = None
-    _v16_state.QUEUE_MONITOR = None
-    _v16_state.QUEUE_MONITOR_TASK = None
-    _v16_state.HEARTBEAT_TASK = None
-    _v16_state.WATCHER_TASK = None
-    _v16_state.WORKER_MAIN_TASK = None
-    _v16_state.RUNTIME_INITIALIZED = False
-    sys.modules[_V16_STATE_KEY] = _v16_state
-V16_STATE = sys.modules[_V16_STATE_KEY]
-
+# V16_STATE itself is created once, at the top of this file (right after
+# imports) so it's available to the early resource-creation sites
+# (chrome_driver, brokers, etc.) too -- here we just mirror its
+# task/monitor fields into plain module globals for the code below.
 BACKGROUND_TASKS = V16_STATE.BACKGROUND_TASKS
 BULLMQ_WORKER = V16_STATE.BULLMQ_WORKER
 QUEUE_MONITOR = V16_STATE.QUEUE_MONITOR
