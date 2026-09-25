@@ -2204,7 +2204,7 @@ def fetch_generation(gen_id):
     conn = sys.modules['db'].borrow()
     try:
         cur = conn.cursor()
-        cur.execute('\n            SELECT g.id, g.user_id, g.model_id, g.catalogue_item_id, g.package_id,\n                   g.prompt, g.params, g.attempts, g.max_attempts, g.credits_cost,\n                   ci.hologram_url, ci.thumbnail_url, ci.model_id AS ci_model_id,\n                   pk.primary_outfit_name,\n                   m.image_url AS model_image_url, m.angle_image_url AS model_angle_url\n            FROM image_generations g\n            LEFT JOIN catalogue_items ci ON ci.id = g.catalogue_item_id\n            LEFT JOIN packages pk ON pk.id = COALESCE(g.package_id, ci.package_id)\n            LEFT JOIN models m ON m.id = COALESCE(g.model_id, ci.model_id)\n            WHERE g.id = %s\n            ', (gen_id,))
+        cur.execute('\n            SELECT g.id, g.user_id, g.model_id, g.catalogue_item_id, g.package_id,\n                   g.prompt, g.params, g.attempts, g.max_attempts, g.credits_cost,\n                   g.status, g.output_url, g.webp_url,\n                   ci.hologram_url, ci.thumbnail_url, ci.model_id AS ci_model_id,\n                   pk.primary_outfit_name,\n                   m.image_url AS model_image_url, m.angle_image_url AS model_angle_url\n            FROM image_generations g\n            LEFT JOIN catalogue_items ci ON ci.id = g.catalogue_item_id\n            LEFT JOIN packages pk ON pk.id = COALESCE(g.package_id, ci.package_id)\n            LEFT JOIN models m ON m.id = COALESCE(g.model_id, ci.model_id)\n            WHERE g.id = %s\n            ', (gen_id,))
         row = cur.fetchone()
         if not row:
             return None
@@ -2296,17 +2296,20 @@ class JobContext:
     webp_path: Optional[str] = None
     
     error: Optional[str] = None
-    
+    completed_at: Optional[float] = None
+
     state_waiters: Dict[JobState, List[asyncio.Future]] = field(default_factory=dict)
-    
+
     def transition_sync(self, new_state: JobState):
         self.loop.call_soon_threadsafe(self._set_state_threadsafe, new_state)
-        
+
     def _set_state_threadsafe(self, new_state: JobState):
         old = self.state
         self.state = new_state
         print(f"[STATE] {self.job_id}: {old.name} -> {new_state.name}")
-        
+        if new_state in (JobState.COMPLETED, JobState.FAILED):
+            self.completed_at = time.time()
+
         if new_state in self.state_waiters:
             for fut in self.state_waiters[new_state]:
                 if not fut.done(): fut.set_result(True)
@@ -2614,109 +2617,89 @@ class GeminiWorker:
     def __init__(self, tid: str):
         self.tid = tid
         self.driver = None
+        self.handle = None
 
     def do_execute_sync(self, ctx: JobContext):
         prefix = f"[{self.tid}][{ctx.job_id}]"
-        try:
-            ctx.transition_sync(JobState.GEMINI_GENERATING)
-            if self.driver is None:
-                self.driver = create_chrome_driver()
-                comprehensive_login_check(self.driver, "Gemini Worker")
+        with CHROME_DRIVER_LOCK:
+            try:
+                ctx.transition_sync(JobState.GEMINI_GENERATING)
+                tid_int = int(self.tid.replace('T', ''))
 
-            tid_int = int(self.tid.replace('T', ''))
-            
-            tab_id_str = open_new_chat_and_reload(self.driver, tid_int, ctx.job_id)
-            if not tab_id_str:
-                raise RuntimeError("Failed to create/find target tab")
-            
-            staging_dir = get_chrome_job_dir(tid_int, ctx.job_id)
-            set_tab_download_dir(self.driver, str(staging_dir))
+                # T0-T3 are TABS of the single shared, already-authenticated chrome_driver
+                # (see _create_gemini_tab) -- never a second Chrome process on the same profile.
+                if self.handle is None or self.handle not in chrome_driver.window_handles:
+                    self.handle = _create_gemini_tab(tid_int)
+                    log(f"{prefix} PHYSICAL_TAB_CREATED handle={self.handle}")
+                chrome_driver.switch_to.window(self.handle)
+                self.driver = chrome_driver
 
-            ensure_create_image_mode(self.driver, tid_int, ctx.job_id)
+                tab_id_str = open_new_chat_and_reload(self.driver, tid_int, ctx.job_id)
+                if not tab_id_str:
+                    raise RuntimeError("Failed to create/find target tab")
 
-            upload_reference_files(self.driver, ctx.reference_paths, tid_int, ctx.job_id)
-            verify_attachment_count(self.driver, expected=len(ctx.reference_paths), tid=tid_int, job_id=ctx.job_id)
-            
-            _inject_prompt_atomic(self.driver, ctx.prompt, tid_int, ctx.job_id)
+                job_dir, staging_dir = get_chrome_job_dir(tid_int, ctx.job_id)
+                set_tab_download_dir(self.driver, str(staging_dir))
 
-            urls_before = snapshot_urls(self.driver)
-            _click_send_button(self.driver)
+                ensure_create_image_mode(self.driver, tid_int, ctx.job_id)
 
-            started = verify_generation_started(self.driver)
-            if not started:
-                raise RuntimeError("Generation did not start")
+                upload_reference_files(self.driver, ctx.reference_paths, tid_int, ctx.job_id)
+                verify_attachment_count(self.driver, expected=len(ctx.reference_paths), tid=tid_int, job_id=ctx.job_id)
 
-            _has_generated_image(self.driver, urls_before)
-            
-            chat_urls = snapshot_urls(self.driver)
-            _hover_and_dl_single_click(self.driver, urls_before, chat_urls)
+                _inject_prompt_atomic(self.driver, ctx.prompt, tid_int, ctx.job_id)
 
-            expected_png = f"{ctx.job_id}.png"
-            dl_guid = None
-            source = "cdp"
-            
-            ctx.transition_sync(JobState.RAW_DOWNLOAD_START)
+                urls_before = snapshot_urls(self.driver)
+                _click_send_button(self.driver)
 
-            t_dl = time.time()
-            while time.time() - t_dl < 60:
+                started = verify_generation_started(self.driver)
+                if not started:
+                    raise RuntimeError("Generation did not start")
+
+                _has_generated_image(self.driver, urls_before)
+
+                chat_urls = snapshot_urls(self.driver)
+                _hover_and_dl_single_click(self.driver, urls_before, chat_urls)
+
+                expected_png = f"{ctx.job_id}.png"
+
+                ctx.transition_sync(JobState.RAW_DOWNLOAD_START)
+                dl_guid, source = _detect_download_start(self.driver, staging_dir, timeout=60)
+                ctx.raw_guid = dl_guid
+
+                record_id = f"gemini:{ctx.job_id}:{time.monotonic_ns()}"
+                with DOWNLOAD_REGISTRY_LOCK:
+                    DOWNLOAD_REGISTRY[record_id] = DownloadRecord(
+                        record_id=record_id,
+                        guid=dl_guid,
+                        job_id=ctx.job_id,
+                        resource_id=self.tid,
+                        resource_type="gemini",
+                        source=source,
+                        staging_dir=str(staging_dir),
+                        expected_filename=expected_png,
+                        actual_filename=None,
+                        target_state=JobState.RAW_VALIDATED,
+                        started_at=time.time(),
+                        created_at=time.time()
+                    )
+
+                release_gemini_once(ctx)
+                ctx.transition_sync(JobState.GEMINI_RELEASED)
+                ctx.transition_sync(JobState.RAW_DOWNLOADING)
+
+            except Exception as e:
+                ctx.error = str(e)
+                ctx.transition_sync(JobState.FAILED)
+                GEMINI_BROKER.fail(self.tid, str(e))
                 try:
-                    for entry in self.driver.get_log('performance'):
-                        try:
-                            msg = json.loads(entry['message'])['message']
-                            if msg['method'] == 'Browser.downloadWillBegin':
-                                dl_guid = msg['params']['guid']
-                                break
-                        except Exception: pass
-                except Exception: pass
-                if dl_guid: break
-                
-                try:
-                    files = list(staging_dir.iterdir())
-                    if files:
-                        for f in files:
-                            if f.name.endswith(".crdownload") or f.stat().st_size > 0:
-                                dl_guid = None
-                                source = "filesystem"
-                                break
-                except Exception: pass
-                
-                if source == "filesystem": break
-                time.sleep(1)
-
-            if not dl_guid and source != "filesystem":
-                raise RuntimeError("Download start timeout")
-            
-            ctx.raw_guid = dl_guid
-            
-            record_id = f"gemini:{ctx.job_id}:{time.monotonic_ns()}"
-            with DOWNLOAD_REGISTRY_LOCK:
-                DOWNLOAD_REGISTRY[record_id] = DownloadRecord(
-                    record_id=record_id,
-                    guid=dl_guid,
-                    job_id=ctx.job_id,
-                    resource_id=self.tid,
-                    resource_type="gemini",
-                    source=source,
-                    staging_dir=str(staging_dir),
-                    expected_filename=expected_png,
-                    actual_filename=None,
-                    target_state=JobState.RAW_VALIDATED,
-                    started_at=time.time(),
-                    created_at=time.time()
-                )
-            
-            release_gemini_once(ctx)
-            ctx.transition_sync(JobState.GEMINI_RELEASED)
-            ctx.transition_sync(JobState.RAW_DOWNLOADING)
-
-        except Exception as e:
-            ctx.error = str(e)
-            ctx.transition_sync(JobState.FAILED)
-            GEMINI_BROKER.fail(self.tid)
-            try: self.driver.quit()
-            except Exception: pass
-            self.driver = None
-            release_gemini_once(ctx)
+                    if self.handle and self.handle in chrome_driver.window_handles:
+                        chrome_driver.switch_to.window(self.handle)
+                        chrome_driver.close()
+                except Exception:
+                    pass
+                self.handle = None
+                self.driver = None
+                release_gemini_once(ctx)
 
 GEMINI_WORKERS = {f"T{i}": GeminiWorker(f"T{i}") for i in range(4)}
 
@@ -2756,37 +2739,8 @@ class WmrDriverThread(threading.Thread):
 
                     expected_png = f"{ctx.job_id}_clean.png"
                     ctx.transition_sync(JobState.WMR_DOWNLOAD_START)
-                    
-                    dl_guid = None
-                    source = "cdp"
-                    
-                    t_dl = time.time()
-                    while time.time() - t_dl < 60:
-                        try:
-                            for entry in self.driver.get_log('performance'):
-                                try:
-                                    msg = json.loads(entry['message'])['message']
-                                    if msg['method'] == 'Browser.downloadWillBegin':
-                                        dl_guid = msg['params']['guid']
-                                        break
-                                except Exception: pass
-                        except Exception: pass
-                        if dl_guid: break
-                        
-                        try:
-                            files = list(staging_dir.iterdir())
-                            if files:
-                                for f in files:
-                                    if f.name.endswith(".crdownload") or f.stat().st_size > 0:
-                                        dl_guid = None
-                                        source = "filesystem"
-                                        break
-                        except Exception: pass
-                        if source == "filesystem": break
-                        time.sleep(1)
-                        
-                    if not dl_guid and source != "filesystem":
-                        raise RuntimeError("WMR Download start timeout")
+
+                    dl_guid, source = _detect_download_start(self.driver, staging_dir, timeout=60)
 
                     record_id = f"wmr:{ctx.job_id}:{time.monotonic_ns()}"
                     with DOWNLOAD_REGISTRY_LOCK:
@@ -2811,7 +2765,7 @@ class WmrDriverThread(threading.Thread):
                 except Exception as e:
                     ctx.error = str(e)
                     ctx.transition_sync(JobState.FAILED)
-                    WMR_BROKER.fail(self.resource_id)
+                    WMR_BROKER.fail(self.resource_id, str(e))
                     try: self.driver.quit()
                     except Exception: pass
                     self.driver = None
@@ -2826,6 +2780,13 @@ WMR_THREADS = {}
 
 async def execute_pipeline(ctx: JobContext):
     try:
+        existing_status = str(ctx.payload.get('status') or '').lower()
+        existing_output = ctx.payload.get('output_url')
+        if existing_status == 'done' and existing_output:
+            log(f"[{ctx.job_id}] IDEMPOTENT_SKIP: generation already completed (status=done, output_url set) — not regenerating")
+            ctx.transition_sync(JobState.COMPLETED)
+            return
+
         prompt, garment_path, model_path, holo_path = resolve_prompt_and_refs(ctx.payload)
         ctx.prompt = prompt
         ctx.garment_path = garment_path
@@ -2862,39 +2823,45 @@ async def execute_pipeline(ctx: JobContext):
             
         if not webp_path.exists() or webp_path.stat().st_size == 0:
             raise RuntimeError("WebP conversion failed.")
-        
-        validate_image_file(str(webp_path))
+
+        if not validate_webp_file(str(webp_path)):
+            raise RuntimeError("WebP validation failed (format/dimensions/size check)")
         ctx.webp_path = str(webp_path)
         ctx.transition_sync(JobState.WEBP_READY)
-        
+
+        fs = sys.modules["fashion_studio"]
+        fs.push_generation(
+            image_path=ctx.clean_png_path,
+            prompt=ctx.prompt,
+            user_id=ctx.payload.get("user_id"),
+            gen_id=ctx.job_id,
+            webp_path=ctx.webp_path,
+            force=True
+        )
+        ctx.transition_sync(JobState.R2_READY)
+        ctx.transition_sync(JobState.DB_FINALIZING)
+        ctx.transition_sync(JobState.DB_READY)
+
         try:
-            fs = sys.modules["fashion_studio"]
-            fs.push_generation(
-                image_path=ctx.clean_png_path,
-                prompt=ctx.prompt,
-                user_id=ctx.payload.get("user_id"),
-                gen_id=ctx.job_id,
-                webp_path=ctx.webp_path,
-                force=True
-            )
-            ctx.transition_sync(JobState.R2_READY)
-            ctx.transition_sync(JobState.DB_FINALIZING)
-            ctx.transition_sync(JobState.DB_READY)
-            
             crd = sys.modules["credits"]
             crd.settle_look(ctx.job_id)
             ctx.transition_sync(JobState.CREDITS_SETTLED)
         except Exception as e:
-            if "credits" in sys.modules:
-                sys.modules["credits"].refund_look(ctx.job_id, str(e)[:500])
-            raise
+            # R2 upload + DB finalization already succeeded above -- the image was
+            # delivered to the user. Do not fail/refund a completed job over a
+            # credits-only settlement failure; log loudly for out-of-band reconciliation.
+            log(f"[{ctx.job_id}] CREDITS_SETTLE_FAILED (job still marked COMPLETED): {e}")
 
         ctx.transition_sync(JobState.COMPLETED)
-        
+
     except Exception as e:
         ctx.error = str(e)
         if ctx.state != JobState.FAILED:
             ctx.transition_sync(JobState.FAILED)
+        try:
+            sys.modules["credits"].refund_look(ctx.job_id, str(e)[:500])
+        except Exception:
+            pass
         release_gemini_once(ctx)
         release_wmr_once(ctx)
 
@@ -2917,12 +2884,15 @@ async def poll_downloads_loop():
                 staging = Path(rec.staging_dir)
                 if not staging.exists(): continue
 
+                # staging is exclusively owned by this one job/resource (see get_chrome_job_dir /
+                # WMR per-resource staging dirs), so ownership is proven by directory scoping --
+                # never by guessing a filename or GUID-prefix Chrome doesn't actually produce.
                 completed_file = None
                 for f in staging.iterdir():
-                    if f.name == rec.expected_filename or (rec.guid and f.name.startswith(rec.guid)):
-                        if not f.name.endswith(".crdownload"):
-                            completed_file = f
-                            break
+                    if f.name.endswith((".crdownload", ".tmp", ".part")):
+                        continue
+                    completed_file = f
+                    break
 
                 if completed_file:
                     size_before = -1
@@ -2962,6 +2932,11 @@ async def poll_downloads_loop():
 async def process_bullmq_job(job, job_token):
     generation_id = job.data.get("generationId") or job.data.get("id") or job.id
     print(f"[{WORKER_ID}] BullMQ job={job.id} generation={generation_id}")
+
+    existing = JOB_CONTEXTS.get(generation_id)
+    if existing is not None and existing.state not in (JobState.COMPLETED, JobState.FAILED):
+        log(f"[{generation_id}] DUPLICATE_JOB_REJECTED: already in-flight (state={existing.state.name})")
+        raise RuntimeError(f"Duplicate job for generation {generation_id} already in-flight (state={existing.state.name})")
 
     gen = fetch_generation(generation_id)
     if not gen: raise RuntimeError(f"Generation {generation_id} not found in DB.")
@@ -3034,6 +3009,7 @@ async def redis_queue_monitor_loop():
     while True:
         try:
             counts = await QUEUE_MONITOR.getJobCounts()
+            RUNTIME_HEALTH["redis"] = True
 
             print("\n" + "=" * 60)
             print("REDIS / BULLMQ QUEUE STATUS")
@@ -3056,68 +3032,77 @@ async def redis_queue_monitor_loop():
                 print("[REDIS] QUEUE EMPTY — worker alive and waiting for jobs")
 
         except Exception as e:
+            RUNTIME_HEALTH["redis"] = False
             print(f"[REDIS MONITOR ERROR] {type(e).__name__}: {e}")
 
         await asyncio.sleep(5)
 
+JOB_CONTEXT_RETENTION_S = 600  # keep terminal JobContexts around briefly for the duplicate-job guard
+
+def _resource_label(state_value: str) -> str:
+    if state_value == ResourceState.AVAILABLE.value:
+        return "FREE"
+    if state_value == ResourceState.BUSY.value:
+        return "BUSY"
+    return "DEAD"  # RECOVERING or DEAD both surface as DEAD in the FREE/BUSY/DEAD heartbeat view
+
 async def worker_heartbeat_loop():
     RUNTIME_HEALTH["heartbeat"] = True
-    QUEUE_NAME = os.environ.get("QUEUE_NAME", "generations")
-    # For tracking uptime
     start_time = time.time()
-    
+
     while True:
         try:
             uptime = time.time() - start_time
             hours, rem = divmod(uptime, 3600)
             minutes, seconds = divmod(rem, 60)
             uptime_str = f"{int(hours):02}:{int(minutes):02}:{int(seconds):02}"
-            
+
+            now = time.time()
+            stale = [jid for jid, j in JOB_CONTEXTS.items()
+                     if j.state in (JobState.COMPLETED, JobState.FAILED)
+                     and j.completed_at and (now - j.completed_at) > JOB_CONTEXT_RETENTION_S]
+            for jid in stale:
+                JOB_CONTEXTS.pop(jid, None)
+
+            gemini_states = GEMINI_BROKER.snapshot()
+            wmr_states = WMR_BROKER.snapshot()
+            raw_downloads = sum(1 for r in DOWNLOAD_REGISTRY.values() if r.resource_type == "gemini")
+            clean_downloads = sum(1 for r in DOWNLOAD_REGISTRY.values() if r.resource_type == "wmr")
+            active_jobs = sum(1 for j in JOB_CONTEXTS.values() if j.state not in (JobState.COMPLETED, JobState.FAILED))
+
             print("\n" + "=" * 60)
-            print("ECOM PHOTOSHOOT N2N WORKER STATUS")
+            print("V16 WORKER HEARTBEAT")
             print("=" * 60)
-            
-            print("\nWorker:")
-            print(f"  ID        = {WORKER_ID}")
-            print(f"  Uptime    = {uptime_str}")
-            print(f"  Status    = RUNNING")
-            
+            print(f"Worker ID: {WORKER_ID}  Uptime: {uptime_str}")
+
+            print("\nRedis:")
+            print("CONNECTED" if RUNTIME_HEALTH["redis"] else "DISCONNECTED")
+
+            print("\nBullMQ:")
+            print("RUNNING" if RUNTIME_HEALTH["bullmq"] else "FAILED")
+
             print("\nGemini:")
             for rid in ["T0", "T1", "T2", "T3"]:
-                print(f"  {rid} = {'FREE' if rid in GEMINI_BROKER.free_resources else 'BUSY/DEAD'}")
-                
+                print(f"{rid} = {_resource_label(gemini_states.get(rid, 'DEAD'))}")
+
             print("\nWMR:")
             for rid in ["W0-T0", "W0-T1", "W1-T0", "W1-T1", "W2-T0", "W2-T1", "W3-T0", "W3-T1"]:
-                print(f"  {rid} = {'FREE' if rid in WMR_BROKER.free_resources else 'BUSY/DEAD'}")
+                print(f"{rid} = {_resource_label(wmr_states.get(rid, 'DEAD'))}")
 
-            # Local Jobs
-            local_jobs = list(JOB_CONTEXTS.values())
-            print("\nLocal Jobs:")
-            print(f"  QUEUED           = {sum(1 for j in local_jobs if j.state == JobState.QUEUED)}")
-            print(f"  GEMINI_GENERATING= {sum(1 for j in local_jobs if j.state == JobState.GEMINI_GENERATING)}")
-            print(f"  RAW_DOWNLOADING  = {sum(1 for j in local_jobs if j.state == JobState.RAW_DOWNLOADING)}")
-            print(f"  RAW_VALIDATED    = {sum(1 for j in local_jobs if j.state == JobState.RAW_VALIDATED)}")
-            print(f"  WMR_PROCESSING   = {sum(1 for j in local_jobs if j.state == JobState.WMR_PROCESSING)}")
-            print(f"  CLEAN_READY      = {sum(1 for j in local_jobs if j.state == JobState.CLEAN_READY)}")
-            print(f"  WEBP_READY       = {sum(1 for j in local_jobs if j.state == JobState.WEBP_READY)}")
-            print(f"  COMPLETED        = {sum(1 for j in local_jobs if j.state == JobState.COMPLETED)}")
-            print(f"  FAILED           = {sum(1 for j in local_jobs if j.state == JobState.FAILED)}")
-            
-            print("\n" + "=" * 60)
-            print("WORKER HEARTBEAT")
+            print("\nDownloads:")
+            print(f"RAW = {raw_downloads}")
+            print(f"CLEAN = {clean_downloads}")
+
+            print("\nJobs:")
+            print(f"ACTIVE = {active_jobs}")
+
+            print("\nWorker:")
+            print("ALIVE")
             print("=" * 60)
-            print(f"Worker ID: {WORKER_ID}")
-            print(f"Uptime: {uptime_str}")
-            print(f"BullMQ Worker: {'RUNNING' if RUNTIME_HEALTH['bullmq'] else 'FAILED'}")
-            print(f"Download Monitor: {'RUNNING' if RUNTIME_HEALTH['download_monitor'] else 'FAILED'}")
-            print(f"Gemini Broker: OK")
-            print(f"WMR Broker: OK")
-            print(f"Queue: {QUEUE_NAME}")
-            print("=" * 60)
-            
+
         except Exception as e:
-            print(f"[HEARTBEAT ERROR] {e}")
-            
+            print(f"[HEARTBEAT ERROR] {type(e).__name__}: {e}")
+
         await asyncio.sleep(10)
 
 async def main():
@@ -3152,14 +3137,25 @@ async def main():
         RUNTIME_HEALTH["db"] = True
 
         print("STEP 13: R2 HEALTH")
-        # Optional health check for R2 here
-        RUNTIME_HEALTH["r2"] = True
-        
+        if fs_configured():
+            try:
+                _r2_client().head_bucket(Bucket=R2_BUCKET_NAME)
+                print("[R2] HEALTH = OK")
+                RUNTIME_HEALTH["r2"] = True
+            except Exception as e:
+                print(f"[R2] HEALTH = FAILED: {type(e).__name__}")
+                RUNTIME_HEALTH["r2"] = False
+                raise
+        else:
+            print("[R2] HEALTH = FAILED: R2 not configured")
+            RUNTIME_HEALTH["r2"] = False
+            raise RuntimeError("R2 required but not configured")
+
         print("STEP 14: GEMINI BROKER")
-        initialize_runtime_once()
-        
-        print("STEP 15: WMR BROKER")
         run_architecture_self_test()
+
+        print("STEP 15: WMR BROKER")
+        initialize_runtime_once()
 
         print("STEP 16: DOWNLOAD MONITOR")
         WATCHER_TASK = asyncio.create_task(poll_downloads_loop())
