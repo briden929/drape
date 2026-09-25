@@ -1289,14 +1289,23 @@ print('🌐 STEP 6: INITIALIZING PERSISTENT CHROME DRIVERS')
 print('=' * 80)
 
 def set_tab_download_dir(drv, path):
+    """Sets the download destination for the CURRENTLY ACTIVE tab only.
+    Browser.setDownloadBehavior is browser-context scoped, not tab scoped
+    -- calling it per-job with a different path (as this used to do)
+    meant T1's job setting its own path would silently redirect T0's
+    (or any other tab's) in-flight download to T1's folder, since the
+    browser-context-level path applies to the whole shared Gemini Chrome
+    profile, not just the tab that called it. Page.setDownloadBehavior is
+    the actual per-tab/per-target mechanism and is safe to call per job.
+    Browser.setDownloadBehavior(eventsEnabled=True) is still needed once,
+    browser-wide, to make Browser.downloadWillBegin fire at all (the only
+    source of real download GUIDs used elsewhere in this file) -- that is
+    now set exactly once at driver creation in create_chrome_driver(),
+    never here."""
     ap = os.path.abspath(str(path))
     os.makedirs(ap, exist_ok=True)
     try:
         drv.execute_cdp_cmd('Page.setDownloadBehavior', {'behavior': 'allow', 'downloadPath': ap})
-    except Exception:
-        pass
-    try:
-        drv.execute_cdp_cmd('Browser.setDownloadBehavior', {'behavior': 'allow', 'downloadPath': ap, 'eventsEnabled': True})
     except Exception:
         pass
 
@@ -1341,6 +1350,16 @@ def create_chrome_driver():
     drv = webdriver.Chrome(options=opts)
     try:
         drv.execute_cdp_cmd('Network.enable', {})
+    except Exception:
+        pass
+    try:
+        # Enables Browser.downloadWillBegin events browser-wide, exactly
+        # ONCE at driver creation -- never per-job. The downloadPath here
+        # is just a startup default; each job's actual per-tab destination
+        # is set separately by set_tab_download_dir() via the tab-scoped
+        # Page.setDownloadBehavior, which does not touch this browser-level
+        # setting.
+        drv.execute_cdp_cmd('Browser.setDownloadBehavior', {'behavior': 'allow', 'downloadPath': str(CHROME_DL_BASE), 'eventsEnabled': True})
     except Exception:
         pass
     return drv
@@ -4056,14 +4075,18 @@ class FirstFreeBroker:
         self.name = name
         self.resource_ids = resources
         self._records: Dict[str, ResourceRecord] = {r: ResourceRecord(resource_id=r) for r in resources}
-        self._free_heap = []
-        self._seq = 0
+        # A set of currently-free resource IDs, scanned in self.resource_ids
+        # order on acquire -- NOT a release-order queue. A heap keyed by a
+        # monotonically increasing release sequence (the previous
+        # implementation) always returns whichever resource has been free
+        # LONGEST, which drifts away from a deterministic "always prefer
+        # T0, then T1, then T2, then T3" policy the moment resources are
+        # released out of ID order -- e.g. T2 releasing before T0 would
+        # then hand T2 to the next job even though T0 is also free.
+        self._free_set = set(resources)
         self._lock = threading.Lock()
         self._condition = threading.Condition(self._lock)
         self._recovery_fn = None
-        for r in resources:
-            self._seq += 1
-            heapq.heappush(self._free_heap, (self._seq, r))
 
     def set_recovery_fn(self, fn):
         """fn(resource_id) -> bool. Called off-lock in a background thread to restart the
@@ -4077,12 +4100,13 @@ class FirstFreeBroker:
     def _acquire_sync(self, job_id: str, timeout: float) -> str:
         t0 = time.monotonic()
         with self._condition:
-            while not self._free_heap:
+            while not self._free_set:
                 remaining = timeout - (time.monotonic() - t0)
                 if remaining <= 0:
                     raise ResourceAcquireTimeout(self.name, job_id, time.monotonic() - t0, self.snapshot_locked())
                 self._condition.wait(timeout=remaining)
-            _, resource_id = heapq.heappop(self._free_heap)
+            resource_id = next(r for r in self.resource_ids if r in self._free_set)
+            self._free_set.discard(resource_id)
             rec = self._records[resource_id]
             rec.state = ResourceState.BUSY
             rec.current_job_id = job_id
@@ -4098,9 +4122,8 @@ class FirstFreeBroker:
             rec.state = ResourceState.AVAILABLE
             rec.current_job_id = None
             rec.last_health_check = time.time()
-            if not any((res_id == resource_id for _, res_id in self._free_heap)):
-                self._seq += 1
-                heapq.heappush(self._free_heap, (self._seq, resource_id))
+            if resource_id not in self._free_set:
+                self._free_set.add(resource_id)
                 append_runtime_log(f"[{self.name} BROKER] Released {resource_id}")
                 self._condition.notify_all()
 
@@ -4138,9 +4161,8 @@ class FirstFreeBroker:
             rec.last_health_check = time.time()
             if ok:
                 rec.state = ResourceState.AVAILABLE
-                if not any((res_id == resource_id for _, res_id in self._free_heap)):
-                    self._seq += 1
-                    heapq.heappush(self._free_heap, (self._seq, resource_id))
+                if resource_id not in self._free_set:
+                    self._free_set.add(resource_id)
                 append_runtime_log(f"[{self.name} BROKER] {resource_id} RECOVERY_COMPLETE -> AVAILABLE")
                 self._condition.notify_all()
             else:
