@@ -414,9 +414,14 @@ REDIS_URL = os.environ.get('REDIS_URL')
 # BullMQ job concurrency is independent of Gemini (4 T-resources) / WMR (8
 # W-resources) concurrency -- those are enforced separately by GEMINI_BROKER
 # and WMR_BROKER's own acquire() backpressure. Defaulting BullMQ's own
-# concurrency to 1 (its library default) would serialize job admission and
-# starve the resource brokers of anything to actually parallelize.
-BULLMQ_CONCURRENCY = int(os.environ.get('BULLMQ_CONCURRENCY', '8'))
+# Matches the physical Gemini resource count (T0-T3) so BullMQ itself is
+# the waiting queue for jobs beyond that: admitting more than 4 meant jobs
+# 5-8 were already inside the pipeline (JobContext created, appearing as
+# G5/-- ... G8/--) blocked on GEMINI_BROKER.acquire() instead of sitting
+# in BullMQ's own waiting state. WMR (8 logical resources) is unaffected
+# by this -- Gemini is released right after download-start, well before
+# WMR runs, so 4 concurrent Gemini jobs still keep WMR busy.
+BULLMQ_CONCURRENCY = int(os.environ.get('BULLMQ_CONCURRENCY', '4'))
 
 def build_redis_connection_opts(redis_url: str) -> dict:
     """Canonical redis-py connection kwargs for a REDIS_URL, used by every
@@ -3243,85 +3248,10 @@ def get_quill_editor(drv):
     matters for verification."""
     return get_active_gemini_image_composer(drv)
 
-def _verify_editor_prompt(drv, editor, expected_text, tid=0, job_id=''):
-    prefix = f'[T{tid}][{job_id}]' if job_id else f'[T{tid}]'
-    try:
-        # The stale-WebElement guard: ALWAYS re-read through the CURRENT
-        # live DOM (the driver's attached element reference can go stale or
-        # point at a hidden editor after Gemini re-renders the composer),
-        # and require that this exact element is still VISIBLE -- text found
-        # only in a hidden/stale editor is NOT proof of anything.
-        live = drv.execute_script(
-            "var e=arguments[0];"
-            "if(!e || !document.body.contains(e)) return null;"
-            "if(e.offsetParent===null) return {hidden:true, text:''};"
-            "return {hidden:false, text:(e.innerText||e.textContent||'')};",
-            editor)
-        if not isinstance(live, dict):
-            append_runtime_log(f'{prefix} PROMPT_VERIFY editor handle stale/missing from DOM')
-            append_runtime_log(f'{prefix} PROMPT_VERIFY_FAILED reason=STALE_EDITOR')
-            return False
-        if live.get('hidden'):
-            append_runtime_log(f'{prefix} PROMPT_VERIFY editor NOT visible (hidden/stale editor)')
-            append_runtime_log(f'{prefix} PROMPT_VERIFY_FAILED reason=EDITOR_HIDDEN')
-            return False
-        actual_raw = live.get('text') or ''
-        expected_norm = normalize_prompt_text(expected_text)
-        actual_norm = normalize_prompt_text(actual_raw)
-        exp_len = len(expected_norm)
-        act_len = len(actual_norm)
-        append_runtime_log(f'{prefix} PROMPT_LENGTH expected={exp_len} actual={act_len}')
-        # Forensic PROMPT_VERIFY record (worker.log only): lengths, coverage,
-        # 50-char prefixes/suffixes and a hash prefix -- never the whole prompt.
-        _cov = act_len / exp_len if exp_len > 0 else 0
-        append_runtime_log(
-            f"{prefix} PROMPT_VERIFY expected_len={exp_len} actual_len={act_len} coverage={_cov:.3f} "
-            f"expected_prefix={expected_norm[:50]!r} actual_prefix={actual_norm[:50]!r} "
-            f"expected_suffix={expected_norm[-50:]!r} actual_suffix={actual_norm[-50:]!r} "
-            f"hash16={hashlib.sha256(expected_norm.encode('utf-8')).hexdigest()[:16]}"
-        )
-        if exp_len == 0:
-            _empty_ok = act_len == 0
-            append_runtime_log(f'{prefix} PROMPT_VERIFY_FAILED reason=EMPTY' if not _empty_ok else f'{prefix} GEMINI_PROMPT_VERIFIED len=0')
-            return _empty_ok
-        coverage = act_len / exp_len if exp_len > 0 else 0
-        if coverage < 0.98 or coverage > 1.05:
-            append_runtime_log(f'{prefix} PROMPT_LENGTH_MISMATCH coverage={coverage:.2%}')
-            append_runtime_log(f'{prefix} PROMPT_VERIFY_FAILED reason=MISMATCH detail=length_coverage_{coverage:.3f}')
-            return False
-        prefix_len = min(80, exp_len)
-        if actual_norm[:prefix_len] != expected_norm[:prefix_len]:
-            append_runtime_log(f" {prefix} PROMPT_START_MISMATCH: '{actual_norm[:30]}' != '{expected_norm[:30]}'".lstrip())
-            append_runtime_log(f'{prefix} PROMPT_VERIFY_FAILED reason=MISMATCH detail=start_mismatch')
-            return False
-        append_runtime_log(f'{prefix} PROMPT_START_VERIFIED')
-        suffix_len = min(80, exp_len)
-        if actual_norm[-suffix_len:] != expected_norm[-suffix_len:]:
-            append_runtime_log(f" {prefix} PROMPT_END_MISMATCH: '{actual_norm[-30:]}' != '{expected_norm[-30:]}'".lstrip())
-            append_runtime_log(f'{prefix} PROMPT_VERIFY_FAILED reason=MISMATCH detail=end_mismatch')
-            return False
-        append_runtime_log(f'{prefix} PROMPT_END_VERIFIED')
-        # NEGATIVE check: the ACTIVE visible UI must no longer be the plain
-        # 'Ask Gemini' chat composer with an empty input. If the expected
-        # prompt is genuinely present in the visible active editor above,
-        # 'Ask Gemini' can legitimately appear elsewhere on the page; but
-        # if BOTH the content matched AND the snapshot still reports the
-        # Ask-Gemini empty-chat state while our own visible-editor read came
-        # up empty-ish, we would already have failed coverage. Belt &
-        # braces: log the ask_gemini_visible flag alongside the PASS.
-        snap = _gemini_ui_snapshot(drv)
-        append_runtime_log(
-            f"{prefix} PROMPT_VERIFY_CONTEXT ask_gemini_visible={snap.get('ask_gemini_visible')} "
-            f"composer_ph='{snap.get('composer_placeholder')}' img_sig='{snap.get('image_mode_signal')}' "
-            f"mode='{snap.get('visible_mode_text')}'"
-        )
-        append_runtime_log(f'{prefix} PROMPT_VERIFIED ✅')
-        append_runtime_log(f'{prefix} GEMINI_PROMPT_VERIFIED len={act_len}')
-        return True
-    except Exception as e:
-        append_runtime_log(f'{prefix} Prompt verification error: {e}')
-        append_runtime_log(f'{prefix} PROMPT_VERIFY_FAILED reason=ERROR detail={e}')
-        return False
+# _verify_editor_prompt() (post-paste content verification: length coverage,
+# prefix/suffix match) was removed here by explicit instruction (V16.3) --
+# the prompt path no longer verifies pasted content at all, matching the
+# proven V9 paste-then-send behavior. See _inject_prompt_atomic() below.
 
 def _clear_editor(drv, editor, tid=0, job_id=''):
     """Clear the composer and PROVE it's actually empty afterward -- a
@@ -3405,166 +3335,66 @@ def _prep_composer_for_tier(drv, tid, job_id, prefix):
     return editor
 
 
-def _wait_for_editor_text_stable(drv, editor, timeout=2.5, poll_interval=0.15, stable_polls=2):
-    """Poll the live editor's text length until it stops changing for
-    `stable_polls` consecutive reads, instead of a single fixed sleep --
-    a long clipboard paste / execCommand insert / send_keys can still be
-    asynchronously rendering past a fixed 0.4s wait on a loaded machine,
-    which risked verifying (and needlessly retrying tiers) against
-    content that hadn't finished landing yet."""
-    deadline = time.time() + timeout
-    last_len = -1
-    stable_count = 0
-    while time.time() < deadline:
-        try:
-            cur_len = drv.execute_script(
-                "var e=arguments[0]; if(!e||!document.body.contains(e)) return -1;"
-                "return (e.innerText||e.textContent||'').length;", editor)
-        except Exception:
-            cur_len = -1
-        if cur_len == last_len and cur_len >= 0:
-            stable_count += 1
-            if stable_count >= stable_polls:
-                return
-        else:
-            stable_count = 0
-        last_len = cur_len
-        time.sleep(poll_interval)
-
-
-def _inject_prompt_clipboard_first(drv, text, tid=0, job_id=''):
-    """TIER 1 (primary): xclip clipboard + Ctrl+V."""
-    prefix = f'[T{tid}][{job_id}]' if job_id else f'[T{tid}]'
-    editor = _prep_composer_for_tier(drv, tid, job_id, prefix)
-    if not editor:
-        return False
-    if not _set_clipboard_xclip(text):
-        append_runtime_log(f'{prefix} PROMPT_CLIPBOARD_SET_FAIL')
-        return False
-    ActionChains(drv).click(editor).key_down(Keys.CONTROL).send_keys('v').key_up(Keys.CONTROL).perform()
-    _wait_for_editor_text_stable(drv, editor)
-    verify_editor = get_active_gemini_image_composer(drv, tid=tid, job_id=job_id)
-    if verify_editor is None:
-        append_runtime_log(f'{prefix} PROMPT_VERIFY FAIL=FRESH_COMPOSER_NOT_FOUND')
-        return False
-    return _verify_editor_prompt(drv, verify_editor, text, tid=tid, job_id=job_id)
-
-
-def _inject_prompt_exec_command(drv, text, tid=0, job_id=''):
-    """TIER 2: document.execCommand('insertText') against the editor's own
-    contenteditable editing context -- one atomic JS call, not a Selenium
-    key-event simulation."""
-    prefix = f'[T{tid}][{job_id}]' if job_id else f'[T{tid}]'
-    editor = _prep_composer_for_tier(drv, tid, job_id, prefix)
-    if not editor:
-        return False
-    try:
-        drv.execute_script(
-            "var editor=arguments[0], text=arguments[1];"
-            "editor.focus();"
-            "document.execCommand('selectAll', false, null);"
-            "document.execCommand('delete', false, null);"
-            "document.execCommand('insertText', false, text);"
-            "editor.dispatchEvent(new InputEvent('input', {bubbles:true, inputType:'insertText', data:text}));",
-            editor, text,
-        )
-    except Exception as e:
-        append_runtime_log(f'{prefix} PROMPT_EXECCOMMAND_ERROR: {e}')
-        return False
-    _wait_for_editor_text_stable(drv, editor)
-    verify_editor = get_active_gemini_image_composer(drv, tid=tid, job_id=job_id)
-    if verify_editor is None:
-        append_runtime_log(f'{prefix} PROMPT_VERIFY FAIL=FRESH_COMPOSER_NOT_FOUND')
-        return False
-    return _verify_editor_prompt(drv, verify_editor, text, tid=tid, job_id=job_id)
-
-
-def _inject_prompt_send_keys(drv, text, tid=0, job_id=''):
-    """TIER 3: full Selenium send_keys() in ONE call -- no 500-char
-    chunking loop. Chunking exists only to work around WebDriver payload
-    limits that don't apply here; it added latency and extra DOM-mutation
-    surface without being required for correctness."""
-    prefix = f'[T{tid}][{job_id}]' if job_id else f'[T{tid}]'
-    editor = _prep_composer_for_tier(drv, tid, job_id, prefix)
-    if not editor:
-        return False
-    try:
-        editor.send_keys(text)
-    except Exception as e:
-        append_runtime_log(f'{prefix} PROMPT_SENDKEYS_ERROR: {e}')
-        return False
-    _wait_for_editor_text_stable(drv, editor)
-    verify_editor = get_active_gemini_image_composer(drv, tid=tid, job_id=job_id)
-    if verify_editor is None:
-        append_runtime_log(f'{prefix} PROMPT_VERIFY FAIL=FRESH_COMPOSER_NOT_FOUND')
-        return False
-    return _verify_editor_prompt(drv, verify_editor, text, tid=tid, job_id=job_id)
-
-
-def _inject_prompt_cdp(drv, text, tid=0, job_id=''):
-    """TIER 4 (last resort): Chrome DevTools Input.insertText. A CDP call
-    returning without raising is NOT proof of success -- only the
-    post-tier _verify_editor_prompt() read of the live composer is."""
-    prefix = f'[T{tid}][{job_id}]' if job_id else f'[T{tid}]'
-    editor = _prep_composer_for_tier(drv, tid, job_id, prefix)
-    if not editor:
-        return False
-    try:
-        drv.execute_cdp_cmd('Input.insertText', {'text': text})
-    except Exception as e:
-        append_runtime_log(f'{prefix} PROMPT_CDP_ERROR: {e}')
-        return False
-    _wait_for_editor_text_stable(drv, editor)
-    verify_editor = get_active_gemini_image_composer(drv, tid=tid, job_id=job_id)
-    if verify_editor is None:
-        append_runtime_log(f'{prefix} PROMPT_VERIFY FAIL=FRESH_COMPOSER_NOT_FOUND')
-        return False
-    return _verify_editor_prompt(drv, verify_editor, text, tid=tid, job_id=job_id)
-
-
-_PROMPT_INJECT_TIERS = [
-    ('clipboard', _inject_prompt_clipboard_first),
-    ('execCommand', _inject_prompt_exec_command),
-    ('send_keys', _inject_prompt_send_keys),
-    ('cdp', _inject_prompt_cdp),
-]
-
-
 def _inject_prompt_atomic(drv, text, tid=0, job_id=''):
     """
-    Inject the prompt via a bounded tier order -- clipboard/Ctrl+V first
-    (matches the proven older browser implementation's primary method),
-    then execCommand, then a single full send_keys call, then CDP
-    Input.insertText as the last resort. Every tier re-finds the CURRENT
-    visible composer, clears it, proves focus landed, and verifies actual
-    visible content afterward -- no tier's return value or lack of
-    exception is ever treated as success on its own.
+    V16.3, by explicit instruction: single clipboard paste, no post-paste
+    content verification, no chunking, no retry-on-unverified-content --
+    matching the proven V9 paste-then-send behavior. This is a deliberate
+    trade of the multi-tier verify/retry safety net for speed; it is not
+    an oversight.
+
+    Sequence: find the current composer, focus it, clear it (pre-paste
+    setup -- not content verification), put the full text on the X11
+    clipboard via xclip, click+Ctrl+V once, a tiny UI-settle delay, done.
+
+    The ONLY fallback to a different injection mechanism is a real
+    xclip failure (the clipboard write itself failing) -- never because
+    pasted content wasn't verified, since no such verification runs here.
+    The fallback methods are likewise unverified and single-shot.
     """
     prefix = f'[T{tid}][{job_id}]' if job_id else f'[T{tid}]'
     append_runtime_log(f'{prefix} GEMINI_PROMPT_INJECT_STARTED len={len(text)}')
 
-    if get_active_gemini_image_composer(drv, tid=tid, job_id=job_id) is None:
-        raise PromptFailed(f'Tab T{tid}: active image composer not found')
+    editor = _prep_composer_for_tier(drv, tid, job_id, prefix)
+    if not editor:
+        raise PromptFailed(f'Tab T{tid}: composer not found/focus+clear not proven before prompt injection')
 
-    for attempt in range(1, 3):
-        for method_name, method in _PROMPT_INJECT_TIERS:
-            # Which tier is running goes to worker.log only -- the single
-            # per-job live line (JOB_PROGRESS 'prompt' stage, already
-            # marked run/ok elsewhere) is the only thing that updates in
-            # the notebook, so this doesn't spam a fresh line per tier.
-            append_runtime_log(f'{prefix} PROMPT_METHOD_START={method_name} attempt={attempt}')
-            try:
-                if method(drv, text, tid=tid, job_id=job_id):
-                    append_runtime_log(f'{prefix} PROMPT_METHOD_SUCCESS={method_name}')
-                    progress_detail(job_id, 'prompt_method', method_name)
-                    return True
-                append_runtime_log(f'{prefix} PROMPT_METHOD_FAIL={method_name}')
-            except Exception as e:
-                append_runtime_log(f'{prefix} PROMPT_METHOD_EXCEPTION={method_name} {type(e).__name__}: {e}')
-        append_runtime_log(f'{prefix} PROMPT_VERIFY_FAIL attempt {attempt} (all tiers) — retrying')
-        time.sleep(0.3)
+    if _set_clipboard_xclip(text):
+        ActionChains(drv).click(editor).key_down(Keys.CONTROL).send_keys('v').key_up(Keys.CONTROL).perform()
+        time.sleep(0.1)
+        append_runtime_log(f'{prefix} PROMPT_METHOD_USED=clipboard (unverified)')
+        progress_detail(job_id, 'prompt_method', 'clipboard')
+        return True
 
-    raise PromptFailed(f'Tab T{tid}: Prompt injection failed after 2 attempts (all tiers unverified)')
+    # xclip itself failed to write the clipboard -- a real OS-level
+    # failure, not a content-verification failure -- fall back, still
+    # with no post-paste verification.
+    append_runtime_log(f'{prefix} PROMPT_CLIPBOARD_SET_FAIL — falling back to execCommand')
+    try:
+        drv.execute_script(
+            "var editor=arguments[0], text=arguments[1];"
+            "editor.focus();"
+            "document.execCommand('insertText', false, text);"
+            "editor.dispatchEvent(new InputEvent('input', {bubbles:true, inputType:'insertText', data:text}));",
+            editor, text,
+        )
+        time.sleep(0.1)
+        append_runtime_log(f'{prefix} PROMPT_METHOD_USED=execCommand (unverified, xclip-fallback)')
+        progress_detail(job_id, 'prompt_method', 'execCommand')
+        return True
+    except Exception as e:
+        append_runtime_log(f'{prefix} PROMPT_EXECCOMMAND_ERROR: {e}')
+
+    try:
+        editor.send_keys(text)
+        time.sleep(0.1)
+        append_runtime_log(f'{prefix} PROMPT_METHOD_USED=send_keys (unverified, xclip-fallback)')
+        progress_detail(job_id, 'prompt_method', 'send_keys')
+        return True
+    except Exception as e:
+        append_runtime_log(f'{prefix} PROMPT_SENDKEYS_ERROR: {e}')
+
+    raise PromptFailed(f'Tab T{tid}: xclip clipboard set failed and all fallback injection methods raised')
 
 def _log_click_rect_and_occlusion(drv, element, label, prefix=''):
     """Logs the element's viewport rect before a critical click, and whether
@@ -4646,17 +4476,10 @@ class GeminiWorker:
 
                 ctx.transition_sync(JobState.GEMINI_SEND_PENDING)
                 job_mark(ctx.job_id, 'send', 'run')
-                # Final gate immediately before Send: re-read the CURRENT live
-                # composer and re-verify it still holds the full prompt.
-                # _inject_prompt_atomic() already verified this moments ago,
-                # but re-checking here catches anything that could have
-                # altered the composer between that verification and this
-                # click (a stray re-render, a leftover async event from an
-                # earlier tier attempt) instead of trusting a stale result.
-                presend_editor = get_active_gemini_image_composer(self.driver, tid=tid_int, job_id=ctx.job_id)
-                if presend_editor is None or not _verify_editor_prompt(self.driver, presend_editor, ctx.prompt, tid=tid_int, job_id=ctx.job_id):
-                    job_mark(ctx.job_id, 'send', 'fail')
-                    raise RuntimeError("SEND_ABORT_PROMPT_NOT_VERIFIED: composer no longer holds the full verified prompt immediately before Send")
+                # No prompt re-verification here by explicit choice (V16.3):
+                # Send follows the paste immediately, matching the proven V9
+                # paste-then-send behavior with no verification stage between
+                # the two stages.
                 urls_before = snapshot_urls(self.driver)
                 append_runtime_log(f'{prefix} GEMINI_SEND_REQUESTED')
                 if not _click_send_button(self.driver, tid_int, ctx.job_id):
