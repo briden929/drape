@@ -3084,11 +3084,14 @@ class GeminiWorker:
     def do_execute_sync(self, ctx: JobContext):
         prefix = f"[GEMINI][{self.tid}][{ctx.job_id}]"
         print(f"{prefix} START", flush=True)
-        with CHROME_DRIVER_LOCK:
-            try:
-                ctx.transition_sync(JobState.GEMINI_GENERATING)
-                tid_int = int(self.tid.replace('T', ''))
+        tid_int = int(self.tid.replace('T', ''))
+        try:
+            ctx.transition_sync(JobState.GEMINI_GENERATING)
 
+            # Phase 1: setup (all short Selenium operations) -- held under
+            # the lock for its whole duration since these need the shared
+            # chrome_driver's focused window to stay put between calls.
+            with CHROME_DRIVER_LOCK:
                 # T0-T3 are TABS of the single shared, already-authenticated chrome_driver
                 # (see _create_gemini_tab) -- never a second Chrome process on the same profile.
                 print(f"{prefix} OPENING GEMINI", flush=True)
@@ -3126,11 +3129,48 @@ class GeminiWorker:
                 if not started:
                     raise RuntimeError("Generation did not start")
                 print(f"{prefix} GENERATION STARTED", flush=True)
-
-                _has_generated_image(self.driver, urls_before)
-                print(f"{prefix} IMAGE DETECTED", flush=True)
-
                 chat_urls = snapshot_urls(self.driver)
+
+            # Phase 2: wait for the REAL generated image. Previously this
+            # called _has_generated_image() -- a single one-shot DOM check,
+            # never a poll -- exactly ONCE and printed "IMAGE DETECTED"
+            # unconditionally, discarding whatever it returned (almost
+            # always None, since Gemini image generation takes many
+            # seconds). The pipeline never actually waited for a real image
+            # before trying to hover-click a download button that usually
+            # didn't exist yet. nb_check_image() (already defined, never
+            # called) additionally catches REFUSED/LIMIT/ERROR states that
+            # a bare _has_generated_image() call never could.
+            #
+            # This loop also fixes the concurrency bottleneck of the old
+            # single all-encompassing `with CHROME_DRIVER_LOCK:`: the lock
+            # is now held only for each brief per-iteration DOM check, not
+            # for the whole 15-240s generation wait, so the other 3 Gemini
+            # tabs can make real progress on their own jobs while this one
+            # waits.
+            deadline = time.time() + GENERATION_TIMEOUT_S
+            status, img_src = "WAITING", None
+            while time.time() < deadline:
+                with CHROME_DRIVER_LOCK:
+                    chrome_driver.switch_to.window(self.handle)
+                    status, img_src = nb_check_image(self.driver, urls_before, chat_urls)
+                if status != "WAITING":
+                    break
+                time.sleep(0.5)
+            if status == "SUCCESS":
+                print(f"{prefix} IMAGE DETECTED", flush=True)
+            elif status == "REFUSED":
+                raise RuntimeError("Gemini refused the prompt")
+            elif status == "LIMIT":
+                raise RuntimeError("Gemini image-generation limit reached")
+            elif status == "ERROR":
+                raise RuntimeError("Gemini reported an error during generation")
+            else:
+                raise RuntimeError(f"Generation timed out after {GENERATION_TIMEOUT_S}s waiting for image (last status={status})")
+
+            # Phase 3: download click + start detection -- short lock again.
+            with CHROME_DRIVER_LOCK:
+                chrome_driver.switch_to.window(self.handle)
                 _hover_and_dl_single_click(self.driver, urls_before, chat_urls)
                 print(f"{prefix} DOWNLOAD CLICKED", flush=True)
 
@@ -3165,20 +3205,21 @@ class GeminiWorker:
                 print(f"{prefix} GEMINI RESOURCE RELEASED", flush=True)
                 print(f"{prefix} RAW DOWNLOAD CONTINUES", flush=True)
 
-            except Exception as e:
-                ctx.error = str(e)
-                ctx.transition_sync(JobState.FAILED)
-                GEMINI_BROKER.fail(self.tid, str(e))
-                _dump_gemini_debug_artifacts(self.tid, self.handle, ctx.job_id, str(e))
-                try:
+        except Exception as e:
+            ctx.error = str(e)
+            ctx.transition_sync(JobState.FAILED)
+            GEMINI_BROKER.fail(self.tid, str(e))
+            _dump_gemini_debug_artifacts(self.tid, self.handle, ctx.job_id, str(e))
+            try:
+                with CHROME_DRIVER_LOCK:
                     if self.handle and self.handle in chrome_driver.window_handles:
                         chrome_driver.switch_to.window(self.handle)
                         chrome_driver.close()
-                except Exception:
-                    pass
-                self.handle = None
-                self.driver = None
-                release_gemini_once(ctx)
+            except Exception:
+                pass
+            self.handle = None
+            self.driver = None
+            release_gemini_once(ctx)
 
 # Reuse the previous run's GeminiWorker instances -- each holds a live
 # `.handle`/`.driver` pointing at an actual open Chrome tab; a fresh dict
