@@ -355,21 +355,11 @@ _REQUIRED_SECRETS = [
     'R2_PUBLIC_URL'
 ]
 
-# Hardcoded per explicit request, baked in from backend/.env at generation
-# time — no Colab secrets popups.
-_HARDCODED = {
-    'DATABASE_URL': 'postgresql://postgres.cfgthwsqgmvtftlyoamj:Daxil%4016%3F80!@aws-0-ap-northeast-1.pooler.supabase.com:6543/postgres',
-    'R2_ACCOUNT_ID': '8e22889fff8e7c874800278c4bdcb26c',
-    'R2_ACCESS_KEY_ID': 'e90045f23e9cd55bb08238384b771bf2',
-    'R2_SECRET_ACCESS_KEY': '0b0e32afb39cf06d1682968ee7dc1750526b04c2ea16b200fb6027b070e7d4d6',
-    'R2_BUCKET_NAME': 'studio-photoshoot',
-    'R2_PUBLIC_URL': 'https://pub-943056d53cd64d87aef37136315753a7.r2.dev',
-    'REDIS_URL': 'rediss://default:gQAAAAAABH39AAIgcDIzNDM4OTNlMTY0NDU0MWQ0YmYwMDJmZWMxOTc0N2Q4NQ@harmless-orca-294397.upstash.io:6379'
-}
-
-# Inject hardcoded secrets into os.environ BEFORE the missing check
-for _name, _val in _HARDCODED.items():
-    os.environ[_name] = _val
+# SECURITY (V16 hardening): NO hardcoded credentials live in this tracked
+# file anymore. A previous revision embedded live DATABASE_URL / REDIS_URL /
+# R2 keys here; they were removed and MUST BE ROTATED because they appeared
+# in source history. Secrets come ONLY from real environment variables or
+# Colab Secrets below -- never printed, never stored in this repo.
 
 # Colab Secrets are per-Google-account, not per-session/per-notebook: add
 # each of the names above ONCE under the key icon in the left sidebar (with
@@ -449,7 +439,14 @@ DOWNLOAD_STABLE_CHECKS = 2
 DOWNLOAD_MIN_SIZE = 5000
 DOWNLOAD_TIMEOUT_S = 120
 DOWNLOAD_START_WINDOW_S = 15
-WMR_TIMEOUT_S = 120
+# V16: split the single generic WMR timeout into per-phase budgets so a
+# stuck upload fails in seconds instead of burning the whole processing
+# window (and vice versa). WMR_TIMEOUT_S kept as the process default for
+# backwards compatibility with any env override.
+WMR_TIMEOUT_S = float(os.environ.get("WMR_TIMEOUT_S", "120"))
+WMR_UPLOAD_ACCEPT_TIMEOUT_S = float(os.environ.get("WMR_UPLOAD_ACCEPT_TIMEOUT_S", "25"))
+WMR_PROCESS_TIMEOUT_S = float(os.environ.get("WMR_PROCESS_TIMEOUT_S", str(WMR_TIMEOUT_S)))
+WMR_DOWNLOAD_START_TIMEOUT_S = float(os.environ.get("WMR_DOWNLOAD_START_TIMEOUT_S", "20"))
 SCREEN_W, SCREEN_H = (1920, 1080)
 VNC_PORT = 5900
 NOVNC_PORT = 6080
@@ -457,9 +454,19 @@ GEMINI_APP_URL = 'https://gemini.google.com/app'
 WMR_SERVICE_URL = 'https://app.gemini-logo-remover.workers.dev/gemini'
 WORKER_ID = f'queue_worker-{uuid.uuid4().hex[:8]}'
 
-def log(msg, file=None):
-    ts = time.strftime('%H:%M:%S')
-    print(f'[{ts}] {msg}', file=file, flush=True)
+def _silent_log(msg, file=None):
+    """Console-quiet replacement for the per-helper status prints.
+
+    PART 13: runtime helpers used to print fragments straight to the
+    notebook (CreateImg / ImgMode(confirmed) / UploadFiles / FileInput(3)
+    / Paste / Sent ...) while the actual browser showed plain 'Ask Gemini'
+    -- false-positive noise competing with the compact live dashboard.
+    Helpers now only RETURN results and update JOB_PROGRESS from verified
+    evidence; everything they observe goes to worker.log via this sink."""
+    return None
+
+
+log = _silent_log
 BASE_DIR = Path('/content/queue_worker_bundle')
 STATE_DIR = BASE_DIR / 'queue_worker_state'
 CHROME_PROFILE_DIR = STATE_DIR / 'chrome_profile'
@@ -497,6 +504,15 @@ def append_runtime_log(msg: str):
             f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}\n")
     except Exception:
         pass
+
+
+# The ORIGINAL timestamped console logger, kept under its own name for the
+# few genuinely user-facing lines (startup steps, fatal errors). Runtime
+# browser helpers must NEVER print per-action status to the notebook --
+# PART 13: their claims belong in worker.log + JOB_PROGRESS tokens only.
+def clog(msg, file=None):
+    ts = time.strftime('%H:%M:%S')
+    print(f'[{ts}] {msg}', file=file, flush=True)
 
 DASHBOARD_STATE = {
     'queue': {'waiting': 0, 'active': 0, 'delayed': 0, 'local_active': 0, 'completed': 0, 'failed': 0, 'raw_downloads': 0, 'clean_downloads': 0},
@@ -538,7 +554,8 @@ def set_last_event(msg: str):
 
 PROGRESS_STAGES = ['newchat', 'flash', 'picker', 'createimg', 'imgmode',
                    'upload', 'attached', 'prompt', 'send', 'genstart',
-                   'image', 'download', 'released', 'done']
+                   'image', 'download', 'dlraw', 'released', 'wmr', 'dlclean',
+                   'webp', 'settle', 'done']
 
 JOB_PROGRESS: Dict[str, dict] = {}
 
@@ -568,7 +585,10 @@ def _job_display_name(job_id: str) -> str:
         return short_job_id(job_id)
 
 
+JOB_PROGRESS_RETENTION_S = float(os.environ.get('JOB_PROGRESS_RETENTION_S', '120'))
+
 def job_progress_init(job_id: str):
+    prev = JOB_PROGRESS.get(job_id) or {}
     JOB_PROGRESS[job_id] = {
         'stages': {},          # stage -> 'run' | 'ok' | 'fail'
         'attach': None,        # (actual, expected)
@@ -579,7 +599,25 @@ def job_progress_init(job_id: str):
         'dl_bytes': None,      # raw download size when file completes
         'completed_at': None,
         'failed': False,
+        # BullMQ-attempt counter carried across re-inits of the same job_id
+        # so staging dirs get isolated per attempt (no stale-file acceptance).
+        'attempt': int(prev.get('attempt') or 0) + 1,
     }
+
+
+def _job_attempt(job_id: str) -> int:
+    p = JOB_PROGRESS.get(job_id)
+    return int(p.get('attempt') or 1) if p else 1
+
+
+def prune_job_progress():
+    """Remove completed/failed job lines after a retention window so a
+    long-running worker never leaks one dict entry per job forever."""
+    now = time.time()
+    for jid in [j for j, p in JOB_PROGRESS.items()
+                if (p.get('completed_at') or p.get('failed'))
+                and now - (p.get('completed_at') or p.get('failed_ts') or now) > JOB_PROGRESS_RETENTION_S]:
+        JOB_PROGRESS.pop(jid, None)
 
 
 def job_mark(job_id: str, stage: str, status: str):
@@ -589,6 +627,30 @@ def job_mark(job_id: str, stage: str, status: str):
     if p is None:
         return
     p['stages'][stage] = status
+    if status == 'fail':
+        p['failed'] = True
+        p.setdefault('failed_ts', time.time())
+
+
+def job_stop(job_id: str, reason: str):
+    """Mark the current in-flight stage failed and pin the STOP reason on
+    the job's live line (compact console). Full evidence -> worker.log."""
+    p = JOB_PROGRESS.get(job_id)
+    if p is None:
+        return
+    for st in reversed(PROGRESS_STAGES):
+        if p['stages'].get(st) == 'run':
+            p['stages'][st] = 'fail'
+            break
+    p['error'] = reason[:120]
+    p['failed'] = True
+    p.setdefault('failed_ts', time.time())
+
+
+def job_complete(job_id: str):
+    p = JOB_PROGRESS.get(job_id)
+    if p is not None:
+        p['completed_at'] = time.time()
 
 
 def job_attach(job_id: str, actual, expected):
@@ -624,13 +686,25 @@ def render_job_line(job_id: str) -> str:
                 tokens.append(_STAGE_ICONS[stages[st]] + 'Image')
             continue
         if st == 'download':
+            if 'dlraw' in stages or p.get('dl_bytes'):
+                continue
+            tokens.append(_STAGE_ICONS[stages[st]] + 'DL')
+            continue
+        if st == 'dlraw':
             if p.get('dl_bytes'):
                 tokens.append(f"⬇️{p['dl_bytes'] // 1024}KB")
+            else:
+                tokens.append(_STAGE_ICONS[stages[st]] + 'DL-Raw')
+            continue
+        if st == 'dlclean':
+            if p.get('dlclean_bytes'):
+                tokens.append(f"➜{p['dlclean_bytes'] // 1024}KB")
             elif st in stages:
-                tokens.append(_STAGE_ICONS[stages[st]] + 'DL')
+                tokens.append(_STAGE_ICONS[stages[st]] + 'DL-Clean')
             continue
         if st in stages:
-            tokens.append(_STAGE_ICONS[stages[st]] + st.capitalize())
+            label = {'wmr': 'WMR', 'webp': 'WebP', 'settle': 'Settle'}.get(st, st.capitalize())
+            tokens.append(_STAGE_ICONS[stages[st]] + label)
     if p.get('completed_at'):
         tokens.append('🎉DONE')
     if p.get('failed'):
@@ -640,22 +714,31 @@ def render_job_line(job_id: str) -> str:
     else:
         head = '🟢'
     res = p.get('resource') or '--'
-    line = f"{head} [{res}] {short_job_id(job_id)} {_job_display_name(job_id)}\n| " + ' | '.join(tokens)
+    wres = p.get('wmr_resource')
+    tag = f"{res}" + (f"/{wres}" if wres else "")
+    # ONE physical line: tokens are never truncated -- only the human title.
+    line = f"{head} [{tag}] {short_job_id(job_id)} {_job_display_name(job_id)} | " + ' | '.join(tokens)
     if p.get('error'):
-        line += f"\n| STOP {p['error']}"
+        line += f" | STOP {p['error']}"
     return line
 
 
 def get_chrome_job_dir(tab_id: int, job_id: str):
-    """Returns (job_dir, incoming_dir) for Chrome downloads."""
-    job_dir = CHROME_DL_BASE / f'T{tab_id}' / job_id
+    """Returns (job_dir, incoming_dir) for Chrome downloads.
+    ATTEMPT ISOLATION: path is T{tab}/attempt-{N}/{job_id}/incoming -- a
+    BullMQ retry of the same job_id gets a brand-new directory and can
+    never accept a stale leftover file from a previous attempt."""
+    attempt = _job_attempt(job_id)
+    job_dir = CHROME_DL_BASE / f'T{tab_id}' / f'attempt-{attempt}' / job_id
     incoming = job_dir / 'incoming'
     incoming.mkdir(parents=True, exist_ok=True)
     return (job_dir, incoming)
 
 def get_wmr_job_dir(chrome_tab_id: int, job_id: str):
-    """Returns (job_dir, incoming_dir) for WMR Chrome output. Named by T-slot, not W-slot."""
-    job_dir = WMR_DL_BASE / f'T{chrome_tab_id}' / job_id
+    """Returns (job_dir, incoming_dir) for WMR Chrome output. Named by T-slot, not W-slot.
+    Attempt-isolated for the same reason as get_chrome_job_dir()."""
+    attempt = _job_attempt(job_id)
+    job_dir = WMR_DL_BASE / f'T{chrome_tab_id}' / f'attempt-{attempt}' / job_id
     incoming = job_dir / 'incoming'
     incoming.mkdir(parents=True, exist_ok=True)
     return (job_dir, incoming)
@@ -1154,7 +1237,7 @@ def create_wmr_chrome_driver(resource_id: str) -> webdriver.Chrome:
         drv.execute_cdp_cmd('Browser.setDownloadBehavior', {'behavior': 'allow', 'downloadPath': dl_dir_str, 'eventsEnabled': True})
     except Exception:
         pass
-    log(f'[WMR-{resource_id}] Browser = Google Chrome  staging={staging_dir}')
+    append_runtime_log(f'[WMR-{resource_id}] Browser = Google Chrome  staging={staging_dir}')
     return drv
 chrome_driver = None
 if V16_STATE.chrome_driver is not None:
@@ -1655,7 +1738,7 @@ def convert_to_webp(png_path, max_size_kb=800):
                 return webp_path
         return webp_path
     except Exception as e:
-        log(f'  ⚠️ WebP conversion failed: {e}')
+        append_runtime_log(f'  ⚠️ WebP conversion failed: {e}')
         return None
 
 def validate_image_file(path, min_size=DOWNLOAD_MIN_SIZE):
@@ -1713,6 +1796,33 @@ def _wmr_find_file_input(drv):
     _wmr_expose_file_inputs(drv)
     inputs = drv.find_elements(By.CSS_SELECTOR, "input[type='file']")
     return inputs[0] if inputs else None
+
+def _wmr_wait_for_upload_accepted(drv, timeout_s: float) -> bool:
+    """POSITIVE browser evidence that WMR actually accepted the file:
+    page left the landing/upload state (title/url changed to a workspace/
+    editor route or an 'after'/preview image appeared). send_keys()
+    returning is NOT proof -- without this check a silent rejection used
+    to burn the full processing timeout."""
+    t0 = time.time()
+    while time.time() - t0 < timeout_s:
+        try:
+            res = drv.execute_script(
+                "var url=(location.href||'').toLowerCase();"
+                "if(url.indexOf('upload')===-1 && url!=='https://www.watermarkremover.io/') return 'NAV';"
+                "var imgs=document.querySelectorAll('img');"
+                "for(var i=0;i<imgs.length;i++){"
+                "  var alt=(imgs[i].getAttribute('alt')||'').toLowerCase();"
+                "  var src=imgs[i].getAttribute('src')||'';"
+                "  if((alt.indexOf('after')!==-1||src.indexOf('blob:')===0)&&imgs[i].offsetParent!==null) return 'PREVIEW';"
+                "}"
+                "return 'WAIT';")
+            if res in ('NAV', 'PREVIEW'):
+                append_runtime_log(f'[WMR] UPLOAD_ACCEPTED via={res} elapsed={time.time()-t0:.1f}s')
+                return True
+        except Exception:
+            pass
+        time.sleep(0.5)
+    return False
 
 def _wmr_check_status(drv):
     js_code = "\n        var btns = document.querySelectorAll('button');\n        for (var i = 0; i < btns.length; i++) {\n            var btn = btns[i];\n            var txt = (btn.textContent || '').trim();\n            if (txt.indexOf('Download PNG') !== -1 || txt.indexOf('Save') !== -1) {\n                var style = window.getComputedStyle(btn);\n                var isVisible = style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0';\n                if (isVisible && !btn.disabled) {\n                    return 'DONE';\n                }\n            }\n        }\n        var imgs = document.querySelectorAll('img');\n        for (var i = 0; i < imgs.length; i++) {\n            var alt = (imgs[i].getAttribute('alt') || '').toLowerCase();\n            var src = imgs[i].getAttribute('src') || '';\n            if (alt.indexOf('after') !== -1 && (src.indexOf('blob:') === 0 || src.indexOf('data:') === 0)) {\n                return 'DONE';\n            }\n        }\n        var allText = document.body ? document.body.innerText.toLowerCase() : '';\n        if (allText.indexOf('detecting') !== -1 || allText.indexOf('processing') !== -1) {\n            return 'BUSY';\n        }\n        if (allText.indexOf('not detected') !== -1 || allText.indexOf('no watermark') !== -1) {\n            for (var i = 0; i < btns.length; i++) {\n                var txt = (btns[i].textContent || '').trim();\n                if (txt.indexOf('Download PNG') !== -1 || txt.indexOf('Save') !== -1) {\n                    return 'DONE';\n                }\n            }\n            return 'NOT_FOUND';\n        }\n        if (allText.length < 10) return 'LOADING';\n        return 'BUSY';\n    "
@@ -1788,7 +1898,7 @@ def _ensure_chrome_alive():
         return
     except Exception:
         pass
-    log("[CHROME] SHARED CHROME PROCESS IS DEAD -- relaunching browser")
+    append_runtime_log("[CHROME] SHARED CHROME PROCESS IS DEAD -- relaunching browser")
     try:
         chrome_driver.quit()
     except Exception:
@@ -1830,7 +1940,7 @@ def _create_gemini_tab(tid: int) -> str:
             return handle
         except Exception as e:
             last_err = e
-            log(f'[TAB-CREATE][T{tid}] attempt {attempt}/3 failed: {e}')
+            append_runtime_log(f'[TAB-CREATE][T{tid}] attempt {attempt}/3 failed: {e}')
             time.sleep(1.0)
     raise RuntimeError(f'Tab T{tid}: Failed to create physical tab after 3 attempts: {last_err}')
 for _i in range(MAX_CONCURRENT_TABS):
@@ -1876,7 +1986,7 @@ def _dismiss_new_chat_dialog(drv):
                     if any((w in combined for w in ['new chat', 'create', 'confirm', 'delete', 'continue', 'yes'])):
                         if 'cancel' not in combined:
                             drv.execute_script('arguments[0].click();', btn)
-                            log(f"    [DIALOG] Clicked affirmative button: '{btn.text.strip()}'")
+                            append_runtime_log(f"    [DIALOG] Clicked affirmative button: '{btn.text.strip()}'")
                             time.sleep(0.5)
                             return True
     except Exception:
@@ -1884,7 +1994,7 @@ def _dismiss_new_chat_dialog(drv):
     try:
         res = drv.execute_script('\n            var modals = document.querySelectorAll(\'[role="dialog"], mat-dialog-container, [class*="dialog"], [class*="modal"]\');\n            for (var m = 0; m < modals.length; m++) {\n                var modal = modals[m];\n                if (!modal.offsetParent) continue;\n                var btns = modal.querySelectorAll(\'button\');\n                for (var i = 0; i < btns.length; i++) {\n                    var b = btns[i];\n                    if (!b.offsetParent) continue;\n                    var t = (b.textContent || \'\').trim().toLowerCase();\n                    var a = (b.getAttribute(\'aria-label\') || \'\').toLowerCase();\n                    var combined = t + \' \' + a;\n                    if ((combined.indexOf(\'new chat\') !== -1 || combined.indexOf(\'create\') !== -1 ||\n                         combined.indexOf(\'confirm\') !== -1 || combined.indexOf(\'delete\') !== -1) &&\n                        combined.indexOf(\'cancel\') === -1) {\n                        b.click(); return \'OK:\' + t;\n                    }\n                }\n            }\n            return \'NO\';\n        ')
         if res and res.startswith('OK:'):
-            log(f'    [DIALOG] JS-dismissed: {res}')
+            append_runtime_log(f'    [DIALOG] JS-dismissed: {res}')
             time.sleep(0.5)
             return True
     except Exception:
@@ -1909,20 +2019,20 @@ def open_new_chat_and_reload(drv, tid: int, job_id: str='') -> str:
     for attempt in range(1, MAX_NEW_CHAT_RETRIES + 1):
         try:
             old_url = drv.current_url
-            log(f'{prefix} NEW_CHAT_START (attempt {attempt}) OLD_URL={old_url}')
+            append_runtime_log(f'{prefix} NEW_CHAT_START (attempt {attempt}) OLD_URL={old_url}')
             clicked = False
             res = drv.execute_script('\n                var sels = [\n                    \'a[aria-label="New chat"]\',\n                    \'button[aria-label="New chat"]\',\n                    \'div[aria-label="New chat"]\',\n                    \'[data-test-id="new-chat-button"]\',\n                    \'a[href="/app"]\',\n                ];\n                for (var s = 0; s < sels.length; s++) {\n                    var els = document.querySelectorAll(sels[s]);\n                    for (var i = 0; i < els.length; i++) {\n                        if (els[i].offsetParent !== null) {\n                            els[i].click(); return \'OK:\' + sels[s];\n                        }\n                    }\n                }\n                return \'NO\';\n            ')
             if res and res.startswith('OK:'):
                 clicked = True
-                log(f'{prefix} NEW_CHAT_CLICK -> {res}')
+                append_runtime_log(f'{prefix} NEW_CHAT_CLICK -> {res}')
             else:
                 drv.get(GEMINI_APP_URL)
                 clicked = True
-                log(f'{prefix} NEW_CHAT_NAVIGATE -> {GEMINI_APP_URL}')
+                append_runtime_log(f'{prefix} NEW_CHAT_NAVIGATE -> {GEMINI_APP_URL}')
             time.sleep(0.3)
             dialog_handled = _dismiss_new_chat_dialog(drv)
             if dialog_handled:
-                log(f'{prefix} DIALOG_HANDLED')
+                append_runtime_log(f'{prefix} DIALOG_HANDLED')
                 time.sleep(0.4)
             url_deadline = time.time() + 8.0
             new_url = None
@@ -1939,25 +2049,25 @@ def open_new_chat_and_reload(drv, tid: int, job_id: str='') -> str:
                 cur = drv.current_url
                 if 'gemini.google.com/app' in cur:
                     new_url = cur
-                    log(f'{prefix} NEW_CHAT_URL_UNCHANGED — accepting base URL: {new_url}')
+                    append_runtime_log(f'{prefix} NEW_CHAT_URL_UNCHANGED — accepting base URL: {new_url}')
             if not new_url:
-                log(f'{prefix} NEW_CHAT_URL_NOT_CHANGED (attempt {attempt}) — retrying')
+                append_runtime_log(f'{prefix} NEW_CHAT_URL_NOT_CHANGED (attempt {attempt}) — retrying')
                 time.sleep(0.5)
                 continue
-            log(f'{prefix} NEW_CHAT_URL={new_url}')
-            log(f'{prefix} RELOADING NEW CHAT URL')
+            append_runtime_log(f'{prefix} NEW_CHAT_URL={new_url}')
+            append_runtime_log(f'{prefix} RELOADING NEW CHAT URL')
             drv.get(new_url)
             time.sleep(1.0)
-            log(f'{prefix} NEW_CHAT_RELOADED')
+            append_runtime_log(f'{prefix} NEW_CHAT_RELOADED')
             if _verify_clean_composer(drv):
-                log(f'{prefix} NEW_CHAT_VERIFIED ✅')
+                append_runtime_log(f'{prefix} NEW_CHAT_VERIFIED ✅')
                 return new_url
             else:
-                log(f'{prefix} NEW_CHAT_COMPOSER_NOT_CLEAN (attempt {attempt}) — retrying')
+                append_runtime_log(f'{prefix} NEW_CHAT_COMPOSER_NOT_CLEAN (attempt {attempt}) — retrying')
                 time.sleep(0.5)
                 continue
         except Exception as e:
-            log(f'{prefix} NEW_CHAT_EXCEPTION (attempt {attempt}): {e}', file=sys.stderr)
+            append_runtime_log(f'{prefix} NEW_CHAT_EXCEPTION (attempt {attempt}): {e}', file=sys.stderr)
             time.sleep(0.5)
             continue
     raise NewChatFailed(f'Tab T{tid}: Could not create a verified new Gemini chat after {MAX_NEW_CHAT_RETRIES} attempts')
@@ -2106,7 +2216,7 @@ def ensure_flash_mode(drv, tid=0, job_id=''):
     append_runtime_log(f'{prefix} GEMINI_FLASH_CHECK')
     current = _get_current_model_text(drv)
     if current and 'flash' in current.lower() and ('lite' not in current.lower()):
-        log(f"{prefix} FLASH_VERIFIED (already active: '{current}')")
+        append_runtime_log(f"{prefix} FLASH_VERIFIED (already active: '{current}')")
         append_runtime_log(f"{prefix} GEMINI_FLASH_VERIFIED model_text='{current}'")
         return True
     for attempt in range(1, 4):
@@ -2123,7 +2233,7 @@ def ensure_flash_mode(drv, tid=0, job_id=''):
                 pass
             raise
         if clicked and _verify_flash_selected(drv, timeout=2.5):
-            log(f'{prefix} FLASH_VERIFIED ✅')
+            append_runtime_log(f'{prefix} FLASH_VERIFIED ✅')
             append_runtime_log(f"{prefix} GEMINI_FLASH_VERIFIED model_text='{_get_current_model_text(drv)}'")
             return True
         try:
@@ -2540,7 +2650,7 @@ def open_upload_drawer(drv, tid=0, job_id='') -> bool:
     """Open the upload/tools drawer by clicking the + button."""
     prefix = f'[T{tid}][{job_id}]' if job_id else f'[T{tid}]'
     if not click_plus_button(drv):
-        log(f'{prefix} DRAWER_FAILED: Could not click plus button', file=sys.stderr)
+        append_runtime_log(f'{prefix} DRAWER_FAILED: Could not click plus button', file=sys.stderr)
         return False
     time.sleep(0.25)
     return True
@@ -2597,11 +2707,11 @@ def find_file_input_strict(drv, tid=0, job_id=''):
         return fi
     for attempt in range(1, 4):
         if not open_upload_drawer(drv, tid, job_id):
-            log(f'{prefix} FILE_INPUT_RETRY (attempt {attempt}/3): could not open + drawer')
+            append_runtime_log(f'{prefix} FILE_INPUT_RETRY (attempt {attempt}/3): could not open + drawer')
             time.sleep(0.5)
             continue
         if not click_upload_files_in_drawer(drv):
-            log(f'{prefix} FILE_INPUT_RETRY (attempt {attempt}/3): "Upload files" not found in drawer')
+            append_runtime_log(f'{prefix} FILE_INPUT_RETRY (attempt {attempt}/3): "Upload files" not found in drawer')
             try:
                 drv.find_element(By.TAG_NAME, 'body').send_keys(Keys.ESCAPE)
             except Exception:
@@ -2636,7 +2746,7 @@ def upload_reference_files(drv, abs_paths: list, tid=0, job_id='') -> dict:
     fi = find_file_input_strict(drv, tid, job_id)
     token = _tag_upload_input(drv, fi, job_id)
     fi.send_keys('\n'.join(valid_paths))
-    log(f'{prefix} UPLOAD_SENT files={len(valid_paths)}')
+    append_runtime_log(f'{prefix} UPLOAD_SENT files={len(valid_paths)}')
     return {'expected': len(valid_paths), 'token': token, 'paths': valid_paths}
 
 def verify_attachment_count(drv, expected: int, tid=0, job_id='', upload_token=None, timeout_s=15.0) -> tuple:
@@ -2684,7 +2794,7 @@ def verify_attachment_count(drv, expected: int, tid=0, job_id='', upload_token=N
             if actual is not None and actual >= 0:
                 last_actual = int(actual)
                 if last_actual == expected:
-                    log(f'{prefix} ATTACHMENTS {last_actual}/{expected} ✅ FILELIST EXACT')
+                    append_runtime_log(f'{prefix} ATTACHMENTS {last_actual}/{expected} ✅ FILELIST EXACT')
                     return (True, last_actual)
                 if last_actual > expected:
                     raise RuntimeError(f'{prefix} ATTACHMENT_OVERCOUNT: expected {expected}, got {last_actual}')
@@ -2706,7 +2816,7 @@ def verify_attachment_count(drv, expected: int, tid=0, job_id='', upload_token=N
         if result is not None:
             last_actual = result
             if result == expected:
-                log(f'{prefix} ATTACHMENTS {result}/{expected} ✅ CANONICAL UI EXACT')
+                append_runtime_log(f'{prefix} ATTACHMENTS {result}/{expected} ✅ CANONICAL UI EXACT')
                 return (True, result)
             if result > expected:
                 raise RuntimeError(f'{prefix} ATTACHMENT_OVERCOUNT: expected {expected}, got {result}')
@@ -2758,11 +2868,11 @@ def _verify_editor_prompt(drv, editor, expected_text, tid=0, job_id=''):
             "return {hidden:false, text:(e.innerText||e.textContent||'')};",
             editor)
         if not isinstance(live, dict):
-            log(f'{prefix} PROMPT_VERIFY editor handle stale/missing from DOM')
+            append_runtime_log(f'{prefix} PROMPT_VERIFY editor handle stale/missing from DOM')
             append_runtime_log(f'{prefix} PROMPT_VERIFY_FAILED reason=STALE_EDITOR')
             return False
         if live.get('hidden'):
-            log(f'{prefix} PROMPT_VERIFY editor NOT visible (hidden/stale editor)')
+            append_runtime_log(f'{prefix} PROMPT_VERIFY editor NOT visible (hidden/stale editor)')
             append_runtime_log(f'{prefix} PROMPT_VERIFY_FAILED reason=EDITOR_HIDDEN')
             return False
         actual_raw = live.get('text') or ''
@@ -2770,7 +2880,7 @@ def _verify_editor_prompt(drv, editor, expected_text, tid=0, job_id=''):
         actual_norm = normalize_prompt_text(actual_raw)
         exp_len = len(expected_norm)
         act_len = len(actual_norm)
-        log(f'{prefix} PROMPT_LENGTH expected={exp_len} actual={act_len}')
+        append_runtime_log(f'{prefix} PROMPT_LENGTH expected={exp_len} actual={act_len}')
         # Forensic PROMPT_VERIFY record (worker.log only): lengths, coverage,
         # 50-char prefixes/suffixes and a hash prefix -- never the whole prompt.
         _cov = act_len / exp_len if exp_len > 0 else 0
@@ -2786,21 +2896,21 @@ def _verify_editor_prompt(drv, editor, expected_text, tid=0, job_id=''):
             return _empty_ok
         coverage = act_len / exp_len if exp_len > 0 else 0
         if coverage < 0.98 or coverage > 1.05:
-            log(f'{prefix} PROMPT_LENGTH_MISMATCH coverage={coverage:.2%}')
+            append_runtime_log(f'{prefix} PROMPT_LENGTH_MISMATCH coverage={coverage:.2%}')
             append_runtime_log(f'{prefix} PROMPT_VERIFY_FAILED reason=MISMATCH detail=length_coverage_{coverage:.3f}')
             return False
         prefix_len = min(80, exp_len)
         if actual_norm[:prefix_len] != expected_norm[:prefix_len]:
-            log(f" {prefix} PROMPT_START_MISMATCH: '{actual_norm[:30]}' != '{expected_norm[:30]}'".lstrip())
+            append_runtime_log(f" {prefix} PROMPT_START_MISMATCH: '{actual_norm[:30]}' != '{expected_norm[:30]}'".lstrip())
             append_runtime_log(f'{prefix} PROMPT_VERIFY_FAILED reason=MISMATCH detail=start_mismatch')
             return False
-        log(f'{prefix} PROMPT_START_VERIFIED')
+        append_runtime_log(f'{prefix} PROMPT_START_VERIFIED')
         suffix_len = min(80, exp_len)
         if actual_norm[-suffix_len:] != expected_norm[-suffix_len:]:
-            log(f" {prefix} PROMPT_END_MISMATCH: '{actual_norm[-30:]}' != '{expected_norm[-30:]}'".lstrip())
+            append_runtime_log(f" {prefix} PROMPT_END_MISMATCH: '{actual_norm[-30:]}' != '{expected_norm[-30:]}'".lstrip())
             append_runtime_log(f'{prefix} PROMPT_VERIFY_FAILED reason=MISMATCH detail=end_mismatch')
             return False
-        log(f'{prefix} PROMPT_END_VERIFIED')
+        append_runtime_log(f'{prefix} PROMPT_END_VERIFIED')
         # NEGATIVE check: the ACTIVE visible UI must no longer be the plain
         # 'Ask Gemini' chat composer with an empty input. If the expected
         # prompt is genuinely present in the visible active editor above,
@@ -2815,11 +2925,11 @@ def _verify_editor_prompt(drv, editor, expected_text, tid=0, job_id=''):
             f"composer_ph='{snap.get('composer_placeholder')}' img_sig='{snap.get('image_mode_signal')}' "
             f"mode='{snap.get('visible_mode_text')}'"
         )
-        log(f'{prefix} PROMPT_VERIFIED ✅')
+        append_runtime_log(f'{prefix} PROMPT_VERIFIED ✅')
         append_runtime_log(f'{prefix} GEMINI_PROMPT_VERIFIED len={act_len}')
         return True
     except Exception as e:
-        log(f'{prefix} Prompt verification error: {e}')
+        append_runtime_log(f'{prefix} Prompt verification error: {e}')
         append_runtime_log(f'{prefix} PROMPT_VERIFY_FAILED reason=ERROR detail={e}')
         return False
 
@@ -2864,46 +2974,46 @@ def _inject_prompt_atomic(drv, text, tid=0, job_id=''):
 
             try:
                 drv.execute_cdp_cmd('Input.insertText', {'text': text})
-                log(f'{prefix} PROMPT_INJECTING via CDP')
+                append_runtime_log(f'{prefix} PROMPT_INJECTING via CDP')
                 append_runtime_log(f'{prefix} GEMINI_PROMPT_INJECT_METHOD tier={attempt}:cdp_input_insertText')
             except Exception as cdp_err:
-                log(f'{prefix} CDP notice ({cdp_err})')
+                append_runtime_log(f'{prefix} CDP notice ({cdp_err})')
             time.sleep(0.3)
             if _verify_editor_prompt(drv, editor, text, tid=tid, job_id=job_id):
                 return True
-            log(f'{prefix} CDP insertText did not verify -- trying xclip fallback')
+            append_runtime_log(f'{prefix} CDP insertText did not verify -- trying xclip fallback')
 
             _clear_editor(drv, editor)
             if _set_clipboard_xclip(text):
                 drv.execute_script('arguments[0].focus();', editor)
                 ActionChains(drv).click(editor).key_down(Keys.CONTROL).send_keys('v').key_up(Keys.CONTROL).perform()
-                log(f'{prefix} PROMPT_INJECTING via xclip Ctrl+V')
+                append_runtime_log(f'{prefix} PROMPT_INJECTING via xclip Ctrl+V')
                 append_runtime_log(f'{prefix} GEMINI_PROMPT_INJECT_METHOD tier={attempt}:xclip_ctrl_v')
             else:
-                log(f'{prefix} xclip failed', file=sys.stderr)
+                append_runtime_log(f'{prefix} xclip failed', file=sys.stderr)
             time.sleep(0.3)
             if _verify_editor_prompt(drv, editor, text, tid=tid, job_id=job_id):
                 return True
-            log(f'{prefix} xclip paste did not verify -- trying direct send_keys fallback')
+            append_runtime_log(f'{prefix} xclip paste did not verify -- trying direct send_keys fallback')
 
             _clear_editor(drv, editor)
             try:
                 for chunk_start in range(0, len(text), 500):
                     editor.send_keys(text[chunk_start:chunk_start + 500])
                     time.sleep(0.03)
-                log(f'{prefix} PROMPT_INJECTING via send_keys chunks')
+                append_runtime_log(f'{prefix} PROMPT_INJECTING via send_keys chunks')
                 append_runtime_log(f'{prefix} GEMINI_PROMPT_INJECT_METHOD tier={attempt}:send_keys_chunks')
             except Exception as sk_err:
-                log(f'{prefix} send_keys fallback error: {sk_err}')
+                append_runtime_log(f'{prefix} send_keys fallback error: {sk_err}')
             time.sleep(0.3)
             if _verify_editor_prompt(drv, editor, text, tid=tid, job_id=job_id):
                 return True
 
-            log(f'{prefix} PROMPT_VERIFY_FAIL attempt {attempt} (all 3 tiers) — retrying')
+            append_runtime_log(f'{prefix} PROMPT_VERIFY_FAIL attempt {attempt} (all 3 tiers) — retrying')
         except PromptFailed:
             raise
         except Exception as e:
-            log(f'{prefix} Prompt injection exception (attempt {attempt}): {e}')
+            append_runtime_log(f'{prefix} Prompt injection exception (attempt {attempt}): {e}')
             try:
                 _clear_editor(drv, editor)
             except Exception:
@@ -2929,9 +3039,9 @@ def _log_click_rect_and_occlusion(drv, element, label, prefix=''):
         )
         if not info:
             return True  # couldn't inspect -- don't block the click over it
-        log(f"{prefix} {label}_RECT x={info['x']} y={info['y']} w={info['w']} h={info['h']}")
+        append_runtime_log(f"{prefix} {label}_RECT x={info['x']} y={info['y']} w={info['w']} h={info['h']}")
         if not info['owns']:
-            log(f"{prefix} {label}_OCCLUDED by <{info['topTag']}>")
+            append_runtime_log(f"{prefix} {label}_OCCLUDED by <{info['topTag']}>")
         return info['owns']
     except Exception:
         return True
@@ -2995,10 +3105,10 @@ def _click_send_button(drv, tid=0, job_id=''):
             editor = get_quill_editor(drv)
             if editor and editor.is_displayed():
                 editor.send_keys(Keys.RETURN)
-                log(f'{prefix} SEND via Enter fallback')
+                append_runtime_log(f'{prefix} SEND via Enter fallback')
                 clicked = True
         except Exception as e:
-            log(f'{prefix} Enter fallback failed: {e}')
+            append_runtime_log(f'{prefix} Enter fallback failed: {e}')
     if not clicked:
         return False
     append_runtime_log(f'{prefix} GEMINI_SEND_CLICKED pre_composer_len={pre_len}')
@@ -3012,7 +3122,7 @@ def _click_send_button(drv, tid=0, job_id=''):
                 f"{prefix} GEMINI_SEND_VERIFIED composer_emptied={composer_empty} "
                 f"gen_evidence={gen_evidence} composer_len={snap.get('composer_text_len')}"
             )
-            log(f'{prefix} SEND_VERIFIED ✅')
+            append_runtime_log(f'{prefix} SEND_VERIFIED ✅')
             return True
         time.sleep(0.4)
     append_runtime_log(
@@ -3220,7 +3330,7 @@ def _hover_and_dl_single_click(drv, urls_before, chat_urls, prefix='') -> bool:
     for attempt in range(1, DOWNLOAD_BUTTON_RETRIES + 1):
         if _hover_and_dl_single_click_once(drv, urls_before, chat_urls):
             return True
-        log(f'{prefix} DOWNLOAD_BUTTON_NOT_FOUND attempt {attempt}/{DOWNLOAD_BUTTON_RETRIES}')
+        append_runtime_log(f'{prefix} DOWNLOAD_BUTTON_NOT_FOUND attempt {attempt}/{DOWNLOAD_BUTTON_RETRIES}')
         if attempt < DOWNLOAD_BUTTON_RETRIES:
             time.sleep(DOWNLOAD_BUTTON_RETRY_GAP_S)
     return False
@@ -3600,9 +3710,9 @@ def _log_download_start_confirmed(prefix: str, dl_guid: Optional[str], source: s
     print literally read "REAL CHROME GUID = None (source=filesystem)").
     Log what's actually true for each source."""
     if source == 'cdp' and dl_guid:
-        log(f'{prefix} DOWNLOAD_START_CONFIRMED source=cdp CDP_GUID={dl_guid}')
+        append_runtime_log(f'{prefix} DOWNLOAD_START_CONFIRMED source=cdp CDP_GUID={dl_guid}')
     else:
-        log(f'{prefix} DOWNLOAD_START_CONFIRMED source=filesystem CDP_GUID=NOT_CAPTURED')
+        append_runtime_log(f'{prefix} DOWNLOAD_START_CONFIRMED source=filesystem CDP_GUID=NOT_CAPTURED')
 
 def _snapshot_staging_dir(staging_dir: Path) -> set:
     try:
@@ -3726,10 +3836,10 @@ def _recover_gemini_resource(resource_id: str) -> bool:
             _ = chrome_driver.title
             worker.handle = new_handle
             worker.driver = chrome_driver
-            log(f"[GEMINI BROKER] {resource_id} RECOVERY_HEALTH_CHECK = OK (new tab {new_handle})")
+            append_runtime_log(f"[GEMINI BROKER] {resource_id} RECOVERY_HEALTH_CHECK = OK (new tab {new_handle})")
             return True
         except Exception as e:
-            log(f"[GEMINI BROKER] {resource_id} RECOVERY_HEALTH_CHECK = FAILED: {e}")
+            append_runtime_log(f"[GEMINI BROKER] {resource_id} RECOVERY_HEALTH_CHECK = FAILED: {e}")
             worker.handle = None
             worker.driver = None
             return False
@@ -3744,9 +3854,9 @@ def _recover_wmr_resource(resource_id: str) -> bool:
         return False
     ok = request_wmr_recover(thread)
     if ok:
-        log(f"[WMR BROKER] {resource_id} RECOVERY_HEALTH_CHECK = OK")
+        append_runtime_log(f"[WMR BROKER] {resource_id} RECOVERY_HEALTH_CHECK = OK")
     else:
-        log(f"[WMR BROKER] {resource_id} RECOVERY_HEALTH_CHECK = FAILED")
+        append_runtime_log(f"[WMR BROKER] {resource_id} RECOVERY_HEALTH_CHECK = FAILED")
     return ok
 
 GEMINI_BROKER.set_recovery_fn(_recover_gemini_resource)
@@ -3810,9 +3920,9 @@ def _dump_gemini_debug_artifacts(tid: str, handle: Optional[str], job_id: str, r
             "return out;"
         )
         (debug_dir / 'geom.json').write_text(json.dumps(geom, indent=2), encoding='utf-8')
-        log(f'[T{tid}][{job_id}] DEBUG_ARTIFACTS_SAVED -> {debug_dir}')
+        append_runtime_log(f'[T{tid}][{job_id}] DEBUG_ARTIFACTS_SAVED -> {debug_dir}')
     except Exception as dump_err:
-        log(f'[T{tid}][{job_id}] DEBUG_ARTIFACT_DUMP_FAILED: {dump_err}')
+        append_runtime_log(f'[T{tid}][{job_id}] DEBUG_ARTIFACT_DUMP_FAILED: {dump_err}')
 
 class GeminiWorker:
     def __init__(self, tid: str):
@@ -3846,7 +3956,7 @@ class GeminiWorker:
                 append_runtime_log(f"{prefix} OPENING GEMINI")
                 if self.handle is None or self.handle not in chrome_driver.window_handles:
                     self.handle = _create_gemini_tab(tid_int)
-                    log(f"{prefix} PHYSICAL_TAB_CREATED handle={self.handle}")
+                    append_runtime_log(f"{prefix} PHYSICAL_TAB_CREATED handle={self.handle}")
                 chrome_driver.switch_to.window(self.handle)
                 self.driver = chrome_driver
 
@@ -3855,41 +3965,57 @@ class GeminiWorker:
                 if not tab_id_str:
                     raise RuntimeError("Failed to create/find target tab")
                 append_runtime_log(f'{prefix} GEMINI_NEW_CHAT_STARTED')
+                job_mark(ctx.job_id, 'newchat', 'run')
                 _gemini_state_snapshot(self.driver, 'after_new_chat', tid_int, ctx.job_id)
                 append_runtime_log(f'{prefix} GEMINI_NEW_CHAT_READY')
+                job_mark(ctx.job_id, 'newchat', 'ok')
 
                 job_dir, staging_dir = get_chrome_job_dir(tid_int, ctx.job_id)
                 set_tab_download_dir(self.driver, str(staging_dir))
 
                 ctx.transition_sync(JobState.GEMINI_MODE_SELECT)
                 append_runtime_log(f"{prefix} FLASH MODE")
+                job_mark(ctx.job_id, 'flash', 'run')
                 ensure_flash_mode(self.driver, tid_int, ctx.job_id)
+                job_mark(ctx.job_id, 'flash', 'ok')
                 _gemini_state_snapshot(self.driver, 'after_flash', tid_int, ctx.job_id)
 
                 append_runtime_log(f"{prefix} CREATE IMAGE MODE")
+                job_mark(ctx.job_id, 'picker', 'run')
                 ensure_create_image_mode(self.driver, tid_int, ctx.job_id)
+                job_mark(ctx.job_id, 'picker', 'ok')
+                job_mark(ctx.job_id, 'createimg', 'ok')
+                job_mark(ctx.job_id, 'imgmode', 'ok')
                 _gemini_state_snapshot(self.driver, 'after_create_image', tid_int, ctx.job_id)
 
                 ctx.transition_sync(JobState.GEMINI_UPLOADING)
                 append_runtime_log(f"{prefix} UPLOADING REFERENCES")
                 append_runtime_log(f'{prefix} GEMINI_UPLOAD_STARTED n_refs={len(ctx.reference_paths)}')
+                job_mark(ctx.job_id, 'upload', 'run')
                 upload_result = upload_reference_files(self.driver, ctx.reference_paths, tid_int, ctx.job_id)
                 append_runtime_log(f"{prefix} GEMINI_UPLOAD_COMPLETED files={upload_result['expected']}")
-                verify_attachment_count(self.driver, upload_result["expected"], tid=tid_int, job_id=ctx.job_id, upload_token=upload_result["token"])
+                _ok_att, _actual_att = verify_attachment_count(self.driver, upload_result["expected"], tid=tid_int, job_id=ctx.job_id, upload_token=upload_result["token"])
+                job_attach(ctx.job_id, _actual_att, upload_result["expected"])
+                job_mark(ctx.job_id, 'upload', 'ok')
                 append_runtime_log(f"{prefix} ATTACHMENTS VERIFIED")
                 append_runtime_log(f"{prefix} GEMINI_ATTACHMENTS_VERIFIED count={upload_result['expected']}")
                 _gemini_state_snapshot(self.driver, 'after_attachments', tid_int, ctx.job_id)
 
                 ctx.transition_sync(JobState.GEMINI_PROMPT)
+                job_mark(ctx.job_id, 'prompt', 'run')
                 _inject_prompt_atomic(self.driver, ctx.prompt, tid_int, ctx.job_id)
+                job_mark(ctx.job_id, 'prompt', 'ok')
                 append_runtime_log(f"{prefix} PROMPT INJECTED")
                 _gemini_state_snapshot(self.driver, 'after_prompt', tid_int, ctx.job_id)
 
                 ctx.transition_sync(JobState.GEMINI_SEND_PENDING)
+                job_mark(ctx.job_id, 'send', 'run')
                 urls_before = snapshot_urls(self.driver)
                 append_runtime_log(f'{prefix} GEMINI_SEND_REQUESTED')
                 if not _click_send_button(self.driver, tid_int, ctx.job_id):
+                    job_mark(ctx.job_id, 'send', 'fail')
                     raise RuntimeError("SEND_FAILED: Could not click send button")
+                job_mark(ctx.job_id, 'send', 'ok')
                 append_runtime_log(f"{prefix} SEND CLICKED")
                 append_runtime_log(f'{prefix} GEMINI_SEND_CLICKED')
                 _gemini_state_snapshot(self.driver, 'after_send', tid_int, ctx.job_id)
@@ -3897,7 +4023,9 @@ class GeminiWorker:
                 started = verify_generation_started(self.driver)
                 if not started:
                     _gemini_state_snapshot(self.driver, 'generation_start_failed', tid_int, ctx.job_id, screenshot=True)
+                    job_mark(ctx.job_id, 'genstart', 'fail')
                     raise RuntimeError("GENERATION_START_FAILED: verify_generation_started() saw no browser evidence (stop button / loading overlay / generating indicator) after Send")
+                job_mark(ctx.job_id, 'genstart', 'ok')
                 ctx.transition_sync(JobState.GEMINI_GENERATING)
                 append_runtime_log(f"{prefix} GENERATION STARTED")
                 append_runtime_log(f'{prefix} GEMINI_GENERATION_STARTED')
@@ -3932,6 +4060,10 @@ class GeminiWorker:
             if status == "SUCCESS":
                 append_runtime_log(f"{prefix} IMAGE DETECTED")
                 _t_img = time.time()
+                _jp = JOB_PROGRESS.get(ctx.job_id)
+                if _jp is not None:
+                    _jp['image_at'] = _t_img
+                job_mark(ctx.job_id, 'image', 'ok')
                 try:
                     _kind = 'blob_new' if str(img_src).startswith('blob:') else ('googleusercontent' if 'googleusercontent' in str(img_src) else 'other')
                 except Exception:
@@ -3968,6 +4100,7 @@ class GeminiWorker:
                 append_runtime_log(f'{prefix} GEMINI_DOWNLOAD_CLICKED')
 
             expected_png = f"{ctx.job_id}.png"
+            job_mark(ctx.job_id, 'download', 'run')
             ctx.transition_sync(JobState.RAW_DOWNLOAD_START)
 
             # Phase 3b: waiting up to DOWNLOAD_START_WINDOW_S for the real
@@ -4016,6 +4149,8 @@ class GeminiWorker:
                     created_at=time.time()
                 )
 
+            job_mark(ctx.job_id, 'download', 'ok')
+            job_mark(ctx.job_id, 'released', 'ok')
             release_gemini_once(ctx)
             ctx.transition_sync(JobState.GEMINI_RELEASED)
             ctx.transition_sync(JobState.RAW_DOWNLOADING)
@@ -4025,6 +4160,13 @@ class GeminiWorker:
 
         except Exception as e:
             ctx.error = str(e)
+            _err = str(e)
+            if 'CREATE_IMAGE_VERIFY_FAILED' in _err:
+                job_stop(ctx.job_id, 'CREATE_IMAGE_VERIFY_FAILED')
+            elif 'PROMPT_VERIFY_FAILED' in _err or 'Prompt injection failed' in _err:
+                job_stop(ctx.job_id, 'PROMPT_VERIFY_FAILED')
+            else:
+                job_stop(ctx.job_id, type(e).__name__ + ': ' + _err[:60])
             ctx.transition_sync(JobState.FAILED)
             GEMINI_BROKER.fail(self.tid, str(e))
             _dump_gemini_debug_artifacts(self.tid, self.handle, ctx.job_id, str(e))
@@ -4113,6 +4255,7 @@ class WmrDriverThread(threading.Thread):
                 prefix = f"[WMR][{self.resource_id}][{ctx.job_id}]"
                 append_runtime_log(f"{prefix} START")
                 try:
+                    job_mark(ctx.job_id, 'wmr', 'run')
                     if self.driver is None:
                         self.driver = create_wmr_chrome_driver(self.resource_id)
                         self.driver.get("https://www.watermarkremover.io/upload")
@@ -4121,7 +4264,9 @@ class WmrDriverThread(threading.Thread):
 
                     ctx.transition_sync(JobState.WMR_PROCESSING)
 
-                    staging_dir = Path(WMR_STAGING_BASE) / self.resource_id / ctx.job_id
+                    # ATTEMPT ISOLATION: per-attempt staging dir -- a retry of
+                    # the same job can never see a previous attempt's leftover.
+                    staging_dir = Path(WMR_STAGING_BASE) / self.resource_id / f"attempt-{_job_attempt(ctx.job_id)}" / ctx.job_id
                     staging_dir.mkdir(parents=True, exist_ok=True)
 
                     set_tab_download_dir(self.driver, str(staging_dir))
@@ -4129,14 +4274,19 @@ class WmrDriverThread(threading.Thread):
                     append_runtime_log(f"{prefix} UPLOADING RAW PNG")
                     _wmr_expose_file_inputs(self.driver)
                     file_input = _wmr_find_file_input(self.driver)
+                    if file_input is None:
+                        raise RuntimeError("WMR_UPLOAD_FAILED: no file input on page")
                     file_input.send_keys(str(Path(ctx.raw_path).resolve()))
+                    # POSITIVE evidence the upload was accepted (page navigated
+                    # to workspace or preview appeared) within its OWN timeout.
+                    if not _wmr_wait_for_upload_accepted(self.driver, WMR_UPLOAD_ACCEPT_TIMEOUT_S):
+                        raise RuntimeError(f"WMR_UPLOAD_NOT_ACCEPTED within {WMR_UPLOAD_ACCEPT_TIMEOUT_S:.0f}s")
 
                     append_runtime_log(f"{prefix} PROCESSING")
-                    # Previously this called _wmr_check_status() exactly once and
-                    # discarded the result -- meaning WMR processing status was
-                    # never actually awaited before attempting the download click.
-                    # Poll until the page reports DONE (or a terminal failure).
-                    deadline = time.time() + WMR_TIMEOUT_S
+                    # Poll until the page reports DONE (or a terminal failure),
+                    # bounded by the dedicated PROCESS timeout (not one generic
+                    # timeout for the whole WMR operation).
+                    deadline = time.time() + WMR_PROCESS_TIMEOUT_S
                     wmr_status = "LOADING"
                     while time.time() < deadline:
                         try:
@@ -4150,7 +4300,8 @@ class WmrDriverThread(threading.Thread):
                     if wmr_status == "NOT_FOUND":
                         raise RuntimeError("WMR_WATERMARK_NOT_DETECTED")
                     if wmr_status not in ("DONE",):
-                        raise RuntimeError(f"WMR_PROCESSING_TIMEOUT (last status={wmr_status})")
+                        raise RuntimeError(f"WMR_PROCESSING_TIMEOUT after {WMR_PROCESS_TIMEOUT_S:.0f}s (last status={wmr_status})")
+                    job_mark(ctx.job_id, 'wmr', 'ok')
 
                     clicked = _wmr_click_download(self.driver, attempts=6)
                     if not clicked:
@@ -4158,9 +4309,10 @@ class WmrDriverThread(threading.Thread):
                     append_runtime_log(f"{prefix} DOWNLOAD CLICKED")
 
                     expected_png = f"{ctx.job_id}_clean.png"
+                    job_mark(ctx.job_id, 'dlclean', 'run')
                     ctx.transition_sync(JobState.WMR_DOWNLOAD_START)
 
-                    dl_guid, source = _detect_download_start(self.driver, staging_dir, timeout=DOWNLOAD_START_WINDOW_S)
+                    dl_guid, source = _detect_download_start(self.driver, staging_dir, timeout=WMR_DOWNLOAD_START_TIMEOUT_S)
                     _log_download_start_confirmed(prefix, dl_guid, source)
 
                     record_id = f"wmr:{ctx.job_id}:{time.monotonic_ns()}"
@@ -4186,6 +4338,7 @@ class WmrDriverThread(threading.Thread):
 
                 except Exception as e:
                     ctx.error = str(e)
+                    job_stop(ctx.job_id, 'WMR: ' + type(e).__name__ + ': ' + str(e)[:60])
                     ctx.transition_sync(JobState.FAILED)
                     WMR_BROKER.fail(self.resource_id, str(e))
                     try: self.driver.quit()
@@ -4260,11 +4413,12 @@ def _print_job_timing(ctx: JobContext):
     )
 
 async def execute_pipeline(ctx: JobContext):
+    job_progress_init(ctx.job_id)
     try:
         existing_status = str(ctx.payload.get('status') or '').lower()
         existing_output = ctx.payload.get('output_url')
         if existing_status == 'done' and existing_output:
-            log(f"[{ctx.job_id}] IDEMPOTENT_SKIP: generation already completed (status=done, output_url set) — not regenerating")
+            append_runtime_log(f"[{ctx.job_id}] IDEMPOTENT_SKIP: generation already completed (status=done, output_url set) — not regenerating")
             ctx.transition_sync(JobState.COMPLETED)
             return
 
@@ -4292,6 +4446,9 @@ async def execute_pipeline(ctx: JobContext):
         append_runtime_log(f"[PIPELINE][{ctx.job_id}] Acquiring Gemini resource")
         tid = await GEMINI_BROKER.acquire(ctx.job_id)
         ctx.gemini_resource = tid
+        _jp = JOB_PROGRESS.get(ctx.job_id)
+        if _jp is not None:
+            _jp['resource'] = tid
         ctx.transition_sync(JobState.GEMINI_RESERVED)
         append_runtime_log(f"[PIPELINE][{ctx.job_id}] Gemini acquired = {tid}")
 
@@ -4305,6 +4462,9 @@ async def execute_pipeline(ctx: JobContext):
         append_runtime_log(f"[PIPELINE][{ctx.job_id}] Acquiring WMR resource")
         w_tid = await WMR_BROKER.acquire(ctx.job_id)
         ctx.wmr_resource = w_tid
+        _jp = JOB_PROGRESS.get(ctx.job_id)
+        if _jp is not None:
+            _jp['wmr_resource'] = w_tid
         ctx.transition_sync(JobState.WMR_RESERVED)
         append_runtime_log(f"[PIPELINE][{ctx.job_id}] WMR resource acquired = {w_tid}")
 
@@ -4324,6 +4484,7 @@ async def execute_pipeline(ctx: JobContext):
 
         if not validate_webp_file(str(webp_path)):
             raise RuntimeError("WebP validation failed (format/dimensions/size check)")
+        job_mark(ctx.job_id, 'webp', 'ok')
         ctx.webp_path = str(webp_path)
         ctx.transition_sync(JobState.WEBP_READY)
         append_runtime_log(f"[PIPELINE][{ctx.job_id}] WEBP_READY")
@@ -4347,14 +4508,16 @@ async def execute_pipeline(ctx: JobContext):
         try:
             crd = sys.modules["credits"]
             crd.settle_look(ctx.job_id)
+            job_mark(ctx.job_id, 'settle', 'ok')
             ctx.transition_sync(JobState.CREDITS_SETTLED)
             append_runtime_log(f"[PIPELINE][{ctx.job_id}] CREDITS_SETTLED")
         except Exception as e:
             # R2 upload + DB finalization already succeeded above -- the image was
             # delivered to the user. Do not fail/refund a completed job over a
             # credits-only settlement failure; log loudly for out-of-band reconciliation.
-            log(f"[{ctx.job_id}] CREDITS_SETTLE_FAILED (job still marked COMPLETED): {e}")
+            append_runtime_log(f"[{ctx.job_id}] CREDITS_SETTLE_FAILED (job still marked COMPLETED): {e}")
 
+        job_complete(ctx.job_id)
         ctx.transition_sync(JobState.COMPLETED)
         DASHBOARD_STATE["queue"]["completed"] = DASHBOARD_STATE["queue"].get("completed", 0) + 1
         set_last_event(f"{short_job_id(ctx.job_id)} COMPLETED")
@@ -4366,6 +4529,7 @@ async def execute_pipeline(ctx: JobContext):
 
     except Exception as e:
         ctx.error = str(e)
+        job_stop(ctx.job_id, type(e).__name__ + ': ' + str(e)[:60])
         if ctx.state != JobState.FAILED:
             ctx.transition_sync(JobState.FAILED)
 
@@ -4467,11 +4631,19 @@ async def poll_downloads_loop():
                         try:
                             validate_image_file(str(completed_file))
                             print(f"[DOWNLOAD][{rec.job_id}] PNG VALIDATED", flush=True)
+                            _sz = completed_file.stat().st_size
+                            _jp = JOB_PROGRESS.get(rec.job_id)
                             if rec.target_state == JobState.RAW_VALIDATED:
                                 ctx.raw_path = str(completed_file)
+                                if _jp is not None:
+                                    _jp['dl_bytes'] = _sz
+                                job_mark(rec.job_id, 'dlraw', 'ok')
                                 ctx.transition_sync(JobState.RAW_READY)
                             else:
                                 ctx.clean_png_path = str(completed_file)
+                                if _jp is not None:
+                                    _jp['dlclean_bytes'] = _sz
+                                job_mark(rec.job_id, 'dlclean', 'ok')
 
                             ctx.transition_sync(rec.target_state)
                             print(f"[DOWNLOAD][{rec.job_id}] {rec.target_state.name}", flush=True)
@@ -4752,48 +4924,52 @@ def _dashboard_table_row(resource, row):
     jid = short_job_id(row["job_id"]) if row["job_id"] else "FREE"
     return f'{resource:<7}| {jid:<26}| {row["state"]:<15}| {_fmt_age(row["age"]):<9}| {row["next"]}'
 
-def render_dashboard_html() -> str:
-    q = DASHBOARD_STATE["queue"]
-    sys_state = DASHBOARD_STATE["system"]
-    uptime_s = int(time.time() - DASHBOARD_STATE["start_time"])
-    uptime_str = f"{uptime_s // 3600:02d}:{(uptime_s % 3600) // 60:02d}:{uptime_s % 60:02d}"
-
-    gemini_rows = get_gemini_dashboard_state()
-    wmr_rows = get_wmr_dashboard_state()
-
+def _render_live_progress_block() -> list:
+    """Compact live progress stream: one header line + ONE physical line per
+    active/recent job. No HTML table, no <div id=...>, no CSS, no JavaScript,
+    no second state machine -- it renders JOB_PROGRESS (verified-event mirror)
+    only. Completed/failed lines linger for a short retention window."""
+    prune_job_progress()
     lines = []
-    W = 86
-    lines.append("=" * W)
-    lines.append("ECOM N2N QUEUE WORKER".center(W))
+    q = DASHBOARD_STATE['queue']
+    uptime_s = int(time.time() - DASHBOARD_STATE['start_time'])
     lines.append(
-        f"Queue: {QUEUE_NAME}   WAIT {q['waiting']}   ACTIVE {q['active']}   DELAY {q['delayed']}   "
-        f"LOCAL {q['local_active']}   UPTIME {uptime_str}"
+        f"▒ LIVE PROGRESS · WAIT {q['waiting']} · ACTIVE {q['active']} · "
+        f"LOCAL {q['local_active']} · OK {q['completed']} · FAIL {q['failed']} · "
+        f"{uptime_s // 3600:02d}:{(uptime_s % 3600) // 60:02d}:{uptime_s % 60:02d}"
     )
-    lines.append(
-        f"Completed {q['completed']}   Failed {q['failed']}   RAW-DL {q['raw_downloads']}   "
-        f"WMR-DL {q['clean_downloads']}"
-    )
-    lines.append("-" * W)
-    lines.append("GEMINI / RAW GENERATION")
-    lines.append(f'{"RES":<7}| {"JOB":<26}| {"STATE":<15}| {"AGE":<9}| NEXT')
-    for rid in ["T0", "T1", "T2", "T3"]:
-        lines.append(_dashboard_table_row(rid, gemini_rows[rid]))
-    lines.append("-" * W)
-    lines.append("WMR / CLEAN")
-    lines.append(f'{"RES":<7}| {"JOB":<26}| {"STATE":<15}| {"AGE":<9}| NEXT')
-    for rid in ["W0-T0", "W0-T1", "W1-T0", "W1-T1", "W2-T0", "W2-T1", "W3-T0", "W3-T1"]:
-        lines.append(_dashboard_table_row(rid, wmr_rows[rid]))
-    lines.append("-" * W)
-    lines.append(
-        f"SYSTEM  Redis {sys_state['redis']}  DB {sys_state['db']}  R2 {sys_state['r2']}  "
-        f"BullMQ {sys_state['bullmq']}  Download {sys_state['download']}  Gemini {sys_state['gemini']}  WMR {sys_state['wmr']}"
-    )
-    last_ts = time.strftime("%H:%M:%S", time.localtime(DASHBOARD_STATE["last_event_ts"])) if DASHBOARD_STATE["last_event_ts"] else "--:--:--"
-    lines.append(f"LAST EVENT: [{last_ts}] {DASHBOARD_STATE['last_event']}")
-    lines.append("=" * W)
+    active = [jid for jid, p in JOB_PROGRESS.items()
+              if not p.get('completed_at') and not p.get('failed')]
+    finished = [(jid, p.get('completed_at') or p.get('failed_ts') or 0)
+                for jid, p in JOB_PROGRESS.items()
+                if p.get('completed_at') or p.get('failed')]
+    finished.sort(key=lambda x: x[1])
+    ordered = active + [jid for jid, _ in finished][-6:]
+    for jid in ordered:
+        line = render_job_line(jid)
+        if line:
+            lines.append(line)
+    if len(ordered) == 1:
+        lines.append("[1 job]")
+    elif ordered:
+        lines.append(f"[{len(active)} active / {len(ordered)} shown]")
+    return lines
 
-    body = "\n".join(lines)
-    return f'<pre style="font-family:monospace;font-size:13px;line-height:1.35;white-space:pre;">{body}</pre>'
+
+def render_dashboard_html() -> str:
+    # V16: the resource TABLE dashboard is replaced by the compact live
+    # progress stream below. The old table code path is intentionally gone --
+    # there is exactly ONE rendering of job state on screen now.
+    lines = _render_live_progress_block()
+    body = chr(10).join(lines)
+    return f'<pre style="font-family:monospace;font-size:13px;line-height:1.35;white-space:pre-wrap;">{body}</pre>'
+
+
+# --------------------------------------------------------------------------
+# The old resource-TABLE renderer was removed entirely in V16: the compact
+# live progress stream above is the ONLY on-screen view. No dormant duplicate
+# rendering code is kept.
+# --------------------------------------------------------------------------
 
 async def dashboard_loop():
     """The ONE live dashboard task. Refreshes an in-place output region
@@ -4808,7 +4984,7 @@ async def dashboard_loop():
             ipy_display(HTML(html))
         except Exception as e:
             append_runtime_log(f"DASHBOARD_ERROR: {type(e).__name__}: {e}")
-        await asyncio.sleep(1)
+        await asyncio.sleep(2)
 
 REDIS_STARTUP_TIMEOUT_S = float(os.environ.get("REDIS_STARTUP_TIMEOUT_S", "15"))
 
