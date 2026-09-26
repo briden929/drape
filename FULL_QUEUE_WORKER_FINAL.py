@@ -463,7 +463,12 @@ MAX_JOB_RETRIES = 2
 DOWNLOAD_STABLE_CHECKS = 2
 DOWNLOAD_MIN_SIZE = 5000
 DOWNLOAD_TIMEOUT_S = 120
-DOWNLOAD_START_WINDOW_S = 15
+DOWNLOAD_START_WINDOW_S = 15  # WMR's own default; unrelated to the Gemini path below
+# Gemini's download-start wait has NO normal-operation timeout by explicit
+# request -- a slow/large download is not a failure. This is a safety net
+# only, to eventually give up on a genuinely dead resource (Chrome never
+# writes anything at all), never on a download that's merely still going.
+DOWNLOAD_START_SAFETY_TIMEOUT_S = int(os.environ.get('DOWNLOAD_START_SAFETY_TIMEOUT_S', '300'))
 # V16: split the single generic WMR timeout into per-phase budgets so a
 # stuck upload fails in seconds instead of burning the whole processing
 # window (and vice versa). WMR_TIMEOUT_S kept as the process default for
@@ -4614,44 +4619,6 @@ def _snapshot_staging_dir(staging_dir: Path) -> set:
         return set()
 
 
-def wait_for_download_file(staging_dir: Path, before: set, timeout: float) -> Optional[str]:
-    """Ported directly from the proven ECOM_COMBO_PHOTOSHOOT_ORDER (V9.1)
-    reference script's _wait_for_dl(): a plain filesystem poll, no Selenium
-    driver access at all -- by explicit request, this is "the click and
-    time thing" taken as a function rather than reinvented. Since it never
-    touches the driver, callers don't need CHROME_DRIVER_LOCK for this
-    wait, unlike the old CDP-log-based detection which had to keep
-    switching windows and reading get_log('performance') on every
-    iteration.
-
-    Picks the most-recently-modified newly-appeared file that isn't a
-    partial download and is over the minimum size, exactly as V9.1 did.
-    Returns the file's absolute path, or None on timeout."""
-    t0 = time.time()
-    while time.time() - t0 < timeout:
-        try:
-            if staging_dir.exists():
-                cur = {f.name for f in staging_dir.iterdir()}
-                new_files = {
-                    f for f in (cur - before)
-                    if not f.endswith(('.crdownload', '.tmp', '.part', '.download'))
-                    and f.lower().endswith(('.png', '.jpg', '.jpeg', '.webp'))
-                }
-                if new_files:
-                    candidates = sorted(
-                        new_files,
-                        key=lambda f: (staging_dir / f).stat().st_mtime,
-                        reverse=True,
-                    )
-                    fp = staging_dir / candidates[0]
-                    if fp.stat().st_size > 5000:
-                        return str(fp)
-        except Exception:
-            pass
-        time.sleep(0.4)
-    return None
-
-
 def _detect_download_start_once(drv, before: set, staging_dir: Path) -> Optional[Tuple[Optional[str], str]]:
     """Single-iteration check, so callers that share a Chrome session across
     multiple threads (e.g. Gemini's CHROME_DRIVER_LOCK) can hold the lock
@@ -5090,39 +5057,65 @@ class GeminiWorker:
         job_mark(ctx.job_id, 'download', 'run')
         ctx.transition_sync(JobState.RAW_DOWNLOAD_START)
 
-        # By explicit request: reuse the proven ECOM_COMBO_PHOTOSHOOT_ORDER
-        # (V9.1) reference script's own click-then-wait timing as-is,
-        # rather than the CDP performance-log polling this used to do.
-        # wait_for_download_file() is a plain filesystem poll -- it never
-        # touches the driver, so it doesn't need CHROME_DRIVER_LOCK at all
-        # for the whole wait window (the old CDP-based loop had to
-        # reacquire the lock and switch windows on every single iteration
-        # just to call get_log('performance')).
-        found_path = wait_for_download_file(staging_dir, before_files, DOWNLOAD_START_WINDOW_S)
-        if found_path is None:
+        # PHASE A (start detection) and PHASE B (completion) are
+        # deliberately separate concerns with separate timeouts -- a
+        # previous version of this code collapsed them into one 15s wait
+        # for the FINAL file, which meant a real, slow/large download
+        # produced "Download start timeout after 15s" even while Chrome
+        # was actively writing it to disk. _detect_download_start_once()
+        # already treats a CDP Browser.downloadWillBegin event, a new
+        # .crdownload/.tmp/.part/.download partial file, OR a new final
+        # image file as valid START evidence (not just the final file) --
+        # any one of them is enough to release the Gemini resource right
+        # here. Completion (waiting for the partial to become a real,
+        # stable, valid PNG) is a SEPARATE, unbounded-by-this-loop concern
+        # already handled independently by poll_downloads_loop() once the
+        # DownloadRecord below is registered.
+        #
+        # DOWNLOAD_START_SAFETY_TIMEOUT_S is not a normal-operation limit
+        # -- by explicit request there is no such limit -- it exists only
+        # to eventually fail a job whose browser/resource is genuinely
+        # dead (Chrome never even begins writing anything), not one that
+        # is merely downloading slowly.
+        result = None
+        deadline = time.time() + DOWNLOAD_START_SAFETY_TIMEOUT_S
+        while time.time() < deadline:
+            with CHROME_DRIVER_LOCK:
+                chrome_driver.switch_to.window(self.handle)
+                result = _detect_download_start_once(self.driver, before_files, staging_dir)
+            if result is not None:
+                break
+            time.sleep(0.5)
+        if result is None:
             observed_files = sorted(_snapshot_staging_dir(staging_dir) - before_files)
             append_runtime_log(
                 f"{prefix} DOWNLOAD_START_TIMEOUT resource={self.tid} job={ctx.job_id} "
                 f"configured_dir={staging_dir} files_before={sorted(before_files)[:5]} "
-                f"newly_seen_files={observed_files} click=True window_s={DOWNLOAD_START_WINDOW_S}"
+                f"newly_seen_files={observed_files} click=True safety_window_s={DOWNLOAD_START_SAFETY_TIMEOUT_S}"
             )
-            raise RuntimeError(f"Download start timeout after {DOWNLOAD_START_WINDOW_S}s (dir={staging_dir})")
-        found_name = Path(found_path).name
-        append_runtime_log(f"{prefix} DOWNLOAD START DETECTED file={found_name}")
-        append_runtime_log(f'{prefix} GEMINI_DOWNLOAD_STARTED guid=NOT_CAPTURED source=filesystem file={found_name}')
+            raise RuntimeError(f"No download-start evidence after {DOWNLOAD_START_SAFETY_TIMEOUT_S}s (dir={staging_dir}) -- resource likely dead")
+        dl_guid, source = result
+        ctx.raw_guid = dl_guid
+        append_runtime_log(f"{prefix} DOWNLOAD START DETECTED")
+        if source == 'cdp':
+            append_runtime_log(f'{prefix} GEMINI_DOWNLOAD_EVENT GUID={dl_guid}')
+            append_runtime_log(f'{prefix} GEMINI_DOWNLOAD_STARTED guid={dl_guid}')
+        else:
+            append_runtime_log(f'{prefix} GEMINI_DOWNLOAD_STARTED guid=NOT_CAPTURED source=filesystem')
+        _log_download_start_confirmed(prefix, dl_guid, source)
 
         record_id = f"gemini:{ctx.job_id}:{time.monotonic_ns()}"
         with DOWNLOAD_REGISTRY_LOCK:
             DOWNLOAD_REGISTRY[record_id] = DownloadRecord(
                 record_id=record_id,
-                guid=None,
+                guid=dl_guid,
                 job_id=ctx.job_id,
                 resource_id=self.tid,
                 resource_type="gemini",
-                source="filesystem",
+                source=source,
                 staging_dir=str(staging_dir),
                 expected_filename=expected_png,
-                actual_filename=found_name,
+                actual_filename=None,
                 target_state=JobState.RAW_VALIDATED,
                 started_at=time.time(),
                 created_at=time.time()
