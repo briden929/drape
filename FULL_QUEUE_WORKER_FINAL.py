@@ -5570,56 +5570,66 @@ async def execute_pipeline(ctx: JobContext):
             ctx.transition_sync(JobState.COMPLETED)
             return
 
-        progress_detail(ctx.job_id, 'refs_state', 'resolving')
-        append_runtime_log(f"[{ctx.job_id}] RESOLVING PROMPT + REFERENCES")
-        prompt, garment_path, model_path, holo_path = resolve_prompt_and_refs(ctx.payload)
-        ctx.prompt = prompt
-
-        # PROMPT_PREFLIGHT: a missing/empty prompt must never reach Gemini
-        # at all -- failing here costs nothing, while discovering it after
-        # New Chat/Flash/Create Image/upload have already run wastes a
-        # whole Gemini resource-hold on a job that could never have sent
-        # anything. Never logs the full prompt text.
-        _norm_prompt = (ctx.prompt or '').strip()
-        if not _norm_prompt:
-            append_runtime_log(f"[{ctx.job_id}] PROMPT_PREFLIGHT prompt_present=False -- failing before Gemini acquisition")
-            raise RuntimeError("PROMPT_MISSING: resolved prompt is empty/None")
-        _prompt_hash = hashlib.sha256(_norm_prompt.encode('utf-8')).hexdigest()[:16]
-        append_runtime_log(
-            f"[{ctx.job_id}] PROMPT_PREFLIGHT prompt_present=True len={len(_norm_prompt)} "
-            f"sha256={_prompt_hash} first80={_norm_prompt[:80]!r} last80={_norm_prompt[-80:]!r}"
-        )
-
-        ctx.garment_path = garment_path
-        ctx.model_path = model_path
-        ctx.holo_path = holo_path
-        ctx.reference_paths = [p for p in (garment_path, holo_path, model_path) if p]
-
-        for p in ctx.reference_paths:
-            if not Path(p).exists() or Path(p).stat().st_size == 0:
-                raise RuntimeError(f"Reference invalid: {p}")
-        # Local cache paths only -- never the original remote reference URLs
-        # (params_json/URLs are DB-owned strings that can carry pre-signed
-        # query params, so this stays as filenames only, not full paths).
-        append_runtime_log(
-            f"[{ctx.job_id}] REFERENCES READY garment={Path(garment_path).name if garment_path else None} "
-            f"model={Path(model_path).name if model_path else None} "
-            f"hologram={Path(holo_path).name if holo_path else None} "
-            f"count={len(ctx.reference_paths)}"
-        )
-        progress_detail(ctx.job_id, 'refs_count', len(ctx.reference_paths))
-        progress_detail(ctx.job_id, 'refs_state', 'ready')
-
-        # Only one job may be waiting to enter Gemini setup at a time --
-        # BullMQ can still fetch/admit several jobs concurrently (so a job
-        # doing WMR/R2/DB work never blocks a new one from being picked
-        # up), but each one blocks HERE, before it ever shows up as
-        # "WAIT Gemini", until whichever job is currently going through
-        # Gemini setup has been submitted (reached Send). By explicit
-        # request: "pick one job, upload and hit enter in tab 1, only then
-        # fetch/pick the next one."
+        # Only one job may be doing ANYTHING past this point -- resolving
+        # its prompt/refs from the DB, downloading reference images,
+        # waiting for/using Gemini -- at a time. BullMQ can still fetch/
+        # admit several jobs concurrently (so a job doing WMR/R2/DB work
+        # never blocks a new one from being picked up), but each one
+        # blocks HERE, before it does any of that work, until whichever
+        # job is currently ahead of it has been submitted into Gemini
+        # (reached Send). Gating only the Gemini hand-off (an earlier,
+        # narrower version of this gate) still let every admitted job
+        # resolve prompt/refs and download reference images in parallel,
+        # which is real wasted work for jobs that won't touch Gemini for a
+        # while, and is why several jobs could show "(N refs)" on the
+        # dashboard at once even though only one was ever in a tab. By
+        # explicit request: "pick one job, upload and hit enter in tab 1,
+        # only then fetch/pick the next one" -- moved to the very top so
+        # a newly admitted job does nothing else until this gate is free.
         await GEMINI_ADMISSION_GATE.acquire()
         try:
+            progress_detail(ctx.job_id, 'refs_state', 'resolving')
+            append_runtime_log(f"[{ctx.job_id}] RESOLVING PROMPT + REFERENCES")
+            prompt, garment_path, model_path, holo_path = resolve_prompt_and_refs(ctx.payload)
+            ctx.prompt = prompt
+
+            # PROMPT_PREFLIGHT: a missing/empty prompt must never reach
+            # Gemini at all -- failing here costs nothing, while
+            # discovering it after New Chat/Flash/Create Image/upload have
+            # already run wastes a whole Gemini resource-hold on a job
+            # that could never have sent anything. Never logs the full
+            # prompt text.
+            _norm_prompt = (ctx.prompt or '').strip()
+            if not _norm_prompt:
+                append_runtime_log(f"[{ctx.job_id}] PROMPT_PREFLIGHT prompt_present=False -- failing before Gemini acquisition")
+                raise RuntimeError("PROMPT_MISSING: resolved prompt is empty/None")
+            _prompt_hash = hashlib.sha256(_norm_prompt.encode('utf-8')).hexdigest()[:16]
+            append_runtime_log(
+                f"[{ctx.job_id}] PROMPT_PREFLIGHT prompt_present=True len={len(_norm_prompt)} "
+                f"sha256={_prompt_hash} first80={_norm_prompt[:80]!r} last80={_norm_prompt[-80:]!r}"
+            )
+
+            ctx.garment_path = garment_path
+            ctx.model_path = model_path
+            ctx.holo_path = holo_path
+            ctx.reference_paths = [p for p in (garment_path, holo_path, model_path) if p]
+
+            for p in ctx.reference_paths:
+                if not Path(p).exists() or Path(p).stat().st_size == 0:
+                    raise RuntimeError(f"Reference invalid: {p}")
+            # Local cache paths only -- never the original remote reference
+            # URLs (params_json/URLs are DB-owned strings that can carry
+            # pre-signed query params, so this stays as filenames only,
+            # not full paths).
+            append_runtime_log(
+                f"[{ctx.job_id}] REFERENCES READY garment={Path(garment_path).name if garment_path else None} "
+                f"model={Path(model_path).name if model_path else None} "
+                f"hologram={Path(holo_path).name if holo_path else None} "
+                f"count={len(ctx.reference_paths)}"
+            )
+            progress_detail(ctx.job_id, 'refs_count', len(ctx.reference_paths))
+            progress_detail(ctx.job_id, 'refs_state', 'ready')
+
             append_runtime_log(f"[PIPELINE][{ctx.job_id}] GEMINI QUEUED")
             # Only gemini_scheduler_loop() touches GEMINI_BROKER/the shared
             # driver now -- this just hands the job off and waits for the
