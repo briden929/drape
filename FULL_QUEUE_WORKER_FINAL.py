@@ -220,7 +220,7 @@ import urllib.request
 import urllib.error
 import urllib.parse
 from datetime import datetime
-from collections import defaultdict
+from collections import defaultdict, deque
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Dict, Any, Optional, List, Tuple
@@ -4120,6 +4120,8 @@ class ResourceRecord:
     last_error: Optional[str] = None
     last_used: float = 0.0
     last_health_check: float = 0.0
+    acquired_at: float = 0.0
+    last_release_at: float = 0.0
 
 class ResourceAcquireTimeout(Exception):
     def __init__(self, broker_name: str, job_id: str, wait_s: float, resource_states: Dict[str, str]):
@@ -4163,6 +4165,15 @@ class FirstFreeBroker:
         self._free_set = set(resources)
         self._lock = threading.Lock()
         self._condition = threading.Condition(self._lock)
+        # FIFO ticket queue: notify_all() alone wakes every waiting thread
+        # but does NOT guarantee arrival order wins the resource -- OS/GIL
+        # thread-scheduling under contention could let a job that started
+        # waiting later grab a freshly-released resource before an earlier
+        # waiter. Only the ticket at position 0 may take a resource; every
+        # other woken thread checks it isn't at the front and goes back to
+        # waiting. This is what actually guarantees T0-first selection
+        # AND arrival-order fairness together, not just one or the other.
+        self._waiters = deque()
         self._recovery_fn = None
 
     def set_recovery_fn(self, fn):
@@ -4176,32 +4187,63 @@ class FirstFreeBroker:
 
     def _acquire_sync(self, job_id: str, timeout: float) -> str:
         t0 = time.monotonic()
+        short = short_job_id(job_id)
+        ticket = object()
         with self._condition:
-            while not self._free_set:
-                remaining = timeout - (time.monotonic() - t0)
-                if remaining <= 0:
-                    raise ResourceAcquireTimeout(self.name, job_id, time.monotonic() - t0, self.snapshot_locked())
-                self._condition.wait(timeout=remaining)
-            resource_id = next(r for r in self.resource_ids if r in self._free_set)
-            self._free_set.discard(resource_id)
-            rec = self._records[resource_id]
-            rec.state = ResourceState.BUSY
-            rec.current_job_id = job_id
-            rec.last_used = time.time()
-            append_runtime_log(f"[{self.name} BROKER] Acquired {resource_id} for {job_id}")
-            return resource_id
+            self._waiters.append(ticket)
+            had_to_wait = False
+            try:
+                while True:
+                    if self._waiters[0] is ticket:
+                        skipped = []
+                        resource_id = None
+                        for r in self.resource_ids:
+                            if r in self._free_set:
+                                resource_id = r
+                                break
+                            skipped.append(r)
+                        if resource_id is not None:
+                            for r in skipped:
+                                append_runtime_log(f"[{self.name} BROKER] job={short} {r}=BUSY -> checking next")
+                            self._free_set.discard(resource_id)
+                            self._waiters.popleft()
+                            rec = self._records[resource_id]
+                            rec.state = ResourceState.BUSY
+                            rec.current_job_id = job_id
+                            rec.acquired_at = time.time()
+                            rec.last_used = rec.acquired_at
+                            tag = 'FIFO ACQUIRE' if had_to_wait else 'ACQUIRE'
+                            append_runtime_log(f"[{self.name} BROKER] {tag} job={short} resource={resource_id}")
+                            self._condition.notify_all()
+                            return resource_id
+                    if not had_to_wait:
+                        append_runtime_log(f"[{self.name} BROKER] job={short} WAITING resources={','.join(self.resource_ids)}")
+                        had_to_wait = True
+                    remaining = timeout - (time.monotonic() - t0)
+                    if remaining <= 0:
+                        raise ResourceAcquireTimeout(self.name, job_id, time.monotonic() - t0, self.snapshot_locked())
+                    self._condition.wait(timeout=remaining)
+            except BaseException:
+                try:
+                    self._waiters.remove(ticket)
+                except ValueError:
+                    pass
+                self._condition.notify_all()
+                raise
 
     def release(self, resource_id: str):
         with self._condition:
             rec = self._records.get(resource_id)
             if rec is None or rec.state in (ResourceState.DEAD, ResourceState.RECOVERING):
                 return
+            released_job = rec.current_job_id
             rec.state = ResourceState.AVAILABLE
             rec.current_job_id = None
             rec.last_health_check = time.time()
+            rec.last_release_at = time.time()
             if resource_id not in self._free_set:
                 self._free_set.add(resource_id)
-                append_runtime_log(f"[{self.name} BROKER] Released {resource_id}")
+                append_runtime_log(f"[{self.name} BROKER] RELEASE resource={resource_id} job={short_job_id(released_job) if released_job else 'unknown'}")
                 self._condition.notify_all()
 
     def fail(self, resource_id: str, error: str = ""):
