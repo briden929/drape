@@ -5561,7 +5561,6 @@ def _print_job_timing(ctx: JobContext):
     )
 
 async def execute_pipeline(ctx: JobContext):
-    job_progress_init(ctx.job_id)
     try:
         existing_status = str(ctx.payload.get('status') or '').lower()
         existing_output = ctx.payload.get('output_url')
@@ -5570,6 +5569,14 @@ async def execute_pipeline(ctx: JobContext):
             ctx.transition_sync(JobState.COMPLETED)
             return
 
+        # job_progress_init() is what makes a job appear on the dashboard
+        # at all (dashboard_loop only iterates JOB_PROGRESS entries) --
+        # deliberately NOT called until the gate below is acquired, so a
+        # job BullMQ has admitted but that isn't its turn yet shows nothing
+        # at all instead of an empty "[G4/--] title |" line. progress_detail/
+        # job_mark/job_stop all no-op safely on a job_id with no entry yet,
+        # so nothing upstream of this point needs JOB_PROGRESS to exist.
+        #
         # Only one job may be doing ANYTHING past this point -- resolving
         # its prompt/refs from the DB, downloading reference images,
         # waiting for/using Gemini -- at a time. BullMQ can still fetch/
@@ -5588,6 +5595,7 @@ async def execute_pipeline(ctx: JobContext):
         # a newly admitted job does nothing else until this gate is free.
         await GEMINI_ADMISSION_GATE.acquire()
         try:
+            job_progress_init(ctx.job_id)
             progress_detail(ctx.job_id, 'refs_state', 'resolving')
             append_runtime_log(f"[{ctx.job_id}] RESOLVING PROMPT + REFERENCES")
             prompt, garment_path, model_path, holo_path = resolve_prompt_and_refs(ctx.payload)
