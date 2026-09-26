@@ -3275,10 +3275,52 @@ def get_quill_editor(drv):
     matters for verification."""
     return get_active_gemini_image_composer(drv)
 
-# _verify_editor_prompt() (post-paste content verification: length coverage,
-# prefix/suffix match) was removed here by explicit instruction (V16.3) --
-# the prompt path no longer verifies pasted content at all, matching the
-# proven V9 paste-then-send behavior. See _inject_prompt_atomic() below.
+def _verify_editor_prompt(drv, editor, expected_text, tid=0, job_id=''):
+    """Restored (V16.4, by explicit instruction after V16.3's unverified
+    paste): re-reads the CURRENT live composer -- never a possibly-stale
+    WebElement -- and proves the actual pasted content matches the
+    expected prompt (normalized length coverage 0.98-1.05, first/last 80
+    chars) before Prompt is ever marked ok. A single unverified clipboard
+    paste has no way to distinguish "pasted the full prompt" from "pasted
+    nothing/garbage because xclip or the paste event silently misbehaved"
+    -- this is the only way to actually know which one happened."""
+    prefix = f'[T{tid}][{job_id}]' if job_id else f'[T{tid}]'
+    try:
+        live = drv.execute_script(
+            "var e=arguments[0];"
+            "if(!e || !document.body.contains(e)) return null;"
+            "if(e.offsetParent===null) return {hidden:true, text:''};"
+            "return {hidden:false, text:(e.innerText||e.textContent||'')};",
+            editor)
+        if not isinstance(live, dict):
+            append_runtime_log(f'{prefix} PROMPT_VERIFY_FAILED reason=STALE_EDITOR')
+            return False
+        if live.get('hidden'):
+            append_runtime_log(f'{prefix} PROMPT_VERIFY_FAILED reason=EDITOR_HIDDEN')
+            return False
+        actual_norm = normalize_prompt_text(live.get('text') or '')
+        expected_norm = normalize_prompt_text(expected_text)
+        exp_len, act_len = len(expected_norm), len(actual_norm)
+        coverage = act_len / exp_len if exp_len > 0 else (1.0 if act_len == 0 else 0.0)
+        append_runtime_log(f'{prefix} PROMPT_VERIFY expected_len={exp_len} actual_len={act_len} coverage={coverage:.3f}')
+        if exp_len == 0:
+            return act_len == 0
+        if coverage < 0.98 or coverage > 1.05:
+            append_runtime_log(f'{prefix} PROMPT_VERIFY_FAILED reason=LENGTH_COVERAGE_{coverage:.3f}')
+            return False
+        prefix_len = min(80, exp_len)
+        if actual_norm[:prefix_len] != expected_norm[:prefix_len]:
+            append_runtime_log(f'{prefix} PROMPT_VERIFY_FAILED reason=START_MISMATCH')
+            return False
+        suffix_len = min(80, exp_len)
+        if actual_norm[-suffix_len:] != expected_norm[-suffix_len:]:
+            append_runtime_log(f'{prefix} PROMPT_VERIFY_FAILED reason=END_MISMATCH')
+            return False
+        append_runtime_log(f'{prefix} PROMPT_VERIFIED ✅ len={act_len}')
+        return True
+    except Exception as e:
+        append_runtime_log(f'{prefix} PROMPT_VERIFY_FAILED reason=ERROR detail={e}')
+        return False
 
 def _clear_editor(drv, editor, tid=0, job_id=''):
     """Clear the composer and PROVE it's actually empty afterward -- a
@@ -3364,23 +3406,31 @@ def _prep_composer_for_tier(drv, tid, job_id, prefix):
 
 def _inject_prompt_atomic(drv, text, tid=0, job_id=''):
     """
-    V16.3, by explicit instruction: single clipboard paste, no post-paste
-    content verification, no chunking, no retry-on-unverified-content --
-    matching the proven V9 paste-then-send behavior. This is a deliberate
-    trade of the multi-tier verify/retry safety net for speed; it is not
-    an oversight.
+    V16.4: single clipboard paste (no chunking), with post-paste content
+    verification restored by explicit instruction after V16.3's
+    unverified paste showed no way to distinguish a genuinely successful
+    paste from a silent failure. Sequence: find the current composer,
+    focus it, clear it, put the full text on the X11 clipboard via
+    xclip, click+Ctrl+V once, a tiny UI-settle delay, then re-find the
+    CURRENT (possibly re-rendered) composer and verify its actual
+    content matches the expected prompt.
 
-    Sequence: find the current composer, focus it, clear it (pre-paste
-    setup -- not content verification), put the full text on the X11
-    clipboard via xclip, click+Ctrl+V once, a tiny UI-settle delay, done.
-
-    The ONLY fallback to a different injection mechanism is a real
-    xclip failure (the clipboard write itself failing) -- never because
-    pasted content wasn't verified, since no such verification runs here.
-    The fallback methods are likewise unverified and single-shot.
+    Fallback to a different injection mechanism (execCommand, then
+    send_keys) triggers on either a real xclip failure (clipboard write
+    itself failing) OR a failed post-paste verification -- each fallback
+    is itself verified the same way before being accepted. No method is
+    ever accepted as successful without _verify_editor_prompt() passing
+    against a freshly re-found composer.
     """
     prefix = f'[T{tid}][{job_id}]' if job_id else f'[T{tid}]'
     append_runtime_log(f'{prefix} GEMINI_PROMPT_INJECT_STARTED len={len(text)}')
+
+    def _verify_fresh():
+        fresh = get_active_gemini_image_composer(drv, tid=tid, job_id=job_id)
+        if fresh is None:
+            append_runtime_log(f'{prefix} PROMPT_VERIFY_FAILED reason=FRESH_COMPOSER_NOT_FOUND')
+            return False
+        return _verify_editor_prompt(drv, fresh, text, tid=tid, job_id=job_id)
 
     editor = _prep_composer_for_tier(drv, tid, job_id, prefix)
     if not editor:
@@ -3388,38 +3438,48 @@ def _inject_prompt_atomic(drv, text, tid=0, job_id=''):
 
     if _set_clipboard_xclip(text):
         ActionChains(drv).click(editor).key_down(Keys.CONTROL).send_keys('v').key_up(Keys.CONTROL).perform()
-        time.sleep(0.1)
-        append_runtime_log(f'{prefix} PROMPT_METHOD_USED=clipboard (unverified)')
-        progress_detail(job_id, 'prompt_method', 'clipboard')
-        return True
+        time.sleep(0.15)
+        if _verify_fresh():
+            append_runtime_log(f'{prefix} PROMPT_METHOD_SUCCESS=clipboard')
+            progress_detail(job_id, 'prompt_method', 'clipboard')
+            return True
+        append_runtime_log(f'{prefix} PROMPT_METHOD_FAIL=clipboard — falling back to execCommand')
+    else:
+        append_runtime_log(f'{prefix} PROMPT_CLIPBOARD_SET_FAIL — falling back to execCommand')
 
-    # xclip itself failed to write the clipboard -- a real OS-level
-    # failure, not a content-verification failure -- fall back, still
-    # with no post-paste verification.
-    append_runtime_log(f'{prefix} PROMPT_CLIPBOARD_SET_FAIL — falling back to execCommand')
-    try:
-        drv.execute_script(
-            "var editor=arguments[0], text=arguments[1];"
-            "editor.focus();"
-            "document.execCommand('insertText', false, text);"
-            "editor.dispatchEvent(new InputEvent('input', {bubbles:true, inputType:'insertText', data:text}));",
-            editor, text,
-        )
-        time.sleep(0.1)
-        append_runtime_log(f'{prefix} PROMPT_METHOD_USED=execCommand (unverified, xclip-fallback)')
-        progress_detail(job_id, 'prompt_method', 'execCommand')
-        return True
-    except Exception as e:
-        append_runtime_log(f'{prefix} PROMPT_EXECCOMMAND_ERROR: {e}')
+    editor = _prep_composer_for_tier(drv, tid, job_id, prefix)
+    if editor:
+        try:
+            drv.execute_script(
+                "var editor=arguments[0], text=arguments[1];"
+                "editor.focus();"
+                "document.execCommand('insertText', false, text);"
+                "editor.dispatchEvent(new InputEvent('input', {bubbles:true, inputType:'insertText', data:text}));",
+                editor, text,
+            )
+            time.sleep(0.15)
+            if _verify_fresh():
+                append_runtime_log(f'{prefix} PROMPT_METHOD_SUCCESS=execCommand')
+                progress_detail(job_id, 'prompt_method', 'execCommand')
+                return True
+            append_runtime_log(f'{prefix} PROMPT_METHOD_FAIL=execCommand — falling back to send_keys')
+        except Exception as e:
+            append_runtime_log(f'{prefix} PROMPT_EXECCOMMAND_ERROR: {e}')
 
-    try:
-        editor.send_keys(text)
-        time.sleep(0.1)
-        append_runtime_log(f'{prefix} PROMPT_METHOD_USED=send_keys (unverified, xclip-fallback)')
-        progress_detail(job_id, 'prompt_method', 'send_keys')
-        return True
-    except Exception as e:
-        append_runtime_log(f'{prefix} PROMPT_SENDKEYS_ERROR: {e}')
+    editor = _prep_composer_for_tier(drv, tid, job_id, prefix)
+    if editor:
+        try:
+            editor.send_keys(text)
+            time.sleep(0.15)
+            if _verify_fresh():
+                append_runtime_log(f'{prefix} PROMPT_METHOD_SUCCESS=send_keys')
+                progress_detail(job_id, 'prompt_method', 'send_keys')
+                return True
+            append_runtime_log(f'{prefix} PROMPT_METHOD_FAIL=send_keys')
+        except Exception as e:
+            append_runtime_log(f'{prefix} PROMPT_SENDKEYS_ERROR: {e}')
+
+    raise PromptFailed(f'Tab T{tid}: prompt injection failed verification on all methods (clipboard, execCommand, send_keys)')
 
     raise PromptFailed(f'Tab T{tid}: xclip clipboard set failed and all fallback injection methods raised')
 
