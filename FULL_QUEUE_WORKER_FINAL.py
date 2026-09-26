@@ -2120,12 +2120,20 @@ def _create_gemini_tab(tid: int) -> str:
     """
     last_err = None
     for attempt in range(1, 4):
+        p = f'[TAB-CREATE][T{tid}][a{attempt}]'
         try:
+            append_runtime_log(f'{p} TAB_CREATE_START')
             _ensure_chrome_alive()
-            if not chrome_driver.window_handles:
+            existing_handles = list(chrome_driver.window_handles)
+            append_runtime_log(f'{p} existing_handles={existing_handles}')
+            if not existing_handles:
+                append_runtime_log(f'{p} TAB_CREATE_NO_ANCHOR')
                 raise RuntimeError('BROWSER_SESSION_DEAD: No anchor window exists. Session is broken.')
-            before = set(chrome_driver.window_handles)
-            chrome_driver.execute_cdp_cmd('Target.createTarget', {'url': GEMINI_APP_URL})
+            anchor_handle = chrome_driver.current_window_handle
+            before = set(existing_handles)
+            append_runtime_log(f'{p} anchor_handle={anchor_handle} before_handles={sorted(before)}')
+            cdp_result = chrome_driver.execute_cdp_cmd('Target.createTarget', {'url': GEMINI_APP_URL})
+            append_runtime_log(f'{p} Target.createTarget result={cdp_result}')
             deadline = time.time() + 5.0
             handle = None
             while time.time() < deadline:
@@ -2134,15 +2142,30 @@ def _create_gemini_tab(tid: int) -> str:
                     handle = list(diff)[0]
                     break
                 time.sleep(0.2)
+            after_handles = list(chrome_driver.window_handles)
+            append_runtime_log(f'{p} after_handles={after_handles} new_handle={handle}')
             if not handle:
+                append_runtime_log(f'{p} TAB_CREATE_HANDLE_NOT_OBSERVED cdp_reported_targetId={cdp_result.get("targetId") if isinstance(cdp_result, dict) else None}')
                 raise RuntimeError(f'Tab T{tid}: Failed to create physical tab via CDP (attempt {attempt}/3)')
-            chrome_driver.switch_to.window(handle)
+            try:
+                chrome_driver.switch_to.window(handle)
+                switch_success = True
+            except Exception as switch_err:
+                append_runtime_log(f'{p} TAB_CREATE_SWITCH_FAILED: {switch_err}')
+                raise
             time.sleep(1.0)
-            _ = chrome_driver.title  # prove the new tab is actually responsive
+            try:
+                current_url = chrome_driver.current_url
+                title = chrome_driver.title  # prove the new tab is actually responsive
+                responsive = True
+            except Exception as resp_err:
+                append_runtime_log(f'{p} TAB_CREATE_PAGE_UNRESPONSIVE: {resp_err}')
+                raise
+            append_runtime_log(f'{p} switch_success={switch_success} current_url={current_url} title={title!r} responsive={responsive}')
             return handle
         except Exception as e:
             last_err = e
-            append_runtime_log(f'[TAB-CREATE][T{tid}] attempt {attempt}/3 failed: {e}')
+            append_runtime_log(f'{p} TAB_CREATE_ATTEMPT_FAILED: {e}')
             time.sleep(1.0)
     raise RuntimeError(f'Tab T{tid}: Failed to create physical tab after 3 attempts: {last_err}')
 for _i in range(MAX_CONCURRENT_TABS):
@@ -2203,6 +2226,144 @@ def _dismiss_new_chat_dialog(drv):
         pass
     return False
 
+_FIND_NEW_CHAT_CANDIDATE_JS = r"""
+function vis(el) {
+    if (!el) return false;
+    var r = el.getBoundingClientRect();
+    if (r.width <= 0 || r.height <= 0) return false;
+    return el.offsetParent !== null;
+}
+function toClickable(el) {
+    // An icon/span inside the actual button/anchor is not itself
+    // clickable in a meaningful sense -- resolve to the nearest
+    // button/a/[role=button] ancestor (or itself if already one).
+    var cur = el;
+    for (var d = 0; d < 5 && cur; d++) {
+        var tag = (cur.tagName || '').toUpperCase();
+        if (tag === 'BUTTON' || tag === 'A' || cur.getAttribute('role') === 'button') return cur;
+        cur = cur.parentElement;
+    }
+    return el;
+}
+// Deliberately NOT including a[href="/app"] or any generic href/anchor
+// selector here -- those can match unrelated navigation elements, not
+// specifically the sidebar New Chat control.
+var sels = [
+    '[data-test-id="new-chat-button"]',
+    'button[aria-label="New chat"]',
+    'a[aria-label="New chat"]'
+];
+var seen = new Set();
+var candidates = [];
+for (var s = 0; s < sels.length; s++) {
+    var els = document.querySelectorAll(sels[s]);
+    for (var i = 0; i < els.length; i++) {
+        var c = toClickable(els[i]);
+        if (seen.has(c)) continue;
+        seen.add(c);
+        candidates.push({el: c, via: sels[s]});
+    }
+}
+// Fallback: any element whose OWN visible text is exactly "New chat"
+// (not a container that merely contains other text too, which would
+// risk matching a history/list wrapper instead of the control itself).
+if (candidates.length === 0) {
+    var all = document.querySelectorAll('button, a, [role="button"]');
+    for (var j = 0; j < all.length; j++) {
+        var el = all[j];
+        var t = (el.textContent || '').replace(/\s+/g, ' ').trim();
+        if (t === 'New chat' && !seen.has(el)) {
+            seen.add(el);
+            candidates.push({el: el, via: 'exact-text'});
+        }
+    }
+}
+var out = [];
+for (var k = 0; k < candidates.length; k++) {
+    var cand = candidates[k].el;
+    if (!vis(cand)) continue;
+    var txt = (cand.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 40);
+    var r = cand.getBoundingClientRect();
+    var cx = r.x + r.width / 2, cy = r.y + r.height / 2;
+    var top = document.elementFromPoint(cx, cy);
+    var owns = top === cand || cand.contains(top) || (top && top.contains(cand));
+    out.push({
+        el: cand, via: candidates[k].via, tag: cand.tagName, text: txt,
+        aria: cand.getAttribute('aria-label') || '', testid: cand.getAttribute('data-test-id') || '',
+        rect: {x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height)},
+        center: {x: Math.round(cx), y: Math.round(cy)},
+        topTag: top ? top.tagName : 'NONE', owns: !!owns
+    });
+}
+return out;
+"""
+
+
+def _find_verified_new_chat_button(drv, prefix=''):
+    """Resolve the ACTUAL sidebar New Chat control, never a generic
+    a[href="/app"]/first-anchor/first-button guess. Returns the first
+    visible, non-occluded candidate's WebElement (Selenium re-resolves
+    the JS-returned element reference automatically), or None if nothing
+    qualifies -- callers must not click anything when this returns None."""
+    try:
+        candidates = drv.execute_script(_FIND_NEW_CHAT_CANDIDATE_JS) or []
+    except Exception as e:
+        append_runtime_log(f'{prefix} NEW_CHAT_TARGET_LOOKUP_ERROR: {e}')
+        return None
+    if not candidates:
+        append_runtime_log(f'{prefix} NEW_CHAT_TARGET_NONE_FOUND')
+        return None
+    chosen = None
+    for c in candidates:
+        append_runtime_log(
+            f"{prefix} NEW_CHAT_TARGET via={c['via']} tag={c['tag']} text='{c['text']}' "
+            f"aria='{c['aria']}' testid='{c['testid']}' rect={c['rect']} center={c['center']} "
+            f"topElement={c['topTag']} occluded={not c['owns']}"
+        )
+        if c['owns'] and chosen is None:
+            chosen = c
+    if chosen is None:
+        append_runtime_log(f'{prefix} NEW_CHAT_TARGET_ALL_OCCLUDED — refusing to click a covered element')
+        return None
+    return chosen['el']
+
+
+def _click_element_with_fallbacks(drv, element, label, prefix=''):
+    """Native Selenium click first (closest to a real user click), then
+    ActionChains move+click, then a JS .click() only as a last resort --
+    a JS click alone is not proof a real click landed, so it is
+    deliberately the least-preferred path, used only to avoid failing a
+    job outright when the element is technically clickable but Selenium's
+    own click machinery (e.g. an intercepted-click check) balks at it."""
+    try:
+        drv.execute_script("arguments[0].scrollIntoView({block:'center', inline:'center'});", element)
+        time.sleep(0.15)
+    except Exception:
+        pass
+    if not _log_click_rect_and_occlusion(drv, element, label, prefix):
+        append_runtime_log(f'{prefix} {label}_OCCLUDED_AFTER_SCROLL — not clicking')
+        return False
+    try:
+        element.click()
+        append_runtime_log(f'{prefix} {label}_CLICK method=native')
+        return True
+    except Exception as e:
+        append_runtime_log(f'{prefix} {label}_NATIVE_CLICK_FAILED: {e}')
+    try:
+        ActionChains(drv).move_to_element(element).click().perform()
+        append_runtime_log(f'{prefix} {label}_CLICK method=action_chains')
+        return True
+    except Exception as e:
+        append_runtime_log(f'{prefix} {label}_ACTIONCHAINS_FAILED: {e}')
+    try:
+        drv.execute_script('arguments[0].click();', element)
+        append_runtime_log(f'{prefix} {label}_CLICK method=js (last resort)')
+        return True
+    except Exception as e:
+        append_runtime_log(f'{prefix} {label}_JS_CLICK_FAILED: {e}')
+    return False
+
+
 def open_new_chat_and_reload(drv, tid: int, job_id: str='') -> str:
     """
     Creates a verified new Gemini chat and returns the new chat URL.
@@ -2229,11 +2390,11 @@ def open_new_chat_and_reload(drv, tid: int, job_id: str='') -> str:
         try:
             old_url = drv.current_url
             append_runtime_log(f'{prefix} NEW_CHAT_START (attempt {attempt}) OLD_URL={old_url}')
-            res = drv.execute_script('\n                var sels = [\n                    \'a[aria-label="New chat"]\',\n                    \'button[aria-label="New chat"]\',\n                    \'div[aria-label="New chat"]\',\n                    \'[data-test-id="new-chat-button"]\',\n                    \'a[href="/app"]\',\n                ];\n                for (var s = 0; s < sels.length; s++) {\n                    var els = document.querySelectorAll(sels[s]);\n                    for (var i = 0; i < els.length; i++) {\n                        if (els[i].offsetParent !== null) {\n                            els[i].click(); return \'OK:\' + sels[s];\n                        }\n                    }\n                }\n                return \'NO\';\n            ')
-            if res and res.startswith('OK:'):
+            new_chat_btn = _find_verified_new_chat_button(drv, prefix)
+            if new_chat_btn is not None and _click_element_with_fallbacks(drv, new_chat_btn, 'NEW_CHAT', prefix):
                 new_chat_click_count += 1
-                append_runtime_log(f'{prefix} NEW_CHAT_CLICK -> {res}')
             else:
+                append_runtime_log(f'{prefix} NEW_CHAT_TARGET_UNAVAILABLE — falling back to direct navigation')
                 drv.get(GEMINI_APP_URL)
                 nav_count += 1
                 append_runtime_log(f'{prefix} NEW_CHAT_NAVIGATE -> {GEMINI_APP_URL}')
@@ -2291,7 +2452,16 @@ def open_new_chat_and_reload(drv, tid: int, job_id: str='') -> str:
                 f'{prefix} NEW_CHAT_NAV_COUNTERS click={new_chat_click_count} '
                 f'nav={nav_count} refresh={refresh_count}'
             )
-            if _verify_clean_composer(drv):
+            clean = _verify_clean_composer(drv)
+            try:
+                snap = _gemini_ui_snapshot(drv)
+            except Exception:
+                snap = {}
+            append_runtime_log(
+                f"{prefix} NEW_CHAT_POSTCHECK url={drv.current_url} composer_visible={bool(snap.get('composer_placeholder') and snap.get('composer_placeholder') != 'NO_EDITOR')} "
+                f"composer_empty={snap.get('composer_text_len') == 0} clean_composer={clean}"
+            )
+            if clean:
                 append_runtime_log(f'{prefix} NEW_CHAT_VERIFIED ✅')
                 return new_url
             else:
@@ -2481,24 +2651,137 @@ def ensure_flash_mode(drv, tid=0, job_id=''):
         time.sleep(0.3)
     raise RuntimeError(f'Tab T{tid}: Flash mode could not be verified')
 
-def click_plus_button(drv):
+_COMPOSER_PLUS_BUTTON_JS = r"""
+    var editor = arguments[0];
+    var sels = [
+        'button[aria-label="Upload and tools"]',
+        'button[aria-label*="Upload"]',
+        'button[aria-label*="Tools"]',
+        'button[jslog*="300142"]',
+        'button[aria-haspopup="menu"][aria-label*="Upload"]'
+    ];
+    function vis(el) {
+        if (!el) return false;
+        var r = el.getBoundingClientRect();
+        return r.width > 0 && r.height > 0 && el.offsetParent !== null;
+    }
+    function collect(root) {
+        var res = [];
+        for (var s = 0; s < sels.length; s++) {
+            var els = root.querySelectorAll(sels[s]);
+            for (var i = 0; i < els.length; i++) if (vis(els[i])) res.push(els[i]);
+        }
+        // Icon-based fallback: a plus-shaped mat-icon resolved to its
+        // ancestor button, same as the aria-label matches above.
+        var icons = root.querySelectorAll('mat-icon[fonticon="plus"], mat-icon[data-mat-icon-name="plus"], mat-icon[fonticon="add"], mat-icon[data-mat-icon-name="add"]');
+        for (var j = 0; j < icons.length; j++) {
+            var b = icons[j].closest('button');
+            if (b && vis(b) && res.indexOf(b) === -1) res.push(b);
+        }
+        return res;
+    }
+    // Walk up from the ACTIVE composer looking for an ancestor that
+    // already contains a plus/upload/tools candidate -- exactly the same
+    // pattern _SEND_BUTTON_JS uses, so the "+" found can never belong to
+    // the left sidebar, page header, or another tab/job's composer on
+    // this shared-driver page.
+    var el = editor;
+    for (var depth = 0; depth < 8 && el; depth++) {
+        var found = collect(el);
+        if (found.length > 0) {
+            var b = found[0];
+            var r = b.getBoundingClientRect();
+            var cx = r.x + r.width / 2, cy = r.y + r.height / 2;
+            var top = document.elementFromPoint(cx, cy);
+            var owns = top === b || b.contains(top) || (top && top.contains(b));
+            return {
+                el: b, scoped: true, aria: b.getAttribute('aria-label') || '',
+                text: (b.textContent || '').trim().slice(0, 40),
+                rect: {x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height)},
+                center: {x: Math.round(cx), y: Math.round(cy)}, topTag: top ? top.tagName : 'NONE', owns: !!owns
+            };
+        }
+        el = el.parentElement;
+    }
+    return null;
+"""
+
+
+def _find_composer_plus_button(drv, tid=0, job_id=''):
+    """Composer-scoped "+" lookup: find the ACTIVE visible composer first
+    (get_active_gemini_image_composer, already used for prompt/send), then
+    search only its own ancestor chain for the upload/tools button --
+    never a raw document-wide button scan, which previously risked
+    matching the wrong tab's or the sidebar's controls on this
+    shared-driver multi-tab page."""
+    prefix = f'[T{tid}][{job_id}]' if job_id else f'[T{tid}]'
+    editor = get_active_gemini_image_composer(drv, tid=tid, job_id=job_id)
+    if editor is None:
+        append_runtime_log(f'{prefix} PLUS_TARGET_NO_COMPOSER')
+        return None
     try:
-        res = drv.execute_script('\n            var btns = document.querySelectorAll(\'button\');\n            for (var i = 0; i < btns.length; i++) {\n                var b = btns[i];\n                if (b.offsetParent === null) continue;\n                var lbl = (b.getAttribute(\'aria-label\') || \'\').toLowerCase();\n                if (lbl.indexOf(\'upload\') !== -1 || lbl.indexOf(\'tools\') !== -1 || lbl.indexOf(\'plus\') !== -1) {\n                    b.click(); return \'OK\';\n                }\n                var icon = b.querySelector(\'mat-icon[fonticon="plus"], mat-icon[data-mat-icon-name="plus"]\');\n                if (icon) { b.click(); return \'OK\'; }\n            } return \'NO\';\n        ')
-        if res == 'OK':
+        result = drv.execute_script(_COMPOSER_PLUS_BUTTON_JS, editor)
+    except Exception as e:
+        append_runtime_log(f'{prefix} PLUS_TARGET_LOOKUP_ERROR: {e}')
+        return None
+    if not result:
+        append_runtime_log(f'{prefix} PLUS_TARGET_NOT_FOUND (composer-scoped)')
+        return None
+    append_runtime_log(
+        f"{prefix} PLUS_TARGET aria='{result['aria']}' text='{result['text']}' rect={result['rect']} "
+        f"center={result['center']} topElement={result['topTag']} owned={result['owns']}"
+    )
+    if not result['owns']:
+        append_runtime_log(f'{prefix} PLUS_TARGET_OCCLUDED by <{result["topTag"]}>')
+        return None
+    return result['el']
+
+
+def _verify_upload_tools_drawer_open(drv, tid=0, job_id=''):
+    """Real evidence the upload/tools drawer actually opened after a "+"
+    click -- a click() call not raising is not proof of that; this file's
+    own past bugs (CreateImg✅ while the browser still showed plain 'Ask
+    Gemini') came from exactly this kind of unverified click-as-success
+    assumption."""
+    prefix = f'[T{tid}][{job_id}]' if job_id else f'[T{tid}]'
+    try:
+        items = []
+        for sel in ["button[role='menuitemcheckbox'].toolbox-drawer-item-list-button",
+                    "[role='menuitemcheckbox']", "[role='menuitem']"]:
+            for el in drv.find_elements(By.CSS_SELECTOR, sel):
+                if el.is_displayed():
+                    items.append((el.text or '').strip()[:40])
+        open_ = len(items) > 0
+        append_runtime_log(f'{prefix} DRAWER_VERIFY={"PASS" if open_ else "FAIL"} visible_items={items[:12]}')
+        return open_
+    except Exception as e:
+        append_runtime_log(f'{prefix} DRAWER_VERIFY_ERROR: {e}')
+        return False
+
+
+def click_plus_button(drv, tid=0, job_id=''):
+    """Composer-scoped "+" click with real drawer-open verification and up
+    to 3 retries -- replaces the old global document.querySelectorAll('button')
+    scan, which could click any visible button anywhere on the page whose
+    aria-label happened to contain 'upload'/'tools'/'plus', including
+    controls belonging to a different tab/job or the page chrome."""
+    prefix = f'[T{tid}][{job_id}]' if job_id else f'[T{tid}]'
+    for attempt in range(1, 4):
+        btn = _find_composer_plus_button(drv, tid=tid, job_id=job_id)
+        if btn is None:
             time.sleep(0.3)
-            return True
-    except Exception:
-        pass
-    for sel in ['button[aria-label="Upload and tools"]', 'button[jslog*="300142"]', 'button[aria-haspopup="menu"][aria-label*="Upload"]']:
-        try:
-            for btn in drv.find_elements(By.CSS_SELECTOR, sel):
-                if btn.is_displayed():
-                    drv.execute_script('arguments[0].click();', btn)
-                    time.sleep(0.3)
-                    return True
-        except Exception:
             continue
+        if not _click_element_with_fallbacks(drv, btn, 'PLUS', prefix):
+            time.sleep(0.3)
+            continue
+        time.sleep(0.3)
+        if _verify_upload_tools_drawer_open(drv, tid=tid, job_id=job_id):
+            append_runtime_log(f'{prefix} PLUS_CLICKED attempt={attempt} DRAWER_VERIFY=PASS')
+            return True
+        append_runtime_log(f'{prefix} PLUS_CLICKED_BUT_DRAWER_NOT_OPEN attempt={attempt}/3 — retrying')
+        time.sleep(0.3)
     return False
+
 
 def is_create_image_mode(drv):
     try:
@@ -2799,7 +3082,7 @@ def ensure_create_image_mode(drv, tid=0, job_id=''):
 
     for attempt in range(1, 3):
         append_runtime_log(f'{prefix} GEMINI_CREATE_IMAGE_ATTEMPT {attempt}/2')
-        if click_plus_button(drv):
+        if click_plus_button(drv, tid=tid, job_id=job_id):
             time.sleep(0.5)
             menu_dump = _gemini_state_snapshot(drv, f'menu_open_a{attempt}', tid, job_id)
             append_runtime_log(f"{prefix} GEMINI_CREATE_IMAGE_MENU_OPENED items={menu_dump.get('menu_items', [])[:12]}")
@@ -2817,6 +3100,8 @@ def ensure_create_image_mode(drv, tid=0, job_id=''):
                     candidates = []
             for btn in candidates:
                 try:
+                    if not btn.is_displayed():
+                        continue
                     b_txt = (btn.text or '').lower()
                     if 'create image' not in b_txt:
                         continue
@@ -2856,15 +3141,12 @@ def ensure_create_image_mode(drv, tid=0, job_id=''):
                     pass
             if clicked_info and clicked_btn is not None:
                 append_runtime_log(
-                    f"{prefix} CREATE_IMAGE_CLICK tag={clicked_info.get('tag')} "
+                    f"{prefix} CREATE_IMAGE_TARGET tag={clicked_info.get('tag')} "
                     f"text='{clicked_info.get('text')}' role='{clicked_info.get('role')}' "
                     f"aria='{clicked_info.get('aria')}' class='{clicked_info.get('cls')}' "
                     f"data_test_id='{clicked_info.get('dtid')}' visible={clicked_info.get('vis')}"
                 )
-                try:
-                    drv.execute_script('arguments[0].click();', clicked_btn)
-                except Exception:
-                    pass
+                _click_element_with_fallbacks(drv, clicked_btn, 'CREATE_IMAGE', prefix)
                 append_runtime_log(f'{prefix} GEMINI_CREATE_IMAGE_CLICKED')
                 # Wait for the UI transition, then verify strictly.
                 deadline = time.time() + 4.0
@@ -2891,7 +3173,7 @@ def ensure_create_image_mode(drv, tid=0, job_id=''):
 def open_upload_drawer(drv, tid=0, job_id='') -> bool:
     """Open the upload/tools drawer by clicking the + button."""
     prefix = f'[T{tid}][{job_id}]' if job_id else f'[T{tid}]'
-    if not click_plus_button(drv):
+    if not click_plus_button(drv, tid=tid, job_id=job_id):
         append_runtime_log(f'{prefix} DRAWER_FAILED: Could not click plus button', file=sys.stderr)
         return False
     time.sleep(0.25)
@@ -4159,6 +4441,20 @@ class FirstFreeBroker:
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, self._acquire_sync, job_id, timeout)
 
+    async def acquire_preferred(self, job_id: str, timeout: float = RESOURCE_ACQUIRE_TIMEOUT_S) -> str:
+        """Explicit name for what acquire() already does: _acquire_sync's
+        resource scan runs under self._condition (a real lock) end to end
+        -- the free-set scan, the discard, and marking the resource BUSY
+        all happen in that one critical section, so there is no window for
+        a second acquirer to race in between. Given resource_ids is
+        constructed T0,T1,T2,T3 (see FirstFreeBroker.__init__ callers),
+        that scan is already the deterministic T0-first, atomic,
+        FIFO-fair allocation the resource-order policy requires -- this is
+        a thin alias, not a second/different code path, so the two can
+        never disagree. gemini_scheduler_loop() is this broker's only
+        caller, so there is also no second caller to race against."""
+        return await self.acquire(job_id, timeout)
+
     def _acquire_sync(self, job_id: str, timeout: float) -> str:
         t0 = time.monotonic()
         short = short_job_id(job_id)
@@ -4885,17 +5181,18 @@ async def gemini_scheduler_loop():
             tick_n += 1
             if tick_n % 100 == 0:
                 append_runtime_log(f"[GEMINI SCHED] alive tick={tick_n} active={list(GEMINI_ACTIVE.keys())} queue_size={GEMINI_READY_QUEUE.qsize()}")
-            free_ids = set(GEMINI_BROKER.free_resources)
-            free_tid = None
-            for cand in GEMINI_BROKER.resource_ids:
-                if cand in free_ids and cand not in GEMINI_ACTIVE:
-                    free_tid = cand
-                    break
+            # Cheap pre-check only: "is anything free at all", so Step A
+            # doesn't attempt (and block on) an acquire when every tab is
+            # busy. It does NOT decide WHICH resource gets used -- that
+            # T0-first guarantee comes solely from acquire_preferred()'s
+            # own atomic, lock-scoped scan below, which is the single
+            # source of truth for allocation order.
+            any_free = bool(set(GEMINI_BROKER.free_resources) - set(GEMINI_ACTIVE.keys()))
 
-            if free_tid is not None and not GEMINI_READY_QUEUE.empty():
+            if any_free and not GEMINI_READY_QUEUE.empty():
                 ctx = await GEMINI_READY_QUEUE.get()
                 try:
-                    tid = await GEMINI_BROKER.acquire(ctx.job_id)
+                    tid = await GEMINI_BROKER.acquire_preferred(ctx.job_id)
                 except Exception as e:
                     append_runtime_log(f"[GEMINI SCHED] acquire failed job={ctx.job_id}: {e}")
                     if ctx.gemini_done_future is not None and not ctx.gemini_done_future.done():
