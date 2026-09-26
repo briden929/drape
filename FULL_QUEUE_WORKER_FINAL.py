@@ -1267,8 +1267,16 @@ def start_novnc_tunnel():
 
     if _proc_alive(V16_STATE.cf_proc) and V16_STATE.tunnel_url:
         _cf_proc = V16_STATE.cf_proc
-        print(f'  ♻️  Reusing existing Cloudflare tunnel: {V16_STATE.tunnel_url}')
-        return V16_STATE.tunnel_url
+        tb = V16_STATE.tunnel_url
+        vnc_url = f'{tb}/vnc.html?autoconnect=true&resize=scale'
+        print(f'  ♻️  Reusing existing Cloudflare tunnel: {tb}')
+        try:
+            _banner = f"<div style='background:linear-gradient(135deg,#1b5e20,#2e7d32);color:white;padding:16px;border-radius:10px;font-size:15px;font-weight:bold;margin:10px 0;box-shadow:0 4px 6px rgba(0,0,0,0.3);'>🖥️ <b>noVNC Remote Desktop Stream:</b><br><br>🌐 <a href='{vnc_url}' target='_blank' style='color:#a7ffeb;text-decoration:underline;'>Open Live UI ({vnc_url})</a><br></div>"
+            ipy_display(HTML(_banner))
+        except Exception:
+            pass
+        print(f'  🌐 noVNC Public Link: {vnc_url}')
+        return tb
 
     cf_bin = '/usr/local/bin/cloudflared'
     if os.path.exists(cf_bin):
@@ -4859,58 +4867,82 @@ async def gemini_scheduler_loop():
     whichever single action is currently running, then immediately decides
     the next one."""
     loop = asyncio.get_running_loop()
+    append_runtime_log("[GEMINI SCHED] loop started")
+    tick_n = 0
     while True:
-        did_work = False
-        free_ids = set(GEMINI_BROKER.free_resources)
-        free_tid = None
-        for cand in GEMINI_BROKER.resource_ids:
-            if cand in free_ids and cand not in GEMINI_ACTIVE:
-                free_tid = cand
-                break
+        # Every sibling background loop (worker_heartbeat_loop,
+        # poll_downloads_loop, redis_queue_monitor_loop) wraps its whole
+        # tick body in try/except so one bad tick logs and continues.
+        # This loop is a bare `asyncio.create_task(...)` that nothing ever
+        # awaits or retrieves the result of -- without this same top-level
+        # guard, ANY uncaught exception anywhere in a tick (not just inside
+        # the two narrow try/excepts below) silently kills the loop
+        # forever: GEMINI_ACTIVE freezes, no resource is ever acquired
+        # again, and every queued job sits at "WAIT Gemini" with no error
+        # visible on the (overwritten) live dashboard.
+        try:
+            did_work = False
+            tick_n += 1
+            if tick_n % 100 == 0:
+                append_runtime_log(f"[GEMINI SCHED] alive tick={tick_n} active={list(GEMINI_ACTIVE.keys())} queue_size={GEMINI_READY_QUEUE.qsize()}")
+            free_ids = set(GEMINI_BROKER.free_resources)
+            free_tid = None
+            for cand in GEMINI_BROKER.resource_ids:
+                if cand in free_ids and cand not in GEMINI_ACTIVE:
+                    free_tid = cand
+                    break
 
-        if free_tid is not None and not GEMINI_READY_QUEUE.empty():
-            ctx = await GEMINI_READY_QUEUE.get()
-            try:
-                tid = await GEMINI_BROKER.acquire(ctx.job_id)
-            except Exception as e:
-                append_runtime_log(f"[GEMINI SCHED] acquire failed job={ctx.job_id}: {e}")
-                if ctx.gemini_done_future is not None and not ctx.gemini_done_future.done():
-                    ctx.gemini_done_future.set_exception(e)
-                continue
-            progress_detail(ctx.job_id, 'gemini_wait', False)
-            ctx.gemini_resource = tid
-            _jp = JOB_PROGRESS.get(ctx.job_id)
-            if _jp is not None:
-                _jp['resource'] = tid
-            ctx.transition_sync(JobState.GEMINI_RESERVED)
-            append_runtime_log(f"[PIPELINE][{ctx.job_id}] Gemini acquired = {tid}")
-            worker = GEMINI_WORKERS[tid]
-            try:
-                await loop.run_in_executor(GEMINI_EXECUTOR, worker.run_setup_sync, ctx)
-                GEMINI_ACTIVE[tid] = ctx
-            except Exception as e:
-                _handle_gemini_failure(worker, ctx, e)
-            did_work = True
-        elif GEMINI_ACTIVE:
-            tids = list(GEMINI_ACTIVE.keys())
-            idx = _GEMINI_RR_CURSOR['idx'] % len(tids)
-            _GEMINI_RR_CURSOR['idx'] += 1
-            tid = tids[idx]
-            ctx = GEMINI_ACTIVE[tid]
-            worker = GEMINI_WORKERS[tid]
-            try:
-                finished = await loop.run_in_executor(GEMINI_EXECUTOR, worker.check_and_maybe_finish_sync, ctx)
-                if finished:
-                    GEMINI_ACTIVE.pop(tid, None)
+            if free_tid is not None and not GEMINI_READY_QUEUE.empty():
+                ctx = await GEMINI_READY_QUEUE.get()
+                try:
+                    tid = await GEMINI_BROKER.acquire(ctx.job_id)
+                except Exception as e:
+                    append_runtime_log(f"[GEMINI SCHED] acquire failed job={ctx.job_id}: {e}")
                     if ctx.gemini_done_future is not None and not ctx.gemini_done_future.done():
-                        ctx.gemini_done_future.set_result(True)
-            except Exception as e:
-                GEMINI_ACTIVE.pop(tid, None)
-                _handle_gemini_failure(worker, ctx, e)
-            did_work = True
+                        ctx.gemini_done_future.set_exception(e)
+                    continue
+                progress_detail(ctx.job_id, 'gemini_wait', False)
+                ctx.gemini_resource = tid
+                _jp = JOB_PROGRESS.get(ctx.job_id)
+                if _jp is not None:
+                    _jp['resource'] = tid
+                ctx.transition_sync(JobState.GEMINI_RESERVED)
+                append_runtime_log(f"[PIPELINE][{ctx.job_id}] Gemini acquired = {tid}")
+                worker = GEMINI_WORKERS[tid]
+                try:
+                    await loop.run_in_executor(GEMINI_EXECUTOR, worker.run_setup_sync, ctx)
+                    GEMINI_ACTIVE[tid] = ctx
+                except Exception as e:
+                    _handle_gemini_failure(worker, ctx, e)
+                did_work = True
+            elif GEMINI_ACTIVE:
+                tids = list(GEMINI_ACTIVE.keys())
+                idx = _GEMINI_RR_CURSOR['idx'] % len(tids)
+                _GEMINI_RR_CURSOR['idx'] += 1
+                tid = tids[idx]
+                ctx = GEMINI_ACTIVE[tid]
+                worker = GEMINI_WORKERS[tid]
+                try:
+                    finished = await loop.run_in_executor(GEMINI_EXECUTOR, worker.check_and_maybe_finish_sync, ctx)
+                    if finished:
+                        GEMINI_ACTIVE.pop(tid, None)
+                        if ctx.gemini_done_future is not None and not ctx.gemini_done_future.done():
+                            ctx.gemini_done_future.set_result(True)
+                except Exception as e:
+                    GEMINI_ACTIVE.pop(tid, None)
+                    _handle_gemini_failure(worker, ctx, e)
+                did_work = True
 
-        if not did_work:
-            await asyncio.sleep(0.2)
+            if not did_work:
+                await asyncio.sleep(0.2)
+        except Exception as loop_err:
+            append_runtime_log(f"[GEMINI SCHED] TICK_ERROR (loop survives): {type(loop_err).__name__}: {loop_err}")
+            try:
+                import traceback
+                append_runtime_log("[GEMINI SCHED] " + traceback.format_exc().replace("\n", " | "))
+            except Exception:
+                pass
+            await asyncio.sleep(1.0)
 
 class WmrDriverThread(threading.Thread):
     def __init__(self, resource_id: str):
@@ -5914,6 +5946,23 @@ async def main():
             print("[GEMINI SCHED] Already running", flush=True)
         else:
             GEMINI_SCHEDULER_TASK = asyncio.create_task(gemini_scheduler_loop())
+
+            def _gemini_scheduler_done_cb(t):
+                # The loop's own try/except now survives any tick error, so
+                # this only fires on cancellation (expected at shutdown) or
+                # a genuinely unexpected failure -- e.g. raised before the
+                # while-loop is even entered. Without this, asyncio just
+                # prints "Task exception was never retrieved" to stderr,
+                # which the live dashboard's screen-clearing makes
+                # invisible; log it loudly instead.
+                if t.cancelled():
+                    return
+                exc = t.exception()
+                if exc is not None:
+                    append_runtime_log(f"[GEMINI SCHED] TASK DIED: {type(exc).__name__}: {exc}")
+                    print(f"[GEMINI SCHED] TASK DIED: {type(exc).__name__}: {exc}", flush=True)
+
+            GEMINI_SCHEDULER_TASK.add_done_callback(_gemini_scheduler_done_cb)
             V16_STATE.GEMINI_SCHEDULER_TASK = GEMINI_SCHEDULER_TASK
             BACKGROUND_TASKS.add(GEMINI_SCHEDULER_TASK)
         print("[GEMINI SCHED] task created", flush=True)
