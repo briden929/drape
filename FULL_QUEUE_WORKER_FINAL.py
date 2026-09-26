@@ -4609,6 +4609,44 @@ def _snapshot_staging_dir(staging_dir: Path) -> set:
         return set()
 
 
+def wait_for_download_file(staging_dir: Path, before: set, timeout: float) -> Optional[str]:
+    """Ported directly from the proven ECOM_COMBO_PHOTOSHOOT_ORDER (V9.1)
+    reference script's _wait_for_dl(): a plain filesystem poll, no Selenium
+    driver access at all -- by explicit request, this is "the click and
+    time thing" taken as a function rather than reinvented. Since it never
+    touches the driver, callers don't need CHROME_DRIVER_LOCK for this
+    wait, unlike the old CDP-log-based detection which had to keep
+    switching windows and reading get_log('performance') on every
+    iteration.
+
+    Picks the most-recently-modified newly-appeared file that isn't a
+    partial download and is over the minimum size, exactly as V9.1 did.
+    Returns the file's absolute path, or None on timeout."""
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        try:
+            if staging_dir.exists():
+                cur = {f.name for f in staging_dir.iterdir()}
+                new_files = {
+                    f for f in (cur - before)
+                    if not f.endswith(('.crdownload', '.tmp', '.part', '.download'))
+                    and f.lower().endswith(('.png', '.jpg', '.jpeg', '.webp'))
+                }
+                if new_files:
+                    candidates = sorted(
+                        new_files,
+                        key=lambda f: (staging_dir / f).stat().st_mtime,
+                        reverse=True,
+                    )
+                    fp = staging_dir / candidates[0]
+                    if fp.stat().st_size > 5000:
+                        return str(fp)
+        except Exception:
+            pass
+        time.sleep(0.4)
+    return None
+
+
 def _detect_download_start_once(drv, before: set, staging_dir: Path) -> Optional[Tuple[Optional[str], str]]:
     """Single-iteration check, so callers that share a Chrome session across
     multiple threads (e.g. Gemini's CHROME_DRIVER_LOCK) can hold the lock
@@ -5047,69 +5085,39 @@ class GeminiWorker:
         job_mark(ctx.job_id, 'download', 'run')
         ctx.transition_sync(JobState.RAW_DOWNLOAD_START)
 
-        # Waiting up to DOWNLOAD_START_WINDOW_S (short: this only starts
-        # once an image is already confirmed ready) for real download-start
-        # evidence. Each get_log()/filesystem check is a WebDriver command
-        # on the shared session, so it needs a brief lock acquisition per
-        # iteration, just not held across the sleep in between -- kept as
-        # one bounded synchronous unit here (not chunked across further
-        # scheduler ticks) since it is short and is the critical hand-off
-        # step the resource release depends on.
-        deadline = time.time() + DOWNLOAD_START_WINDOW_S
-        result = None
-        while time.time() < deadline:
-            with CHROME_DRIVER_LOCK:
-                chrome_driver.switch_to.window(self.handle)
-                result = _detect_download_start_once(self.driver, before_files, staging_dir)
-            if result is not None:
-                break
-            time.sleep(0.5)
-        if result is None:
-            try:
-                observed_files = sorted(_snapshot_staging_dir(staging_dir) - before_files)
-            except Exception:
-                observed_files = []
-            try:
-                cdp_events_seen = 0
-                with CHROME_DRIVER_LOCK:
-                    chrome_driver.switch_to.window(self.handle)
-                    for entry in self.driver.get_log('performance'):
-                        try:
-                            if json.loads(entry['message'])['message']['method'] == 'Browser.downloadWillBegin':
-                                cdp_events_seen += 1
-                        except Exception:
-                            pass
-            except Exception:
-                cdp_events_seen = -1
+        # By explicit request: reuse the proven ECOM_COMBO_PHOTOSHOOT_ORDER
+        # (V9.1) reference script's own click-then-wait timing as-is,
+        # rather than the CDP performance-log polling this used to do.
+        # wait_for_download_file() is a plain filesystem poll -- it never
+        # touches the driver, so it doesn't need CHROME_DRIVER_LOCK at all
+        # for the whole wait window (the old CDP-based loop had to
+        # reacquire the lock and switch windows on every single iteration
+        # just to call get_log('performance')).
+        found_path = wait_for_download_file(staging_dir, before_files, DOWNLOAD_START_WINDOW_S)
+        if found_path is None:
+            observed_files = sorted(_snapshot_staging_dir(staging_dir) - before_files)
             append_runtime_log(
                 f"{prefix} DOWNLOAD_START_TIMEOUT resource={self.tid} job={ctx.job_id} "
                 f"configured_dir={staging_dir} files_before={sorted(before_files)[:5]} "
-                f"newly_seen_files={observed_files} cdp_download_events_seen_after_timeout={cdp_events_seen} "
-                f"click=True window_s={DOWNLOAD_START_WINDOW_S}"
+                f"newly_seen_files={observed_files} click=True window_s={DOWNLOAD_START_WINDOW_S}"
             )
             raise RuntimeError(f"Download start timeout after {DOWNLOAD_START_WINDOW_S}s (dir={staging_dir})")
-        dl_guid, source = result
-        ctx.raw_guid = dl_guid
-        append_runtime_log(f"{prefix} DOWNLOAD START DETECTED")
-        if source == 'cdp':
-            append_runtime_log(f'{prefix} GEMINI_DOWNLOAD_EVENT GUID={dl_guid}')
-            append_runtime_log(f'{prefix} GEMINI_DOWNLOAD_STARTED guid={dl_guid}')
-        else:
-            append_runtime_log(f'{prefix} GEMINI_DOWNLOAD_STARTED guid=NOT_CAPTURED source=filesystem')
-        _log_download_start_confirmed(prefix, dl_guid, source)
+        found_name = Path(found_path).name
+        append_runtime_log(f"{prefix} DOWNLOAD START DETECTED file={found_name}")
+        append_runtime_log(f'{prefix} GEMINI_DOWNLOAD_STARTED guid=NOT_CAPTURED source=filesystem file={found_name}')
 
         record_id = f"gemini:{ctx.job_id}:{time.monotonic_ns()}"
         with DOWNLOAD_REGISTRY_LOCK:
             DOWNLOAD_REGISTRY[record_id] = DownloadRecord(
                 record_id=record_id,
-                guid=dl_guid,
+                guid=None,
                 job_id=ctx.job_id,
                 resource_id=self.tid,
                 resource_type="gemini",
-                source=source,
+                source="filesystem",
                 staging_dir=str(staging_dir),
                 expected_filename=expected_png,
-                actual_filename=None,
+                actual_filename=found_name,
                 target_state=JobState.RAW_VALIDATED,
                 started_at=time.time(),
                 created_at=time.time()
