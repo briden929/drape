@@ -5243,7 +5243,7 @@ async def gemini_scheduler_loop():
             did_work = False
             tick_n += 1
             if tick_n % 100 == 0:
-                append_runtime_log(f"[GEMINI SCHED] alive tick={tick_n} active={list(GEMINI_ACTIVE.keys())} queue_size={GEMINI_READY_QUEUE.qsize()}")
+                append_runtime_log(f"[GEMINI SCHED] alive tick={tick_n} active={list(GEMINI_ACTIVE.keys())} queue_size={GEMINI_READY_QUEUE.qsize()} admission_gate_free={GEMINI_ADMISSION_GATE._value}")
             # Cheap pre-check only: "is anything free at all", so Step A
             # doesn't attempt (and block on) an acquire when every tab is
             # busy. It does NOT decide WHICH resource gets used -- that
@@ -5619,14 +5619,25 @@ async def execute_pipeline(ctx: JobContext):
         # request: "pick one job, upload and hit enter in tab 1, only then
         # fetch/pick the next one."
         await GEMINI_ADMISSION_GATE.acquire()
-        append_runtime_log(f"[PIPELINE][{ctx.job_id}] GEMINI QUEUED")
-        # Only gemini_scheduler_loop() touches GEMINI_BROKER/the shared
-        # driver now -- this just hands the job off and waits for the
-        # scheduler to resolve gemini_done_future once setup through
-        # download-start + resource release is done (or raise on failure).
-        progress_detail(ctx.job_id, 'gemini_wait', True)
-        ctx.gemini_done_future = ctx.loop.create_future()
-        await GEMINI_READY_QUEUE.put(ctx)
+        try:
+            append_runtime_log(f"[PIPELINE][{ctx.job_id}] GEMINI QUEUED")
+            # Only gemini_scheduler_loop() touches GEMINI_BROKER/the shared
+            # driver now -- this just hands the job off and waits for the
+            # scheduler to resolve gemini_done_future once setup through
+            # download-start + resource release is done (or raise on
+            # failure). Once GEMINI_READY_QUEUE.put succeeds, releasing the
+            # gate becomes the scheduler's job (_release_admission_gate,
+            # called on setup success or any Gemini failure) -- but if
+            # anything between acquiring the gate and that handoff raises,
+            # nothing else would ever release it, permanently blocking
+            # every future job from entering Gemini. That must never
+            # happen silently.
+            progress_detail(ctx.job_id, 'gemini_wait', True)
+            ctx.gemini_done_future = ctx.loop.create_future()
+            await GEMINI_READY_QUEUE.put(ctx)
+        except BaseException:
+            _release_admission_gate(ctx)
+            raise
         append_runtime_log(f"[PIPELINE][{ctx.job_id}] Gemini execution started")
         await ctx.gemini_done_future
         await ctx.wait_for_state(JobState.RAW_VALIDATED)
