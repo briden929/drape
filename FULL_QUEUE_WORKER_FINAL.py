@@ -4624,11 +4624,22 @@ def _detect_download_start_once(drv, before: set, staging_dir: Path) -> Optional
         pass
     try:
         if staging_dir.exists():
-            for f in staging_dir.iterdir():
-                if f.name in before:
-                    continue
-                if f.name.endswith(('.crdownload', '.tmp', '.part')):
-                    continue
+            new_names = [f.name for f in staging_dir.iterdir() if f.name not in before]
+            # START vs COMPLETE are different questions. A .crdownload/.tmp/
+            # .part file is Chrome actively writing to disk right now -- that
+            # IS the download starting, not something to skip. Skipping it
+            # here (the old behavior) meant a real, in-progress download on
+            # a large/slow image produced nothing but a bare
+            # "Download start timeout after 15s" even though Chrome had
+            # already started writing the file -- the completion side
+            # (poll_downloads_loop) is the one place that must still ignore
+            # these same extensions, since a .crdownload is never a
+            # finished, valid image.
+            partial = [n for n in new_names if n.endswith(('.crdownload', '.tmp', '.part', '.download'))]
+            if partial:
+                append_runtime_log(f"[DL-START] filesystem partial file appeared: {partial[0]}")
+                return (None, "filesystem")
+            if new_names:
                 return (None, "filesystem")
     except Exception:
         pass
@@ -4645,17 +4656,16 @@ def _detect_download_start(drv, staging_dir: Path, timeout: float = DOWNLOAD_STA
     Returns (guid_or_None, source) where source is "cdp" or "filesystem".
     Raises RuntimeError on timeout; never guesses.
 
-    PHASE-11 CONCURRENCY RISK (documented, confirmed from code):
-    driver.get_log('performance') CONSUMES entries as it reads them, and T0-T3
-    are tabs of ONE shared chrome_driver session. This function is called
-    directly by the WMR path (per-resource dedicated drivers -- safe), while
-    the Gemini path uses _detect_download_start_once() under CHROME_DRIVER_LOCK
-    per iteration. A single job therefore has exactly one consumer at a time,
-    but with 4 concurrent Gemini jobs the next job's arm-drain can consume a
-    downloadWillBegin event belonging to another tab's just-clicked download.
-    The pre-click perf-log drain in do_execute_sync narrows but does not close
-    this window. Deferred deliberately (Phase 16): implement the central
-    performance-event collector only if the multi-job run proves collisions.
+    CROSS-JOB get_log('performance') CONSUMPTION: not currently possible.
+    driver.get_log('performance') consumes entries as it reads them, and
+    T0-T3 are tabs of ONE shared chrome_driver session -- so this WOULD be
+    a real race if two jobs' arm-drain/detect calls could ever interleave.
+    They can't: gemini_scheduler_loop() is the sole owner of all Gemini
+    browser actions and runs them through a single-worker executor, so at
+    most one job's setup-or-check (which includes this whole arm -> click
+    -> detect-start sequence) is ever in flight at a time. The WMR path
+    calls this function too, but each WMR resource already has its own
+    dedicated Chrome process/driver (WmrDriverThread), never a shared one.
     """
     t0 = time.time()
     before = _snapshot_staging_dir(staging_dir)
@@ -5050,6 +5060,28 @@ class GeminiWorker:
                 break
             time.sleep(0.5)
         if result is None:
+            try:
+                observed_files = sorted(_snapshot_staging_dir(staging_dir) - before_files)
+            except Exception:
+                observed_files = []
+            try:
+                cdp_events_seen = 0
+                with CHROME_DRIVER_LOCK:
+                    chrome_driver.switch_to.window(self.handle)
+                    for entry in self.driver.get_log('performance'):
+                        try:
+                            if json.loads(entry['message'])['message']['method'] == 'Browser.downloadWillBegin':
+                                cdp_events_seen += 1
+                        except Exception:
+                            pass
+            except Exception:
+                cdp_events_seen = -1
+            append_runtime_log(
+                f"{prefix} DOWNLOAD_START_TIMEOUT resource={self.tid} job={ctx.job_id} "
+                f"configured_dir={staging_dir} files_before={sorted(before_files)[:5]} "
+                f"newly_seen_files={observed_files} cdp_download_events_seen_after_timeout={cdp_events_seen} "
+                f"click=True window_s={DOWNLOAD_START_WINDOW_S}"
+            )
             raise RuntimeError(f"Download start timeout after {DOWNLOAD_START_WINDOW_S}s (dir={staging_dir})")
         dl_guid, source = result
         ctx.raw_guid = dl_guid
