@@ -413,15 +413,25 @@ REDIS_KEY_PREFIX = os.environ.get('REDIS_KEY_PREFIX', 'vastralook:')
 REDIS_URL = os.environ.get('REDIS_URL')
 # BullMQ job concurrency is independent of Gemini (4 T-resources) / WMR (8
 # W-resources) concurrency -- those are enforced separately by GEMINI_BROKER
-# and WMR_BROKER's own acquire() backpressure. Defaulting BullMQ's own
-# Matches the physical Gemini resource count (T0-T3) so BullMQ itself is
-# the waiting queue for jobs beyond that: admitting more than 4 meant jobs
-# 5-8 were already inside the pipeline (JobContext created, appearing as
-# G5/-- ... G8/--) blocked on GEMINI_BROKER.acquire() instead of sitting
-# in BullMQ's own waiting state. WMR (8 logical resources) is unaffected
-# by this -- Gemini is released right after download-start, well before
-# WMR runs, so 4 concurrent Gemini jobs still keep WMR busy.
-BULLMQ_CONCURRENCY = int(os.environ.get('BULLMQ_CONCURRENCY', '4'))
+# and WMR_BROKER's own acquire() backpressure.
+#
+# A prior revision capped this at 4 (== Gemini resource count) to stop
+# G5/--...G8/-- from appearing as already-admitted-but-Gemini-waiting
+# jobs. That traded away real throughput: process_bullmq_job() awaits
+# execute_pipeline() to FULL completion (Gemini -> WMR -> R2 -> DB ->
+# credits) before BullMQ frees that job's concurrency slot -- so at
+# concurrency=4, once a Gemini resource released, there was no job
+# already parked at GEMINI_BROKER.acquire() ready to claim it instantly;
+# BullMQ wouldn't even fetch a replacement job until one of the 4 FULL
+# pipelines finished (well after Gemini release), leaving the freed
+# T-slot idle in the meantime. Raised back above the Gemini resource
+# count so extra jobs are always admitted and waiting on the broker,
+# ready to reuse a freed T-slot the moment it releases -- the 120s
+# acquire-timeout that made high concurrency risky before is already
+# fixed (RESOURCE_ACQUIRE_TIMEOUT_S=600). The waiting-without-a-T-yet
+# state now renders as an explicit "WAIT Gemini" token (see
+# render_job_line()) instead of a blank-looking line.
+BULLMQ_CONCURRENCY = int(os.environ.get('BULLMQ_CONCURRENCY', '8'))
 
 def build_redis_connection_opts(redis_url: str) -> dict:
     """Canonical redis-py connection kwargs for a REDIS_URL, used by every
@@ -732,6 +742,13 @@ def render_job_line(job_id: str) -> str:
     stages = p['stages']
     d = p.get('details') or {}
     tokens = []
+
+    # WAITING FOR A GEMINI RESOURCE (admitted into the pipeline, refs
+    # ready, but no T0-T3 free yet) -- shown only until NewChat actually
+    # starts, so a job doesn't render as a blank line while it's really
+    # queued up behind a busy Gemini resource.
+    if d.get('gemini_wait') and stages.get('newchat') is None:
+        tokens.append('⏸️WAIT Gemini')
 
     # NEW CHAT
     if stages.get('newchat') == 'run':
@@ -5028,7 +5045,9 @@ async def execute_pipeline(ctx: JobContext):
 
         append_runtime_log(f"[PIPELINE][{ctx.job_id}] GEMINI QUEUED")
         append_runtime_log(f"[PIPELINE][{ctx.job_id}] Acquiring Gemini resource")
+        progress_detail(ctx.job_id, 'gemini_wait', True)
         tid = await GEMINI_BROKER.acquire(ctx.job_id)
+        progress_detail(ctx.job_id, 'gemini_wait', False)
         ctx.gemini_resource = tid
         _jp = JOB_PROGRESS.get(ctx.job_id)
         if _jp is not None:
