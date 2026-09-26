@@ -5836,7 +5836,7 @@ async def main():
     print("RUNTIME MAIN ENTERED", flush=True)
     print("=" * 80, flush=True)
     try:
-        global BULLMQ_WORKER, QUEUE_MONITOR_TASK, HEARTBEAT_TASK, WATCHER_TASK
+        global BULLMQ_WORKER, QUEUE_MONITOR_TASK, HEARTBEAT_TASK, WATCHER_TASK, GEMINI_SCHEDULER_TASK
 
         print("STEP 11: REDIS HEALTH", flush=True)
         opts = {"connection": os.environ.get("REDIS_URL"), "prefix": os.environ.get("REDIS_KEY_PREFIX")}
