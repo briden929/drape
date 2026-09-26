@@ -4370,6 +4370,19 @@ else:
 
 CHROME_DRIVER_LOCK = threading.RLock()
 
+# Explicit hard rule (by request): after a job's own setup (NewChat through
+# Send + verify_generation_started) completes, before that job's setup-phase
+# turn on the shared driver ends, it must check the status of whichever
+# OTHER job's tab most recently finished ITS OWN setup -- so the sequence in
+# worker.log genuinely reads "T0 setup done -> check T1 -> T1 setup done ->
+# check T0 -> ..." instead of relying on incidental lock-contention timing.
+# This check is READ-ONLY: it never clicks download or releases a resource
+# itself -- that tab's own thread already owns its Phase 2 polling loop and
+# will act on its own image-ready state independently. Duplicating the
+# action here would race two threads over the same download click.
+_LAST_SETUP_LOCK = threading.Lock()
+_LAST_SETUP_TID = {'value': None}
+
 def _recover_gemini_resource(resource_id: str) -> bool:
     """Recreate this Gemini tab on the shared chrome_driver and prove it responds."""
     worker = GEMINI_WORKERS.get(resource_id)
@@ -4496,6 +4509,13 @@ class GeminiWorker:
         self.tid = tid
         self.driver = None
         self.handle = None
+        # Stored (not just local) so the NEXT job's setup-completion check
+        # can read THIS tab's own generation baseline URLs cross-thread --
+        # see _LAST_SETUP_TID / the read-only previous-tab check at the end
+        # of Phase 1 in do_execute_sync().
+        self.urls_before = set()
+        self.chat_urls = set()
+        self.current_job_id = None
 
     def do_execute_sync(self, ctx: JobContext):
         prefix = f"[GEMINI][{self.tid}][{ctx.job_id}]"
@@ -4603,6 +4623,34 @@ class GeminiWorker:
                 append_runtime_log(f"{prefix} GENERATION STARTED")
                 append_runtime_log(f'{prefix} GEMINI_GENERATION_STARTED')
                 chat_urls = snapshot_urls(self.driver)
+                self.urls_before = urls_before
+                self.chat_urls = chat_urls
+                self.current_job_id = ctx.job_id
+
+                # HARD RULE (by explicit request): before this job's setup
+                # turn on the shared driver ends, check whichever OTHER tab
+                # most recently finished its own setup. Read-only -- this
+                # never clicks download or releases a resource; that tab's
+                # own thread already owns acting on its own image-ready
+                # state via its independent Phase 2 loop below. Duplicating
+                # the action here would race two threads over one click.
+                with _LAST_SETUP_LOCK:
+                    prev_tid = _LAST_SETUP_TID['value']
+                    _LAST_SETUP_TID['value'] = self.tid
+                if prev_tid and prev_tid != self.tid:
+                    prev_worker = GEMINI_WORKERS.get(prev_tid)
+                    if prev_worker is not None and prev_worker.driver is not None and prev_worker.handle:
+                        try:
+                            chrome_driver.switch_to.window(prev_worker.handle)
+                            prev_status, _ = nb_check_image(prev_worker.driver, prev_worker.urls_before, prev_worker.chat_urls)
+                            append_runtime_log(f"{prefix} CHECK_PREVIOUS_TAB tid={prev_tid} job={prev_worker.current_job_id} status={prev_status}")
+                        except Exception as e:
+                            append_runtime_log(f"{prefix} CHECK_PREVIOUS_TAB_ERROR tid={prev_tid}: {e}")
+                        finally:
+                            try:
+                                chrome_driver.switch_to.window(self.handle)
+                            except Exception:
+                                pass
 
             # Phase 2: wait for the REAL generated image. Previously this
             # called _has_generated_image() -- a single one-shot DOM check,
