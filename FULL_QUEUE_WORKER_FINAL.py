@@ -10,7 +10,7 @@
 #       ↓
 #   Resolve prompt + ALL reference images
 #       ↓
-#   Gemini Chrome T0-T3
+#   Gemini Chrome T0-T2
 #       ↓
 #   Generate image
 #       ↓
@@ -452,9 +452,12 @@ def build_redis_connection_opts(redis_url: str) -> dict:
 # Diagnostic cap: GEMINI_ACTIVE_RESOURCES=1 restricts the whole Gemini
 # pool (broker, worker dict, tab slots, dashboard) to only T0, so a
 # suspected browser-interaction regression can be proven/disproven on a
-# single deterministic resource before re-enabling T1-T3. Defaults to 4
-# (unchanged behavior) when unset.
-MAX_CONCURRENT_TABS = max(1, min(4, int(os.environ.get('GEMINI_ACTIVE_RESOURCES', '4'))))
+# single deterministic resource before re-enabling the rest. By explicit
+# request, Gemini now runs T0-T2 only (3 resources) -- default and cap
+# both lowered from 4. T3 must never be constructed anywhere: this is the
+# single source of truth every resource list (broker, worker map,
+# dashboard, tab-state registration) derives from.
+MAX_CONCURRENT_TABS = max(1, min(3, int(os.environ.get('GEMINI_ACTIVE_RESOURCES', '3'))))
 CHROME_WMR_WORKERS = 4
 GENERATION_TIMEOUT_S = 240
 LOCAL_REDIS_PORT = 16379
@@ -921,7 +924,8 @@ _u = urlparse(REDIS_URL or "")
 print(f"  Redis: {_u.scheme}://{_u.hostname}:{_u.port or 6379} (credentials={'configured' if _u.password else 'none'})")
 print(f'  Chrome Profile:    {CHROME_PROFILE_DIR}')
 print(f'  WMR Profiles:      {WMR_PROFILES_BASE}/W{{0-3}}')
-print(f'  Max Chrome Tabs:   {MAX_CONCURRENT_TABS} (T0-T3)')
+print(f'  Max Gemini Tabs:   {MAX_CONCURRENT_TABS} (T0-T{MAX_CONCURRENT_TABS - 1})')
+print(f'  Gemini resources:  {",".join(f"T{i}" for i in range(MAX_CONCURRENT_TABS))}')
 print(f'  WMR Chrome Workers: {CHROME_WMR_WORKERS} (W0-W3)')
 print('  ✅ Secrets and directories configured successfully.\n')
 print('=' * 80)
@@ -2081,7 +2085,7 @@ def _wmr_wait_for_new_file(incoming_dir: Path, files_before: set, timeout=30) ->
     return None
 print(f'  ✅ Chrome WMR Pool initialized (LAZY — workers W0-W{CHROME_WMR_WORKERS - 1} created on demand).\n')
 print('=' * 80)
-print(f'📑 STEP 9: CONFIGURING LAZY CHROME MULTI-TAB POOL ({MAX_CONCURRENT_TABS} SLOTS: T0-T3)')
+print(f'📑 STEP 9: CONFIGURING LAZY CHROME MULTI-TAB POOL ({MAX_CONCURRENT_TABS} SLOTS: T0-T{MAX_CONCURRENT_TABS - 1})')
 print('=' * 80)
 S_IDLE = 'IDLE'
 S_NEW_CHAT = 'NEW_CHAT'
@@ -4482,6 +4486,7 @@ class FirstFreeBroker:
                     if self._waiters[0] is ticket:
                         skipped = []
                         resource_id = None
+                        append_runtime_log(f"[{self.name}] REQUEST job={short} | TRY={self.resource_ids[0]}")
                         for r in self.resource_ids:
                             if r in self._free_set:
                                 resource_id = r
@@ -4490,6 +4495,9 @@ class FirstFreeBroker:
                         if resource_id is not None:
                             for r in skipped:
                                 append_runtime_log(f"[{self.name} BROKER] job={short} {r}=BUSY -> checking next")
+                            idx = self.resource_ids.index(resource_id)
+                            if idx > 0:
+                                append_runtime_log(f"[{self.name}] REQUEST job={short} | {self.resource_ids[idx - 1]}=BUSY -> TRY={resource_id}")
                             self._free_set.discard(resource_id)
                             self._waiters.popleft()
                             rec = self._records[resource_id]
@@ -4499,10 +4507,13 @@ class FirstFreeBroker:
                             rec.last_used = rec.acquired_at
                             tag = 'FIFO ACQUIRE' if had_to_wait else 'ACQUIRE'
                             append_runtime_log(f"[{self.name} BROKER] {tag} job={short} resource={resource_id}")
+                            append_runtime_log(f"[{self.name}] ACQUIRE job={short} -> {resource_id}")
                             self._condition.notify_all()
                             return resource_id
                     if not had_to_wait:
                         append_runtime_log(f"[{self.name} BROKER] job={short} WAITING resources={','.join(self.resource_ids)}")
+                        busy_summary = ' '.join(f"{r}=BUSY" for r in self.resource_ids)
+                        append_runtime_log(f"[{self.name}] WAIT job={short} | {busy_summary}")
                         had_to_wait = True
                     remaining = timeout - (time.monotonic() - t0)
                     if remaining <= 0:
@@ -4528,7 +4539,9 @@ class FirstFreeBroker:
             rec.last_release_at = time.time()
             if resource_id not in self._free_set:
                 self._free_set.add(resource_id)
-                append_runtime_log(f"[{self.name} BROKER] RELEASE resource={resource_id} job={short_job_id(released_job) if released_job else 'unknown'}")
+                _rj = short_job_id(released_job) if released_job else 'unknown'
+                append_runtime_log(f"[{self.name} BROKER] RELEASE resource={resource_id} job={_rj}")
+                append_runtime_log(f"[{self.name}] RELEASE job={_rj} -> {resource_id}")
                 self._condition.notify_all()
 
     def fail(self, resource_id: str, error: str = ""):
@@ -6114,11 +6127,16 @@ def _resource_dashboard_row(rec, label_map):
 
 def get_gemini_dashboard_state():
     snap = GEMINI_BROKER.snapshot_full()
-    return {rid: _resource_dashboard_row(snap.get(rid), _GEMINI_DASHBOARD_LABELS) for rid in ["T0", "T1", "T2", "T3"]}
+    return {rid: _resource_dashboard_row(snap.get(rid), _GEMINI_DASHBOARD_LABELS) for rid in GEMINI_BROKER.resource_ids}
 
 def get_wmr_dashboard_state():
+    # WMR_BROKER genuinely still holds and actively assigns all 8
+    # internal resources (W0-T0..W3-T1) -- this only narrows what the
+    # DASHBOARD renders, per explicit request, to the 3 requested slots.
+    # A job CAN still land on a hidden resource (e.g. W3-T1); it will
+    # process correctly, it just won't show on this particular view.
     snap = WMR_BROKER.snapshot_full()
-    rids = [f"W{i}-T{j}" for i in range(4) for j in range(2)]
+    rids = [f"W{i}-T0" for i in range(3)]
     return {rid: _resource_dashboard_row(snap.get(rid), _WMR_DASHBOARD_LABELS) for rid in rids}
 
 def _fmt_age(seconds):
@@ -6265,7 +6283,7 @@ async def dashboard_loop():
             wmr_running = sum(1 for r in wmr_state.values() if r['job_id'])
             summary = (
                 f"▒ LIVE | WAIT={q['waiting']} ACTIVE={q['active']} LOCAL={q['local_active']} "
-                f"GEMINI={gemini_running}/{MAX_CONCURRENT_TABS} WMR={wmr_running}/8 DONE={q['completed']} "
+                f"GEMINI={gemini_running}/{MAX_CONCURRENT_TABS} WMR={wmr_running}/3 DONE={q['completed']} "
                 f"FAIL={q['failed']} UP={uptime_s // 3600:02d}:{(uptime_s % 3600) // 60:02d}:{uptime_s % 60:02d}"
             )
             emit_live_event('summary', summary)
@@ -6276,9 +6294,12 @@ async def dashboard_loop():
             )
             emit_live_event('gemini_row', gemini_line)
 
+            # Narrowed display, per explicit request -- WMR_BROKER itself
+            # still holds all 8 resources (W0-T0..W3-T1) and can still
+            # route a job to any of them; only these 3 rows are shown here.
             wmr_line = 'WMR ' + ' | '.join(
                 f"{rid}:{short_job_id(wmr_state[rid]['job_id'])}" if wmr_state[rid]['job_id'] else f"{rid}:FREE"
-                for rid in [f"W{i}-T{j}" for i in range(4) for j in range(2)]
+                for rid in [f"W{i}-T0" for i in range(3)]
             )
             emit_live_event('wmr_row', wmr_line)
         except Exception as e:
