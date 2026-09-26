@@ -10,7 +10,7 @@
 #       ↓
 #   Resolve prompt + ALL reference images
 #       ↓
-#   Gemini Chrome T0-T3
+#   Gemini Chrome T0-T2
 #       ↓
 #   Generate image
 #       ↓
@@ -220,15 +220,62 @@ import urllib.request
 import urllib.error
 import urllib.parse
 from datetime import datetime
-from collections import defaultdict
+from collections import defaultdict, deque
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Dict, Any, Optional, List, Tuple
 from enum import Enum
 import heapq
 
+# This whole file is designed to be pasted into and re-run inside a single
+# long-lived Colab/notebook cell. Every stateful, expensive resource this
+# file creates at module scope (chrome_driver, GEMINI_BROKER, WMR_BROKER,
+# GEMINI_WORKERS, WMR_THREADS, and the BullMQ runtime task) gets
+# UNCONDITIONALLY recreated every time the cell re-executes, unless guarded.
+# Without a guard, re-running the cell (without Runtime > Restart) launches
+# a brand new Chrome process and brand new brokers while the PREVIOUS run's
+# Chrome/brokers/main() task are all still alive and in use -- orphaning the
+# old Chrome session (whose window handles then go stale) while doing
+# nothing with the new one, since start_worker() correctly refuses to start
+# a second main(). That orphaning is what produced repeated
+# "[GEMINI BROKER] T0 RECOVERY_HEALTH_CHECK = FAILED: no such window:
+# target window already closed" spam: the OLD broker's background recovery
+# timers kept firing against the OLD (now-abandoned) Chrome tabs.
+#
+# Stashing these in sys.modules -- which, unlike a plain module global,
+# survives this file being re-executed in the same kernel -- lets every
+# creation site below check for and reuse a previous run's live resource
+# instead of creating an orphaned duplicate.
+_V16_STATE_KEY = "__v16_runtime_singleton__"
+if _V16_STATE_KEY not in sys.modules:
+    _v16_state = types.ModuleType(_V16_STATE_KEY)
+    _v16_state.BACKGROUND_TASKS = set()
+    _v16_state.BULLMQ_WORKER = None
+    _v16_state.QUEUE_MONITOR = None
+    _v16_state.QUEUE_MONITOR_TASK = None
+    _v16_state.HEARTBEAT_TASK = None
+    _v16_state.WATCHER_TASK = None
+    _v16_state.GEMINI_SCHEDULER_TASK = None
+    _v16_state.WORKER_MAIN_TASK = None
+    _v16_state.RUNTIME_INITIALIZED = False
+    _v16_state.chrome_driver = None
+    _v16_state.GEMINI_BROKER = None
+    _v16_state.WMR_BROKER = None
+    _v16_state.GEMINI_WORKERS = None
+    _v16_state.WMR_THREADS = None
+    _v16_state.display_obj = None
+    _v16_state.x11vnc_proc = None
+    _v16_state.novnc_proc = None
+    _v16_state.cf_proc = None
+    _v16_state.tunnel_url = None
+    _v16_state.DASHBOARD_TASK = None
+    _v16_state.LIVE_DISPLAY_BORN = set()
+    _v16_state.LIVE_LAST_TEXT = {}
+    sys.modules[_V16_STATE_KEY] = _v16_state
+V16_STATE = sys.modules[_V16_STATE_KEY]
+
 def bootstrap_dependencies():
-    pkg_map = {'selenium': 'selenium', 'bullmq': 'bullmq', 'boto3': 'boto3', 'psycopg2': 'psycopg2-binary', 'PIL': 'Pillow', 'websockets': 'websockets', 'undetected_chromedriver': 'undetected-chromedriver', 'pyvirtualdisplay': 'pyvirtualdisplay'}
+    pkg_map = {'selenium': 'selenium', 'bullmq': 'bullmq', 'boto3': 'boto3', 'psycopg2': 'psycopg2-binary', 'PIL': 'Pillow', 'websockets': 'websockets', 'undetected_chromedriver': 'undetected-chromedriver', 'pyvirtualdisplay': 'pyvirtualdisplay', 'nest_asyncio': 'nest_asyncio', 'webdriver_manager': 'webdriver-manager', 'numpy': 'numpy', 'requests': 'requests'}
     missing = []
     for mod, pkg in pkg_map.items():
         if importlib.util.find_spec(mod) is None:
@@ -254,10 +301,14 @@ from bullmq import Worker, Job, Queue
 import psycopg2
 from psycopg2 import pool as _pgpool
 try:
-    from IPython.display import display as ipy_display, HTML
+    from IPython.display import display as ipy_display, HTML, clear_output, update_display
 except ImportError:
     ipy_display = print
     HTML = str
+    def clear_output(wait=False):
+        pass
+    def update_display(obj, display_id=None):
+        pass
 try:
     from pyvirtualdisplay import Display
 except ImportError:
@@ -308,14 +359,54 @@ _REQUIRED_SECRETS = [
     'R2_BUCKET_NAME',
     'R2_PUBLIC_URL'
 ]
+
+# SECURITY (V16 hardening): NO hardcoded credentials live in this tracked
+# file anymore. A previous revision embedded live DATABASE_URL / REDIS_URL /
+# R2 keys here; they were removed and MUST BE ROTATED because they appeared
+# in source history. Secrets come ONLY from real environment variables or
+# Colab Secrets below -- never printed, never stored in this repo.
+
+# Colab Secrets are per-Google-account, not per-session/per-notebook: add
+# each of the names above ONCE under the key icon in the left sidebar (with
+# notebook access enabled) and every future run on this account picks them
+# up automatically here -- no separate setup cell, and nothing hardcoded in
+# this tracked file. os.environ is checked first so an explicit env var
+# (e.g. set by a launcher, CI, or `python -m FULL_QUEUE_WORKER_FINAL`)
+# always wins over Colab Secrets.
+try:
+    from google.colab import userdata as _colab_userdata
+    for _k in _REQUIRED_SECRETS:
+        if not os.environ.get(_k):
+            try:
+                _v = _colab_userdata.get(_k)
+                if _v:
+                    os.environ[_k] = _v
+            except Exception:
+                print(f"[SECRET CHECK] {_k}: Colab Secret read failed")
+except Exception:
+    print("[SECRET CHECK] Google Colab userdata unavailable")
+
+# Per-secret PRESENT/MISSING status -- never the value itself.
 _missing = []
 for _k in _REQUIRED_SECRETS:
-    if not os.environ.get(_k):
+    if os.environ.get(_k):
+        print(f"✅ {_k}: PRESENT")
+    else:
+        print(f"❌ {_k}: MISSING")
         _missing.append(_k)
 
 if _missing:
-    print(f"[FATAL ERROR] Missing required environment variables: {', '.join(_missing)}")
+    print()
+    print('=' * 80)
+    print("[FATAL ERROR] Missing required secrets:")
+    for _k in _missing:
+        print(f"  - {_k}")
+    print('=' * 80)
+    print("Add each one under Colab Secrets (key icon, left sidebar) with notebook access enabled, or set it in os.environ before running this file.")
     sys.exit(1)
+
+print()
+print("✅ ALL 7 REQUIRED SECRETS ARE AVAILABLE")
 
 os.environ.setdefault('REDIS_KEY_PREFIX', 'vastralook:')
 QUEUE_NAME = 'generations'
@@ -323,9 +414,24 @@ REDIS_KEY_PREFIX = os.environ.get('REDIS_KEY_PREFIX', 'vastralook:')
 REDIS_URL = os.environ.get('REDIS_URL')
 # BullMQ job concurrency is independent of Gemini (4 T-resources) / WMR (8
 # W-resources) concurrency -- those are enforced separately by GEMINI_BROKER
-# and WMR_BROKER's own acquire() backpressure. Defaulting BullMQ's own
-# concurrency to 1 (its library default) would serialize job admission and
-# starve the resource brokers of anything to actually parallelize.
+# and WMR_BROKER's own acquire() backpressure.
+#
+# A prior revision capped this at 4 (== Gemini resource count) to stop
+# G5/--...G8/-- from appearing as already-admitted-but-Gemini-waiting
+# jobs. That traded away real throughput: process_bullmq_job() awaits
+# execute_pipeline() to FULL completion (Gemini -> WMR -> R2 -> DB ->
+# credits) before BullMQ frees that job's concurrency slot -- so at
+# concurrency=4, once a Gemini resource released, there was no job
+# already parked at GEMINI_BROKER.acquire() ready to claim it instantly;
+# BullMQ wouldn't even fetch a replacement job until one of the 4 FULL
+# pipelines finished (well after Gemini release), leaving the freed
+# T-slot idle in the meantime. Raised back above the Gemini resource
+# count so extra jobs are always admitted and waiting on the broker,
+# ready to reuse a freed T-slot the moment it releases -- the 120s
+# acquire-timeout that made high concurrency risky before is already
+# fixed (RESOURCE_ACQUIRE_TIMEOUT_S=600). The waiting-without-a-T-yet
+# state now renders as an explicit "WAIT Gemini" token (see
+# render_job_line()) instead of a blank-looking line.
 BULLMQ_CONCURRENCY = int(os.environ.get('BULLMQ_CONCURRENCY', '8'))
 
 def build_redis_connection_opts(redis_url: str) -> dict:
@@ -343,7 +449,15 @@ def build_redis_connection_opts(redis_url: str) -> dict:
         opts["ssl"] = True
     return opts
 
-MAX_CONCURRENT_TABS = 4
+# Diagnostic cap: GEMINI_ACTIVE_RESOURCES=1 restricts the whole Gemini
+# pool (broker, worker dict, tab slots, dashboard) to only T0, so a
+# suspected browser-interaction regression can be proven/disproven on a
+# single deterministic resource before re-enabling the rest. By explicit
+# request, Gemini now runs T0-T2 only (3 resources) -- default and cap
+# both lowered from 4. T3 must never be constructed anywhere: this is the
+# single source of truth every resource list (broker, worker map,
+# dashboard, tab-state registration) derives from.
+MAX_CONCURRENT_TABS = max(1, min(3, int(os.environ.get('GEMINI_ACTIVE_RESOURCES', '3'))))
 CHROME_WMR_WORKERS = 4
 GENERATION_TIMEOUT_S = 240
 LOCAL_REDIS_PORT = 16379
@@ -352,8 +466,20 @@ MAX_JOB_RETRIES = 2
 DOWNLOAD_STABLE_CHECKS = 2
 DOWNLOAD_MIN_SIZE = 5000
 DOWNLOAD_TIMEOUT_S = 120
-DOWNLOAD_START_WINDOW_S = 15
-WMR_TIMEOUT_S = 120
+DOWNLOAD_START_WINDOW_S = 15  # WMR's own default; unrelated to the Gemini path below
+# Gemini's download-start wait has NO normal-operation timeout by explicit
+# request -- a slow/large download is not a failure. This is a safety net
+# only, to eventually give up on a genuinely dead resource (Chrome never
+# writes anything at all), never on a download that's merely still going.
+DOWNLOAD_START_SAFETY_TIMEOUT_S = int(os.environ.get('DOWNLOAD_START_SAFETY_TIMEOUT_S', '300'))
+# V16: split the single generic WMR timeout into per-phase budgets so a
+# stuck upload fails in seconds instead of burning the whole processing
+# window (and vice versa). WMR_TIMEOUT_S kept as the process default for
+# backwards compatibility with any env override.
+WMR_TIMEOUT_S = float(os.environ.get("WMR_TIMEOUT_S", "120"))
+WMR_UPLOAD_ACCEPT_TIMEOUT_S = float(os.environ.get("WMR_UPLOAD_ACCEPT_TIMEOUT_S", "25"))
+WMR_PROCESS_TIMEOUT_S = float(os.environ.get("WMR_PROCESS_TIMEOUT_S", str(WMR_TIMEOUT_S)))
+WMR_DOWNLOAD_START_TIMEOUT_S = float(os.environ.get("WMR_DOWNLOAD_START_TIMEOUT_S", "20"))
 SCREEN_W, SCREEN_H = (1920, 1080)
 VNC_PORT = 5900
 NOVNC_PORT = 6080
@@ -361,9 +487,19 @@ GEMINI_APP_URL = 'https://gemini.google.com/app'
 WMR_SERVICE_URL = 'https://app.gemini-logo-remover.workers.dev/gemini'
 WORKER_ID = f'queue_worker-{uuid.uuid4().hex[:8]}'
 
-def log(msg, file=None):
-    ts = time.strftime('%H:%M:%S')
-    print(f'[{ts}] {msg}', file=file, flush=True)
+def _silent_log(msg, file=None):
+    """Console-quiet replacement for the per-helper status prints.
+
+    PART 13: runtime helpers used to print fragments straight to the
+    notebook (CreateImg / ImgMode(confirmed) / UploadFiles / FileInput(3)
+    / Paste / Sent ...) while the actual browser showed plain 'Ask Gemini'
+    -- false-positive noise competing with the compact live dashboard.
+    Helpers now only RETURN results and update JOB_PROGRESS from verified
+    evidence; everything they observe goes to worker.log via this sink."""
+    return None
+
+
+log = _silent_log
 BASE_DIR = Path('/content/queue_worker_bundle')
 STATE_DIR = BASE_DIR / 'queue_worker_state'
 CHROME_PROFILE_DIR = STATE_DIR / 'chrome_profile'
@@ -383,16 +519,390 @@ _drive_cookies = Path('/content/drive/MyDrive/gemini-queue-worker/cookies.pkl')
 COOKIES_FILE = _drive_cookies if _drive_cookies.parent.parent.exists() else STATE_DIR / 'cookies.pkl'
 COOKIES_FILE.parent.mkdir(parents=True, exist_ok=True)
 
+# ==============================================================================
+# LIVE DASHBOARD -- console stays quiet after STEP 10; full forensic detail
+# (job IDs, GUIDs, exceptions, timings) goes to worker.log instead. The
+# dashboard is DISPLAY STATE ONLY: it reads GEMINI_BROKER/WMR_BROKER/
+# JOB_CONTEXTS/RUNTIME_HEALTH/LAST_QUEUE_COUNTS, it never creates a second
+# state machine, broker, or JobState enum.
+# ==============================================================================
+
+LOG_FILE = BASE_DIR / 'logs' / 'worker.log'
+LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+def append_runtime_log(msg: str):
+    """Full-detail forensic log -- console stays compact, this file doesn't."""
+    try:
+        with open(LOG_FILE, 'a', encoding='utf-8') as f:
+            f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}\n")
+    except Exception:
+        pass
+
+
+# The ORIGINAL timestamped console logger, kept under its own name for the
+# few genuinely user-facing lines (startup steps, fatal errors). Runtime
+# browser helpers must NEVER print per-action status to the notebook --
+# PART 13: their claims belong in worker.log + JOB_PROGRESS tokens only.
+def clog(msg, file=None):
+    ts = time.strftime('%H:%M:%S')
+    print(f'[{ts}] {msg}', file=file, flush=True)
+
+DASHBOARD_STATE = {
+    'queue': {'waiting': 0, 'active': 0, 'delayed': 0, 'local_active': 0, 'completed': 0, 'failed': 0, 'raw_downloads': 0, 'clean_downloads': 0},
+    'gemini': {f'T{i}': {} for i in range(MAX_CONCURRENT_TABS)},
+    'wmr': {f'W{i}-T{j}': {} for i in range(4) for j in range(2)},
+    'system': {'redis': 'OK', 'db': 'OK', 'r2': 'OK', 'bullmq': 'OK', 'download': 'OK', 'gemini': 'OK', 'wmr': 'OK'},
+    'last_event': '--',
+    'last_event_ts': None,
+    'start_time': time.time(),
+}
+
+def short_job_id(job_id):
+    """gen-0b0b664c-6442-43a3-bff8-38e6ba7ef7b9-1790325724229 -> gen-0b0b.
+    Full ID stays in JOB_CONTEXTS / worker.log; only the dashboard is short."""
+    if not job_id:
+        return '--'
+    text = str(job_id)
+    if len(text) <= 12:
+        return text
+    core = text[4:] if text.startswith('gen-') else text
+    return f'gen-{core[:4]}'
+
+def set_last_event(msg: str):
+    """The dashboard keeps exactly ONE latest event -- every new transition
+    replaces the previous one instead of accumulating a scrolling log in
+    the notebook. Full history still goes to worker.log."""
+    DASHBOARD_STATE['last_event'] = msg
+    DASHBOARD_STATE['last_event_ts'] = time.time()
+    append_runtime_log(f'[EVENT] {msg}')
+
+# ---------------------------------------------------------------------------
+# COMPACT ONE-LINE-PER-JOB LIVE PROGRESS (display-only layer)
+# This is NOT a second state machine: JobContext/JobState remains the sole
+# authority. JOB_PROGRESS merely mirrors VERIFIED browser events emitted by
+# the pipeline helpers (a ✅ token is only ever set after a real DOM check),
+# and the compact renderer reads it once per dashboard tick. Full forensic
+# detail stays in worker.log; the console shows one line per active job.
+# ---------------------------------------------------------------------------
+
+PROGRESS_STAGES = ['newchat', 'flash', 'picker', 'createimg', 'imgmode',
+                   'upload', 'attached', 'prompt', 'send', 'genstart',
+                   'image', 'download', 'dlraw', 'released', 'wmr', 'dlclean',
+                   'webp', 'settle', 'done']
+
+JOB_PROGRESS: Dict[str, dict] = {}
+
+JOB_SEQUENCE_LOCK = threading.Lock()
+JOB_SEQUENCE = 0
+
+
+def allocate_job_sequence() -> int:
+    """Display-only monotonic G1/G2/G3... counter -- never written to DB,
+    never used for correctness, purely so the live line can show a short
+    human-friendly job number instead of only a resource tag."""
+    global JOB_SEQUENCE
+    with JOB_SEQUENCE_LOCK:
+        JOB_SEQUENCE += 1
+        return JOB_SEQUENCE
+
+
+def _job_display_name(job_id: str) -> str:
+    """Compact human label for a job line: DB title/prompt head + ref count."""
+    try:
+        ctx = JOB_CONTEXTS.get(job_id)
+        payload = (ctx.payload if ctx else None) or {}
+        title = ''
+        params = payload.get('params') or {}
+        if isinstance(params, str):
+            try:
+                params = json.loads(params)
+            except Exception:
+                params = {}
+        if isinstance(params, dict):
+            title = str(params.get('title') or '')
+        if not title:
+            title = str(payload.get('primary_outfit_name') or '')
+        if not title:
+            title = str(payload.get('prompt') or '')[:60]
+        n_refs = len(ctx.reference_paths) if (ctx and ctx.reference_paths) else 0
+        title = re.sub(r'\s+', ' ', title).strip()[:48] or short_job_id(job_id)
+        return f'{title} ({n_refs} refs)' if n_refs else title
+    except Exception:
+        return short_job_id(job_id)
+
+
+JOB_PROGRESS_RETENTION_S = float(os.environ.get('JOB_PROGRESS_RETENTION_S', '120'))
+
+def job_progress_init(job_id: str):
+    prev = JOB_PROGRESS.get(job_id) or {}
+    prev_seq = (prev.get('details') or {}).get('seq')
+    JOB_PROGRESS[job_id] = {
+        'stages': {},          # stage -> 'run' | 'ok' | 'fail'
+        'details': {'seq': prev_seq or allocate_job_sequence()},
+        'attach': None,        # (actual, expected)
+        'error': None,         # STOP reason shown on the job line
+        'resource': None,      # T0..T3
+        'wmr_resource': None,  # W0-T0 ...
+        'image_at': None,      # timestamp of verified image detection
+        'dl_bytes': None,      # raw download size when file completes
+        'completed_at': None,
+        'failed': False,
+        # BullMQ-attempt counter carried across re-inits of the same job_id
+        # so staging dirs get isolated per attempt (no stale-file acceptance).
+        'attempt': int(prev.get('attempt') or 0) + 1,
+    }
+
+
+def _job_attempt(job_id: str) -> int:
+    p = JOB_PROGRESS.get(job_id)
+    return int(p.get('attempt') or 1) if p else 1
+
+
+def prune_job_progress():
+    """Remove completed/failed job lines after a retention window so a
+    long-running worker never leaks one dict entry per job forever."""
+    now = time.time()
+    for jid in [j for j, p in JOB_PROGRESS.items()
+                if (p.get('completed_at') or p.get('failed'))
+                and now - (p.get('completed_at') or p.get('failed_ts') or now) > JOB_PROGRESS_RETENTION_S]:
+        JOB_PROGRESS.pop(jid, None)
+
+
+def progress_detail(job_id: str, key: str, value):
+    """A browser helper NEVER prints directly -- it only records what it
+    verified here, and the single persistent per-job display line picks
+    it up. This is the ONLY way qualifiers like flash_current/
+    prompt_method/file_input_count reach the notebook."""
+    p = JOB_PROGRESS.get(job_id)
+    if p is None:
+        return
+    p.setdefault('details', {})[key] = value
+    refresh_job_line(job_id)
+
+
+def refresh_job_line(job_id: str):
+    """Re-render this job's current full state and push it to its ONE
+    persistent display slot (job:<job_id>) -- never a new notebook line,
+    just an update to the same one."""
+    line = render_job_line(job_id)
+    if line:
+        emit_live_event(f'job:{job_id}', line)
+
+
+def job_mark(job_id: str, stage: str, status: str):
+    """Update one stage token on the job's single live line. Only called
+    with status='ok' from call sites AFTER real browser verification."""
+    p = JOB_PROGRESS.get(job_id)
+    if p is None:
+        return
+    p['stages'][stage] = status
+    if status == 'fail':
+        p['failed'] = True
+        p.setdefault('failed_ts', time.time())
+    refresh_job_line(job_id)
+
+
+def job_stop(job_id: str, reason: str):
+    """Mark the current in-flight stage failed and pin the STOP reason on
+    the job's live line (compact console). Full evidence -> worker.log."""
+    p = JOB_PROGRESS.get(job_id)
+    if p is None:
+        return
+    for st in reversed(PROGRESS_STAGES):
+        if p['stages'].get(st) == 'run':
+            p['stages'][st] = 'fail'
+            break
+    p['error'] = reason[:120]
+    p['failed'] = True
+    p.setdefault('failed_ts', time.time())
+    refresh_job_line(job_id)
+
+
+def job_complete(job_id: str):
+    p = JOB_PROGRESS.get(job_id)
+    if p is not None:
+        p['completed_at'] = time.time()
+        refresh_job_line(job_id)
+
+
+def job_attach(job_id: str, actual, expected):
+    p = JOB_PROGRESS.get(job_id)
+    if p is None:
+        return
+    p['attach'] = (actual, expected)
+    d = p.setdefault('details', {})
+    d['file_input_count'] = actual
+    d['file_input_expected'] = expected
+    if expected is not None and actual >= expected:
+        d['attached'] = True
+    refresh_job_line(job_id)
+
+
+_STAGE_ICONS = {'run': '🔄', 'ok': '✅', 'fail': '❌'}
+
+
+def render_job_line(job_id: str) -> str:
+    """ONE physical line per job, rebuilt from JOB_PROGRESS every time
+    anything about this job changes. `details` (set only via
+    progress_detail()/job_attach(), only after a browser helper actually
+    verified something) drives the qualifier-bearing tokens
+    (SwitchFlash/Picker/Flash(role)/FileInput(n)/Paste/etc); `stages`
+    (set only via job_mark(), also only after real verification) drives
+    the plain run/ok/fail tokens for stages that don't need a qualifier.
+    Never truncated -- only the human title is capped."""
+    p = JOB_PROGRESS.get(job_id)
+    if p is None:
+        return ''
+    stages = p['stages']
+    d = p.get('details') or {}
+    tokens = []
+
+    # WAITING FOR A GEMINI RESOURCE (admitted into the pipeline, refs
+    # ready, but no T0-T3 free yet) -- shown only until NewChat actually
+    # starts, so a job doesn't render as a blank line while it's really
+    # queued up behind a busy Gemini resource.
+    if d.get('gemini_wait') and stages.get('newchat') is None:
+        tokens.append('⏸️WAIT Gemini')
+
+    # NEW CHAT
+    if stages.get('newchat') == 'run':
+        tokens.append('🔄NewChat')
+    elif stages.get('newchat') == 'ok':
+        tokens.append('✅NewChat')
+    elif stages.get('newchat') == 'fail':
+        tokens.append('❌NewChat')
+
+    # FLASH
+    if d.get('flash_verified'):
+        tokens.append('✅SwitchFlash')
+    elif stages.get('flash') == 'run':
+        cur = d.get('flash_current') or '?'
+        tokens.append(f'🔄SwitchFlash(cur:{cur})')
+    elif stages.get('flash') == 'fail':
+        tokens.append('❌Flash')
+    if d.get('flash_picker'):
+        tokens.append('🔽Picker(btn)')
+    if d.get('flash_role'):
+        tokens.append('✅Flash(role)')
+    if d.get('flash_verified'):
+        tokens.append('✅Flash(verified)')
+
+    # CREATE IMAGE
+    if d.get('createimg') or stages.get('createimg') == 'ok':
+        tokens.append('✅CreateImg')
+    elif stages.get('createimg') == 'run':
+        tokens.append('🔄CreateImg')
+    elif stages.get('createimg') == 'fail':
+        tokens.append('❌CreateImg')
+    if d.get('imgmode') or stages.get('imgmode') == 'ok':
+        tokens.append('✅ImgMode(confirmed)')
+
+    # UPLOAD
+    if d.get('upload_files'):
+        tokens.append('📁UploadFiles')
+    fi = d.get('file_input_count')
+    if fi is not None:
+        expected = d.get('file_input_expected')
+        tokens.append(f'📎FileInput({fi}/{expected})' if expected else f'📎FileInput({fi})')
+    if d.get('attached'):
+        tokens.append('✅Attached')
+
+    # PROMPT
+    prompt_method = d.get('prompt_method')
+    if prompt_method:
+        label = 'Paste' if prompt_method.lower() in ('clipboard', 'paste') else prompt_method
+        tokens.append(f'✏️{label}✅')
+    elif stages.get('prompt') == 'run':
+        tokens.append('✏️Prompt…')
+    elif stages.get('prompt') == 'fail':
+        tokens.append('❌Prompt')
+
+    # SEND
+    if d.get('sent'):
+        tokens.append('✅Sent')
+    elif stages.get('send') == 'run':
+        tokens.append('📤Sending…')
+    elif stages.get('send') == 'fail':
+        tokens.append('❌Send')
+
+    # GENERATION
+    if stages.get('genstart') == 'ok':
+        tokens.append('🧠Generating')
+    elif d.get('waiting_generation'):
+        tokens.append('→ Waiting gen…')
+
+    # IMAGE
+    if p.get('image_at'):
+        tokens.append(f"🖼️{int(time.time() - p['image_at'])}s")
+    elif d.get('image_detected'):
+        tokens.append('🖼️Image')
+
+    # RAW DOWNLOAD / RELEASE
+    if p.get('dl_bytes'):
+        tokens.append(f"⬇️DL({p['dl_bytes'] // 1024}KB)")
+    elif stages.get('dlraw') == 'run':
+        tokens.append('⬇️DL…')
+    if d.get('gemini_released') or stages.get('released') == 'ok':
+        tokens.append('✅Released')
+
+    # WMR
+    if d.get('wmr_resource'):
+        tokens.append(f"🧼WMR[{d['wmr_resource']}]")
+    if d.get('wmr_done') or stages.get('wmr') == 'ok':
+        tokens.append('✅WMR')
+    elif stages.get('wmr') == 'run':
+        tokens.append('🔄WMR')
+
+    # CLEAN DOWNLOAD / FINALIZE
+    if p.get('dlclean_bytes'):
+        tokens.append(f"⬇️Clean({p['dlclean_bytes'] // 1024}KB)")
+    if d.get('webp') or stages.get('webp') == 'ok':
+        tokens.append('✅WebP')
+    if d.get('r2') or stages.get('r2') == 'ok':
+        tokens.append('✅R2')
+    if d.get('db') or stages.get('db') == 'ok':
+        tokens.append('✅DB')
+    if d.get('credits_failed'):
+        tokens.append('⚠️Credits')
+    elif d.get('credits') or stages.get('settle') == 'ok':
+        tokens.append('✅Credits')
+
+    if p.get('completed_at'):
+        tokens.append('🎉DONE')
+
+    if p.get('failed'):
+        head = '🔴'
+    elif p.get('completed_at'):
+        head = '🖼️'
+    else:
+        head = '🟢'
+    res = p.get('resource') or '--'
+    wres = p.get('wmr_resource')
+    tag = f"{res}" + (f"/{wres}" if wres else "")
+    seq = d.get('seq')
+    seq_tag = f"G{seq}/{tag}" if seq else tag
+    line = f"{head} [{seq_tag}] {_job_display_name(job_id)} | " + ' | '.join(tokens)
+    if p.get('error'):
+        line += f" | STOP {p['error']}"
+    return line
+
+
 def get_chrome_job_dir(tab_id: int, job_id: str):
-    """Returns (job_dir, incoming_dir) for Chrome downloads."""
-    job_dir = CHROME_DL_BASE / f'T{tab_id}' / job_id
+    """Returns (job_dir, incoming_dir) for Chrome downloads.
+    ATTEMPT ISOLATION: path is T{tab}/attempt-{N}/{job_id}/incoming -- a
+    BullMQ retry of the same job_id gets a brand-new directory and can
+    never accept a stale leftover file from a previous attempt."""
+    attempt = _job_attempt(job_id)
+    job_dir = CHROME_DL_BASE / f'T{tab_id}' / f'attempt-{attempt}' / job_id
     incoming = job_dir / 'incoming'
     incoming.mkdir(parents=True, exist_ok=True)
     return (job_dir, incoming)
 
 def get_wmr_job_dir(chrome_tab_id: int, job_id: str):
-    """Returns (job_dir, incoming_dir) for WMR Chrome output. Named by T-slot, not W-slot."""
-    job_dir = WMR_DL_BASE / f'T{chrome_tab_id}' / job_id
+    """Returns (job_dir, incoming_dir) for WMR Chrome output. Named by T-slot, not W-slot.
+    Attempt-isolated for the same reason as get_chrome_job_dir()."""
+    attempt = _job_attempt(job_id)
+    job_dir = WMR_DL_BASE / f'T{chrome_tab_id}' / f'attempt-{attempt}' / job_id
     incoming = job_dir / 'incoming'
     incoming.mkdir(parents=True, exist_ok=True)
     return (job_dir, incoming)
@@ -414,7 +924,8 @@ _u = urlparse(REDIS_URL or "")
 print(f"  Redis: {_u.scheme}://{_u.hostname}:{_u.port or 6379} (credentials={'configured' if _u.password else 'none'})")
 print(f'  Chrome Profile:    {CHROME_PROFILE_DIR}')
 print(f'  WMR Profiles:      {WMR_PROFILES_BASE}/W{{0-3}}')
-print(f'  Max Chrome Tabs:   {MAX_CONCURRENT_TABS} (T0-T3)')
+print(f'  Max Gemini Tabs:   {MAX_CONCURRENT_TABS} (T0-T{MAX_CONCURRENT_TABS - 1})')
+print(f'  Gemini resources:  {",".join(f"T{i}" for i in range(MAX_CONCURRENT_TABS))}')
 print(f'  WMR Chrome Workers: {CHROME_WMR_WORKERS} (W0-W3)')
 print('  ✅ Secrets and directories configured successfully.\n')
 print('=' * 80)
@@ -436,8 +947,7 @@ def run_cmd(cmd, desc='', timeout=120):
         if desc:
             print(f'  ⚠️ Error during {desc}: {e}')
         return False
-print('  Installing Python packages...')
-run_cmd('pip install -q bullmq psycopg2-binary boto3 selenium Pillow websockets nest_asyncio undetected-chromedriver webdriver-manager pyvirtualdisplay setuptools numpy requests', 'pip install')
+print('  Python packages already checked/installed by bootstrap_dependencies() above (only-if-missing) -- not reinstalling here.')
 print('  ✅ Python packages ready.')
 print('  Installing system packages...')
 run_cmd('apt-get update -qq && apt-get install -y -qq wget curl xvfb x11vnc novnc websockify fluxbox net-tools procps unzip zip xclip xsel dbus-x11 python3-numpy python3-websockify', 'system packages')
@@ -576,20 +1086,22 @@ def download_remote_image(url, dest_dir):
     if dest.exists() and dest.stat().st_size > 0:
         return str(dest)
     req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+    PERMANENT_HTTP_STATUS = {400, 401, 403, 404, 410}
     last_err = None
     for attempt in range(1, 5):
         try:
             with urllib.request.urlopen(req, timeout=15) as resp:
                 dest.write_bytes(resp.read())
             return str(dest)
+        except urllib.error.HTTPError as e:
+            last_err = e
+            if e.code in PERMANENT_HTTP_STATUS:
+                raise RuntimeError(f'REF_HTTP_PERMANENT_FAILURE status={e.code}: {e}') from e
+            time.sleep(2 ** attempt)
         except Exception as e:
             last_err = e
             time.sleep(2 ** attempt)
     raise RuntimeError(f'REF_DOWNLOAD_FAILED (exhausted 4 retries): {last_err}')
-    req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-    with urllib.request.urlopen(req, timeout=25) as resp:
-        dest.write_bytes(resp.read())
-    return str(dest)
 
 def push_generation(image_path, prompt, user_id=None, params=None, gen_id=None, webp_path=None, force=False):
     if not fs_configured():
@@ -659,59 +1171,130 @@ def _kill_port(port):
         pass
     time.sleep(0.3)
 
+def _proc_alive(proc):
+    """Most callers pass a real subprocess.Popen (x11vnc/websockify/
+    cloudflared), where .poll() is the correct liveness check. But
+    V16_STATE.display_obj is a pyvirtualdisplay.Display instance on the
+    cell-rerun reuse path -- it has no .poll() at all, so calling this on
+    it raised AttributeError instead of ever reaching the real liveness
+    check. Every call site already ANDs this with an independent liveness
+    proof (_xdisplay_healthy()/_port_open()), so for a non-Popen object we
+    just confirm it's not None and defer to that other check."""
+    if proc is None:
+        return False
+    poll = getattr(proc, 'poll', None)
+    if callable(poll):
+        return poll() is None
+    return True
+
+def _xdisplay_healthy(display_name):
+    try:
+        if shutil.which('xdpyinfo'):
+            env = dict(os.environ)
+            env['DISPLAY'] = display_name
+            result = subprocess.run(['xdpyinfo'], env=env, capture_output=True, text=True, timeout=5)
+            return result.returncode == 0
+        return os.path.exists(f"/tmp/.X11-unix/X{display_name.lstrip(':')}")
+    except Exception:
+        return False
+
 def start_display():
+    """Reuses a healthy X display across cell re-runs in the same Colab
+    kernel instead of pkilling and recreating Xvfb every time -- this file
+    is one giant pasted cell that gets re-executed, and a healthy Xvfb
+    costs nothing to keep. Only creates a new one if none is alive."""
     global _display_obj
-    run_cmd('pkill -f Xvfb', 'pkill xvfb')
-    time.sleep(0.3)
+    existing_display = os.environ.get('DISPLAY')
+    if existing_display and _xdisplay_healthy(existing_display) and _proc_alive(V16_STATE.display_obj):
+        _display_obj = V16_STATE.display_obj
+        print(f'  ♻️  Reusing healthy X display {existing_display}.')
+        return existing_display
     try:
         _display_obj = Display(visible=0, size=(SCREEN_W, SCREEN_H))
         _display_obj.start()
-        os.environ['DISPLAY'] = f':{_display_obj.display}'
-        print(f'  ✅ Display :{_display_obj.display} running at {SCREEN_W}x{SCREEN_H}.')
+        display_name = f':{_display_obj.display}'
+        os.environ['DISPLAY'] = display_name
+        if _xdisplay_healthy(display_name):
+            V16_STATE.display_obj = _display_obj
+            print(f'  ✅ Display {display_name} running at {SCREEN_W}x{SCREEN_H}.')
+            return display_name
     except Exception as e:
         print(f'  ⚠️ pyvirtualdisplay fallback: {e}')
-        subprocess.Popen(['Xvfb', ':99', '-screen', '0', f'{SCREEN_W}x{SCREEN_H}x24', '-ac'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        os.environ['DISPLAY'] = ':99'
-        time.sleep(1.0)
-        print('  ✅ Display :99 running.')
+    display_name = ':99'
+    if not _xdisplay_healthy(display_name):
+        subprocess.Popen(['Xvfb', display_name, '-screen', '0', f'{SCREEN_W}x{SCREEN_H}x24', '-ac'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            if _xdisplay_healthy(display_name):
+                break
+            time.sleep(0.25)
+    os.environ['DISPLAY'] = display_name
+    print(f'  ✅ Display {display_name} running.')
+    return display_name
 
 def start_vnc():
+    """Reuses healthy x11vnc/websockify across cell re-runs instead of
+    pkilling them every time -- a live, working VNC stack should never be
+    torn down just because the pasted cell ran again."""
     global _x11vnc_proc, _novnc_proc
     disp = os.environ.get('DISPLAY', ':99')
-    run_cmd('pkill -f x11vnc', 'pkill x11vnc')
-    run_cmd('pkill -f websockify', 'pkill websockify')
-    run_cmd('pkill -f fluxbox', 'pkill fluxbox')
-    _kill_port(VNC_PORT)
-    _kill_port(NOVNC_PORT)
-    time.sleep(0.5)
-    subprocess.Popen(['fluxbox'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    time.sleep(0.4)
-    _x11vnc_proc = subprocess.Popen(['x11vnc', '-display', disp, '-forever', '-nopw', '-quiet', '-rfbport', str(VNC_PORT), '-shared'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    time.sleep(1.0)
-    _wait_for_port(VNC_PORT, 'x11vnc', max_wait=10)
-    novnc_web_dir = None
-    for p in ['/usr/share/novnc', '/usr/share/noVNC', '/opt/novnc', '/opt/noVNC', '/usr/local/share/novnc']:
-        if os.path.isfile(os.path.join(p, 'vnc.html')) or os.path.isfile(os.path.join(p, 'vnc_lite.html')):
-            novnc_web_dir = p
-            break
-    if novnc_web_dir:
-        vnc_html = os.path.join(novnc_web_dir, 'vnc.html')
-        vnc_lite = os.path.join(novnc_web_dir, 'vnc_lite.html')
-        if not os.path.isfile(vnc_html) and os.path.isfile(vnc_lite):
-            shutil.copy(vnc_lite, vnc_html)
-    cmd = ['websockify', '--web', novnc_web_dir, str(NOVNC_PORT), f'localhost:{VNC_PORT}'] if novnc_web_dir else ['websockify', str(NOVNC_PORT), f'localhost:{VNC_PORT}']
-    _novnc_proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    time.sleep(1.0)
-    _wait_for_port(NOVNC_PORT, 'noVNC/websockify', max_wait=10)
+
+    if _port_open(VNC_PORT) and _proc_alive(V16_STATE.x11vnc_proc):
+        _x11vnc_proc = V16_STATE.x11vnc_proc
+        print('  ♻️  Reusing healthy x11vnc.')
+    elif _port_open(VNC_PORT):
+        print('  ♻️  x11vnc port already healthy; reusing existing service.')
+    else:
+        subprocess.Popen(['fluxbox'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        time.sleep(0.4)
+        _x11vnc_proc = subprocess.Popen(['x11vnc', '-display', disp, '-forever', '-nopw', '-quiet', '-rfbport', str(VNC_PORT), '-shared'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        V16_STATE.x11vnc_proc = _x11vnc_proc
+        _wait_for_port(VNC_PORT, 'x11vnc', max_wait=10)
+
+    if _port_open(NOVNC_PORT) and _proc_alive(V16_STATE.novnc_proc):
+        _novnc_proc = V16_STATE.novnc_proc
+        print('  ♻️  Reusing healthy noVNC/websockify.')
+    elif _port_open(NOVNC_PORT):
+        print('  ♻️  noVNC port already healthy; reusing existing service.')
+    else:
+        novnc_web_dir = None
+        for p in ['/usr/share/novnc', '/usr/share/noVNC', '/opt/novnc', '/opt/noVNC', '/usr/local/share/novnc']:
+            if os.path.isfile(os.path.join(p, 'vnc.html')) or os.path.isfile(os.path.join(p, 'vnc_lite.html')):
+                novnc_web_dir = p
+                break
+        if novnc_web_dir:
+            vnc_html = os.path.join(novnc_web_dir, 'vnc.html')
+            vnc_lite = os.path.join(novnc_web_dir, 'vnc_lite.html')
+            if not os.path.isfile(vnc_html) and os.path.isfile(vnc_lite):
+                shutil.copy(vnc_lite, vnc_html)
+        cmd = ['websockify', '--web', novnc_web_dir, str(NOVNC_PORT), f'localhost:{VNC_PORT}'] if novnc_web_dir else ['websockify', str(NOVNC_PORT), f'localhost:{VNC_PORT}']
+        _novnc_proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        V16_STATE.novnc_proc = _novnc_proc
+        _wait_for_port(NOVNC_PORT, 'noVNC/websockify', max_wait=10)
 
 def start_novnc_tunnel():
+    """Reuses an existing Cloudflare tunnel across cell re-runs -- a live
+    tunnel URL stays valid, so pkilling cloudflared just to mint a brand
+    new (different) public URL on every re-run is pure churn."""
     global _cf_proc
     local_url = f'http://localhost:{NOVNC_PORT}'
+
+    if _proc_alive(V16_STATE.cf_proc) and V16_STATE.tunnel_url:
+        _cf_proc = V16_STATE.cf_proc
+        tb = V16_STATE.tunnel_url
+        vnc_url = f'{tb}/vnc.html?autoconnect=true&resize=scale'
+        print(f'  ♻️  Reusing existing Cloudflare tunnel: {tb}')
+        try:
+            _banner = f"<div style='background:linear-gradient(135deg,#1b5e20,#2e7d32);color:white;padding:16px;border-radius:10px;font-size:15px;font-weight:bold;margin:10px 0;box-shadow:0 4px 6px rgba(0,0,0,0.3);'>🖥️ <b>noVNC Remote Desktop Stream:</b><br><br>🌐 <a href='{vnc_url}' target='_blank' style='color:#a7ffeb;text-decoration:underline;'>Open Live UI ({vnc_url})</a><br></div>"
+            ipy_display(HTML(_banner))
+        except Exception:
+            pass
+        print(f'  🌐 noVNC Public Link: {vnc_url}')
+        return tb
+
     cf_bin = '/usr/local/bin/cloudflared'
     if os.path.exists(cf_bin):
         try:
-            run_cmd('pkill -f cloudflared', 'pkill cloudflared')
-            time.sleep(0.5)
             _cf_proc = subprocess.Popen([cf_bin, 'tunnel', '--url', local_url], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
             deadline = time.time() + 30
             while time.time() < deadline:
@@ -729,6 +1312,8 @@ def start_novnc_tunnel():
                     except Exception:
                         pass
                     print(f'  🌐 noVNC Public Link: {vnc_url}')
+                    V16_STATE.cf_proc = _cf_proc
+                    V16_STATE.tunnel_url = tb
                     return tb
         except Exception as e:
             print(f'  ⚠️ noVNC tunnel notice: {e}')
@@ -743,17 +1328,35 @@ print('=' * 80)
 print('🌐 STEP 6: INITIALIZING PERSISTENT CHROME DRIVERS')
 print('=' * 80)
 
-def set_tab_download_dir(drv, path):
+def set_tab_download_dir(drv, path, resource_id=''):
+    """Sets the download destination for the CURRENTLY ACTIVE tab only.
+    Browser.setDownloadBehavior is browser-context scoped, not tab scoped
+    -- calling it per-job with a different path (as this used to do)
+    meant T1's job setting its own path would silently redirect T0's
+    (or any other tab's) in-flight download to T1's folder, since the
+    browser-context-level path applies to the whole shared Gemini Chrome
+    profile, not just the tab that called it. Page.setDownloadBehavior is
+    the actual per-tab/per-target mechanism and is safe to call per job.
+    Browser.setDownloadBehavior(eventsEnabled=True) is still needed once,
+    browser-wide, to make Browser.downloadWillBegin fire at all (the only
+    source of real download GUIDs used elsewhere in this file) -- that is
+    now set exactly once at driver creation in create_chrome_driver(),
+    never here.
+
+    Returns True/False -- callers must not assume this silently succeeded.
+    A failed CDP call here means every download for this job goes to
+    whatever Chrome's actual default directory is instead, and nothing
+    downstream would ever look there -- that must be visible in
+    worker.log, never swallowed."""
     ap = os.path.abspath(str(path))
     os.makedirs(ap, exist_ok=True)
     try:
         drv.execute_cdp_cmd('Page.setDownloadBehavior', {'behavior': 'allow', 'downloadPath': ap})
-    except Exception:
-        pass
-    try:
-        drv.execute_cdp_cmd('Browser.setDownloadBehavior', {'behavior': 'allow', 'downloadPath': ap, 'eventsEnabled': False})
-    except Exception:
-        pass
+        append_runtime_log(f"[DOWNLOAD-DIR] DOWNLOAD_DIR_SET resource={resource_id or '?'} path={ap}")
+        return True
+    except Exception as e:
+        append_runtime_log(f"[DOWNLOAD-DIR] DOWNLOAD_DIR_SET_FAILED resource={resource_id or '?'} path={ap} error={e}")
+        return False
 
 def create_chrome_driver():
     for fname in ['SingletonLock', 'SingletonCookie', 'SingletonSocket']:
@@ -777,13 +1380,35 @@ def create_chrome_driver():
     opts.add_argument('--disable-features=IdentityConsistencyBrowserUI,SyncPromoUI')
     opts.add_argument('--disable-features=IsolateOrigins,site-per-process')
     opts.add_argument('--disable-site-isolation-trials')
+    opts.add_argument('--disable-notifications')
     opts.add_experimental_option('excludeSwitches', ['enable-automation'])
     opts.add_experimental_option('useAutomationExtension', False)
-    prefs = {'download.default_directory': str(CHROME_DL_BASE), 'download.prompt_for_download': False, 'download.directory_upgrade': True, 'safebrowsing.enabled': False, 'safebrowsing.disable_download_protection': True, 'profile.default_content_setting_values.automatic_downloads': 1}
+    # profile.default_content_setting_values.notifications=2 blocks the
+    # "gemini.google.com wants to Show notifications" permission popup --
+    # it can sit on top of and occlude the composer's + button, which is a
+    # plausible cause of some of the "file input not found"/click-target
+    # failures seen in production.
+    prefs = {'download.default_directory': str(CHROME_DL_BASE), 'download.prompt_for_download': False, 'download.directory_upgrade': True, 'safebrowsing.enabled': False, 'safebrowsing.disable_download_protection': True, 'profile.default_content_setting_values.automatic_downloads': 1, 'profile.default_content_setting_values.notifications': 2}
     opts.add_experimental_option('prefs', prefs)
+    # Required for _detect_download_start()'s driver.get_log('performance')
+    # to return anything at all -- without this capability Chrome never
+    # records Browser.downloadWillBegin events, so the "cdp" GUID path was
+    # silently unreachable and every download fell back to filesystem
+    # detection regardless of Chrome's actual download behavior.
+    opts.set_capability('goog:loggingPrefs', {'performance': 'ALL'})
     drv = webdriver.Chrome(options=opts)
     try:
         drv.execute_cdp_cmd('Network.enable', {})
+    except Exception:
+        pass
+    try:
+        # Enables Browser.downloadWillBegin events browser-wide, exactly
+        # ONCE at driver creation -- never per-job. The downloadPath here
+        # is just a startup default; each job's actual per-tab destination
+        # is set separately by set_tab_download_dir() via the tab-scoped
+        # Page.setDownloadBehavior, which does not touch this browser-level
+        # setting.
+        drv.execute_cdp_cmd('Browser.setDownloadBehavior', {'behavior': 'allow', 'downloadPath': str(CHROME_DL_BASE), 'eventsEnabled': True})
     except Exception:
         pass
     return drv
@@ -818,15 +1443,32 @@ def create_wmr_chrome_driver(resource_id: str) -> webdriver.Chrome:
     opts.add_experimental_option('useAutomationExtension', False)
     prefs = {'download.default_directory': dl_dir_str, 'download.prompt_for_download': False, 'download.directory_upgrade': True, 'safebrowsing.enabled': False, 'safebrowsing.disable_download_protection': True, 'profile.default_content_setting_values.automatic_downloads': 1}
     opts.add_experimental_option('prefs', prefs)
+    opts.set_capability('goog:loggingPrefs', {'performance': 'ALL'})
     drv = webdriver.Chrome(options=opts)
     try:
         drv.execute_cdp_cmd('Page.setDownloadBehavior', {'behavior': 'allow', 'downloadPath': dl_dir_str})
     except Exception:
         pass
-    log(f'[WMR-{resource_id}] Browser = Google Chrome  staging={staging_dir}')
+    try:
+        drv.execute_cdp_cmd('Browser.setDownloadBehavior', {'behavior': 'allow', 'downloadPath': dl_dir_str, 'eventsEnabled': True})
+    except Exception:
+        pass
+    append_runtime_log(f'[WMR-{resource_id}] Browser = Google Chrome  staging={staging_dir}')
     return drv
-print('  Launching Google Chrome with persistent profile...')
-chrome_driver = create_chrome_driver()
+chrome_driver = None
+if V16_STATE.chrome_driver is not None:
+    try:
+        _ = V16_STATE.chrome_driver.window_handles  # proves the old session is actually alive
+        chrome_driver = V16_STATE.chrome_driver
+        print('  Reusing existing Chrome driver from a previous run of this cell...')
+    except Exception:
+        print('  Previous Chrome driver is dead (window/session gone) -- launching a fresh one...')
+        chrome_driver = None
+
+if chrome_driver is None:
+    print('  Launching Google Chrome with persistent profile...')
+    chrome_driver = create_chrome_driver()
+    V16_STATE.chrome_driver = chrome_driver
 print(f'  ✅ Google Chrome driver ready (PID: {chrome_driver.service.process.pid}).\n')
 print('=' * 80)
 print('🔐 STEP 7: VERIFYING GOOGLE / GEMINI LOGIN STATE')
@@ -986,7 +1628,9 @@ def display_page_info(details, step_name=''):
     print('\n' + '=' * 70)
     print(f'📋 PAGE INFORMATION - {step_name}')
     if details['verification_number']:
-        print(f"🔢 VERIFICATION NUMBER: {details['verification_number']} 🔢🔢")
+        print('=' * 70)
+        print(f"🔢🔢 VERIFICATION NUMBER: {details['verification_number']} 🔢🔢")
+        print(f"📱 Check your phone and tap '{details['verification_number']}', then tap 'Yes' to approve")
     print('=' * 70)
 
 def take_screenshot(driver, step_name):
@@ -1031,10 +1675,13 @@ def detect_push_notification_verification(driver):
     except:
         return False
 
-def wait_for_push_notification_approval(driver, max_wait_seconds=60):
+def wait_for_push_notification_approval(driver, max_wait_seconds=60, verification_number=None):
     checks = max_wait_seconds // 5
     for check in range(1, checks + 1):
-        print(f'\n🔍 Check {check}/{checks}')
+        if verification_number:
+            print(f"\n🔍 Check {check}/{checks} -- tap '{verification_number}' on your phone")
+        else:
+            print(f'\n🔍 Check {check}/{checks}')
         for remaining in range(5, 0, -1):
             print(f'\r Waiting for approval: {remaining}s ', end='', flush=True)
             time.sleep(1)
@@ -1050,7 +1697,11 @@ def handle_verification_code_with_retry(driver, wait, max_attempts=3):
             display_page_info(page_details, f'Verification Attempt {attempt}')
             if detect_push_notification_verification(driver):
                 take_screenshot(driver, f'push_notification_attempt_{attempt}')
-                if wait_for_push_notification_approval(driver, max_wait_seconds=60 if attempt == 1 else 30):
+                if wait_for_push_notification_approval(
+                    driver,
+                    max_wait_seconds=60 if attempt == 1 else 30,
+                    verification_number=page_details.get('verification_number'),
+                ):
                     return True
                 if comprehensive_login_check(driver):
                     return True
@@ -1303,7 +1954,7 @@ def convert_to_webp(png_path, max_size_kb=800):
                 return webp_path
         return webp_path
     except Exception as e:
-        log(f'  ⚠️ WebP conversion failed: {e}')
+        append_runtime_log(f'  ⚠️ WebP conversion failed: {e}')
         return None
 
 def validate_image_file(path, min_size=DOWNLOAD_MIN_SIZE):
@@ -1362,6 +2013,42 @@ def _wmr_find_file_input(drv):
     inputs = drv.find_elements(By.CSS_SELECTOR, "input[type='file']")
     return inputs[0] if inputs else None
 
+def _wmr_wait_for_upload_accepted(drv, timeout_s: float) -> bool:
+    """POSITIVE browser evidence that WMR actually accepted the file:
+    an 'after'/preview image appeared, or the page reports a
+    processing/detecting busy state. send_keys() returning is NOT proof
+    -- without this check a silent rejection used to burn the full
+    processing timeout.
+
+    Previously this checked the URL for a lack of "upload" in the path
+    (plus an exact watermarkremover.io homepage match) -- a pattern
+    inherited from a different WMR provider. The real production
+    WMR_SERVICE_URL's path never contains "upload" at all, so that
+    check was true from the very first poll regardless of whether the
+    upload actually took, making this function a no-op rubber stamp.
+    Replaced with the same preview-image/busy-text signals
+    _wmr_check_status() already uses successfully for this exact site."""
+    t0 = time.time()
+    while time.time() - t0 < timeout_s:
+        try:
+            res = drv.execute_script(
+                "var imgs=document.querySelectorAll('img');"
+                "for(var i=0;i<imgs.length;i++){"
+                "  var alt=(imgs[i].getAttribute('alt')||'').toLowerCase();"
+                "  var src=imgs[i].getAttribute('src')||'';"
+                "  if((alt.indexOf('after')!==-1||src.indexOf('blob:')===0||src.indexOf('data:')===0)&&imgs[i].offsetParent!==null) return 'PREVIEW';"
+                "}"
+                "var t=document.body?document.body.innerText.toLowerCase():'';"
+                "if(t.indexOf('detecting')!==-1||t.indexOf('processing')!==-1) return 'BUSY';"
+                "return 'WAIT';")
+            if res in ('PREVIEW', 'BUSY'):
+                append_runtime_log(f'[WMR] UPLOAD_ACCEPTED via={res} elapsed={time.time()-t0:.1f}s')
+                return True
+        except Exception:
+            pass
+        time.sleep(0.5)
+    return False
+
 def _wmr_check_status(drv):
     js_code = "\n        var btns = document.querySelectorAll('button');\n        for (var i = 0; i < btns.length; i++) {\n            var btn = btns[i];\n            var txt = (btn.textContent || '').trim();\n            if (txt.indexOf('Download PNG') !== -1 || txt.indexOf('Save') !== -1) {\n                var style = window.getComputedStyle(btn);\n                var isVisible = style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0';\n                if (isVisible && !btn.disabled) {\n                    return 'DONE';\n                }\n            }\n        }\n        var imgs = document.querySelectorAll('img');\n        for (var i = 0; i < imgs.length; i++) {\n            var alt = (imgs[i].getAttribute('alt') || '').toLowerCase();\n            var src = imgs[i].getAttribute('src') || '';\n            if (alt.indexOf('after') !== -1 && (src.indexOf('blob:') === 0 || src.indexOf('data:') === 0)) {\n                return 'DONE';\n            }\n        }\n        var allText = document.body ? document.body.innerText.toLowerCase() : '';\n        if (allText.indexOf('detecting') !== -1 || allText.indexOf('processing') !== -1) {\n            return 'BUSY';\n        }\n        if (allText.indexOf('not detected') !== -1 || allText.indexOf('no watermark') !== -1) {\n            for (var i = 0; i < btns.length; i++) {\n                var txt = (btns[i].textContent || '').trim();\n                if (txt.indexOf('Download PNG') !== -1 || txt.indexOf('Save') !== -1) {\n                    return 'DONE';\n                }\n            }\n            return 'NOT_FOUND';\n        }\n        if (allText.length < 10) return 'LOADING';\n        return 'BUSY';\n    "
     res = safe_execute_script(drv, js_code)
@@ -1407,7 +2094,7 @@ def _wmr_wait_for_new_file(incoming_dir: Path, files_before: set, timeout=30) ->
     return None
 print(f'  ✅ Chrome WMR Pool initialized (LAZY — workers W0-W{CHROME_WMR_WORKERS - 1} created on demand).\n')
 print('=' * 80)
-print(f'📑 STEP 9: CONFIGURING LAZY CHROME MULTI-TAB POOL ({MAX_CONCURRENT_TABS} SLOTS: T0-T3)')
+print(f'📑 STEP 9: CONFIGURING LAZY CHROME MULTI-TAB POOL ({MAX_CONCURRENT_TABS} SLOTS: T0-T{MAX_CONCURRENT_TABS - 1})')
 print('=' * 80)
 S_IDLE = 'IDLE'
 S_NEW_CHAT = 'NEW_CHAT'
@@ -1420,28 +2107,90 @@ chrome_lock = asyncio.Lock()
 def _make_tab_state(tid: int, handle=None) -> dict:
     return {'tab_id': tid, 'name': f'T{tid}', 'handle': handle, 'state': S_IDLE, 'job': None, 'job_id': None, 'gen': None, 'prompt': None, 'refs': [], 'start_time': 0.0, 'last_poll': 0.0, 'next_poll': 0.0, 'urls_before': set(), 'chat_urls': set(), 'target_src': None, 'download_started': False, 'stuck_polls': 0, 'future': None, 'attempt': 0}
 
+def _ensure_chrome_alive():
+    """Detect a fully-dead shared chrome_driver PROCESS (not just one closed
+    tab) and relaunch it, clearing every GeminiWorker's stale handle.
+
+    Shared by _create_gemini_tab() (first-time tab creation, e.g. when a job
+    arrives for a slot that never had a physical tab yet) and
+    _recover_gemini_resource() (periodic health-check recovery), so a
+    browser crash self-heals on the very next tab request instead of only
+    once the slower periodic recovery pass happens to run next.
+    """
+    global chrome_driver
+    try:
+        _ = chrome_driver.window_handles
+        return
+    except Exception:
+        pass
+    append_runtime_log("[CHROME] SHARED CHROME PROCESS IS DEAD -- relaunching browser")
+    try:
+        chrome_driver.quit()
+    except Exception:
+        pass
+    chrome_driver = create_chrome_driver()
+    V16_STATE.chrome_driver = chrome_driver
+    for w in GEMINI_WORKERS.values():
+        w.handle = None
+        w.driver = None
+
 def _create_gemini_tab(tid: int) -> str:
     """
     Physically create a new Chrome tab for logical slot T{tid}.
     Always creates a NEW tab so the anchor tab is never consumed.
+    Retries up to 3 times, self-healing via _ensure_chrome_alive() if the
+    whole browser process died between attempts.
     """
-    if not chrome_driver.window_handles:
-        raise RuntimeError('BROWSER_SESSION_DEAD: No anchor window exists. Session is broken.')
-    before = set(chrome_driver.window_handles)
-    chrome_driver.execute_cdp_cmd('Target.createTarget', {'url': GEMINI_APP_URL})
-    deadline = time.time() + 5.0
-    handle = None
-    while time.time() < deadline:
-        diff = set(chrome_driver.window_handles) - before
-        if diff:
-            handle = list(diff)[0]
-            break
-        time.sleep(0.2)
-    if not handle:
-        raise RuntimeError(f'Tab T{tid}: Failed to create physical tab via CDP')
-    chrome_driver.switch_to.window(handle)
-    time.sleep(1.0)
-    return handle
+    last_err = None
+    for attempt in range(1, 4):
+        p = f'[TAB-CREATE][T{tid}][a{attempt}]'
+        try:
+            append_runtime_log(f'{p} TAB_CREATE_START')
+            _ensure_chrome_alive()
+            existing_handles = list(chrome_driver.window_handles)
+            append_runtime_log(f'{p} existing_handles={existing_handles}')
+            if not existing_handles:
+                append_runtime_log(f'{p} TAB_CREATE_NO_ANCHOR')
+                raise RuntimeError('BROWSER_SESSION_DEAD: No anchor window exists. Session is broken.')
+            anchor_handle = chrome_driver.current_window_handle
+            before = set(existing_handles)
+            append_runtime_log(f'{p} anchor_handle={anchor_handle} before_handles={sorted(before)}')
+            cdp_result = chrome_driver.execute_cdp_cmd('Target.createTarget', {'url': GEMINI_APP_URL})
+            append_runtime_log(f'{p} Target.createTarget result={cdp_result}')
+            deadline = time.time() + 5.0
+            handle = None
+            while time.time() < deadline:
+                diff = set(chrome_driver.window_handles) - before
+                if diff:
+                    handle = list(diff)[0]
+                    break
+                time.sleep(0.2)
+            after_handles = list(chrome_driver.window_handles)
+            append_runtime_log(f'{p} after_handles={after_handles} new_handle={handle}')
+            if not handle:
+                append_runtime_log(f'{p} TAB_CREATE_HANDLE_NOT_OBSERVED cdp_reported_targetId={cdp_result.get("targetId") if isinstance(cdp_result, dict) else None}')
+                raise RuntimeError(f'Tab T{tid}: Failed to create physical tab via CDP (attempt {attempt}/3)')
+            try:
+                chrome_driver.switch_to.window(handle)
+                switch_success = True
+            except Exception as switch_err:
+                append_runtime_log(f'{p} TAB_CREATE_SWITCH_FAILED: {switch_err}')
+                raise
+            time.sleep(1.0)
+            try:
+                current_url = chrome_driver.current_url
+                title = chrome_driver.title  # prove the new tab is actually responsive
+                responsive = True
+            except Exception as resp_err:
+                append_runtime_log(f'{p} TAB_CREATE_PAGE_UNRESPONSIVE: {resp_err}')
+                raise
+            append_runtime_log(f'{p} switch_success={switch_success} current_url={current_url} title={title!r} responsive={responsive}')
+            return handle
+        except Exception as e:
+            last_err = e
+            append_runtime_log(f'{p} TAB_CREATE_ATTEMPT_FAILED: {e}')
+            time.sleep(1.0)
+    raise RuntimeError(f'Tab T{tid}: Failed to create physical tab after 3 attempts: {last_err}')
 for _i in range(MAX_CONCURRENT_TABS):
     tab_states.append(_make_tab_state(_i, handle=None))
 print(f'  ✅ {MAX_CONCURRENT_TABS} Gemini tab slots registered (LAZY — physical tabs created on demand).\n')
@@ -1485,7 +2234,7 @@ def _dismiss_new_chat_dialog(drv):
                     if any((w in combined for w in ['new chat', 'create', 'confirm', 'delete', 'continue', 'yes'])):
                         if 'cancel' not in combined:
                             drv.execute_script('arguments[0].click();', btn)
-                            log(f"    [DIALOG] Clicked affirmative button: '{btn.text.strip()}'")
+                            append_runtime_log(f"    [DIALOG] Clicked affirmative button: '{btn.text.strip()}'")
                             time.sleep(0.5)
                             return True
     except Exception:
@@ -1493,12 +2242,150 @@ def _dismiss_new_chat_dialog(drv):
     try:
         res = drv.execute_script('\n            var modals = document.querySelectorAll(\'[role="dialog"], mat-dialog-container, [class*="dialog"], [class*="modal"]\');\n            for (var m = 0; m < modals.length; m++) {\n                var modal = modals[m];\n                if (!modal.offsetParent) continue;\n                var btns = modal.querySelectorAll(\'button\');\n                for (var i = 0; i < btns.length; i++) {\n                    var b = btns[i];\n                    if (!b.offsetParent) continue;\n                    var t = (b.textContent || \'\').trim().toLowerCase();\n                    var a = (b.getAttribute(\'aria-label\') || \'\').toLowerCase();\n                    var combined = t + \' \' + a;\n                    if ((combined.indexOf(\'new chat\') !== -1 || combined.indexOf(\'create\') !== -1 ||\n                         combined.indexOf(\'confirm\') !== -1 || combined.indexOf(\'delete\') !== -1) &&\n                        combined.indexOf(\'cancel\') === -1) {\n                        b.click(); return \'OK:\' + t;\n                    }\n                }\n            }\n            return \'NO\';\n        ')
         if res and res.startswith('OK:'):
-            log(f'    [DIALOG] JS-dismissed: {res}')
+            append_runtime_log(f'    [DIALOG] JS-dismissed: {res}')
             time.sleep(0.5)
             return True
     except Exception:
         pass
     return False
+
+_FIND_NEW_CHAT_CANDIDATE_JS = r"""
+function vis(el) {
+    if (!el) return false;
+    var r = el.getBoundingClientRect();
+    if (r.width <= 0 || r.height <= 0) return false;
+    return el.offsetParent !== null;
+}
+function toClickable(el) {
+    // An icon/span inside the actual button/anchor is not itself
+    // clickable in a meaningful sense -- resolve to the nearest
+    // button/a/[role=button] ancestor (or itself if already one).
+    var cur = el;
+    for (var d = 0; d < 5 && cur; d++) {
+        var tag = (cur.tagName || '').toUpperCase();
+        if (tag === 'BUTTON' || tag === 'A' || cur.getAttribute('role') === 'button') return cur;
+        cur = cur.parentElement;
+    }
+    return el;
+}
+// Deliberately NOT including a[href="/app"] or any generic href/anchor
+// selector here -- those can match unrelated navigation elements, not
+// specifically the sidebar New Chat control.
+var sels = [
+    '[data-test-id="new-chat-button"]',
+    'button[aria-label="New chat"]',
+    'a[aria-label="New chat"]'
+];
+var seen = new Set();
+var candidates = [];
+for (var s = 0; s < sels.length; s++) {
+    var els = document.querySelectorAll(sels[s]);
+    for (var i = 0; i < els.length; i++) {
+        var c = toClickable(els[i]);
+        if (seen.has(c)) continue;
+        seen.add(c);
+        candidates.push({el: c, via: sels[s]});
+    }
+}
+// Fallback: any element whose OWN visible text is exactly "New chat"
+// (not a container that merely contains other text too, which would
+// risk matching a history/list wrapper instead of the control itself).
+if (candidates.length === 0) {
+    var all = document.querySelectorAll('button, a, [role="button"]');
+    for (var j = 0; j < all.length; j++) {
+        var el = all[j];
+        var t = (el.textContent || '').replace(/\s+/g, ' ').trim();
+        if (t === 'New chat' && !seen.has(el)) {
+            seen.add(el);
+            candidates.push({el: el, via: 'exact-text'});
+        }
+    }
+}
+var out = [];
+for (var k = 0; k < candidates.length; k++) {
+    var cand = candidates[k].el;
+    if (!vis(cand)) continue;
+    var txt = (cand.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 40);
+    var r = cand.getBoundingClientRect();
+    var cx = r.x + r.width / 2, cy = r.y + r.height / 2;
+    var top = document.elementFromPoint(cx, cy);
+    var owns = top === cand || cand.contains(top) || (top && top.contains(cand));
+    out.push({
+        el: cand, via: candidates[k].via, tag: cand.tagName, text: txt,
+        aria: cand.getAttribute('aria-label') || '', testid: cand.getAttribute('data-test-id') || '',
+        rect: {x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height)},
+        center: {x: Math.round(cx), y: Math.round(cy)},
+        topTag: top ? top.tagName : 'NONE', owns: !!owns
+    });
+}
+return out;
+"""
+
+
+def _find_verified_new_chat_button(drv, prefix=''):
+    """Resolve the ACTUAL sidebar New Chat control, never a generic
+    a[href="/app"]/first-anchor/first-button guess. Returns the first
+    visible, non-occluded candidate's WebElement (Selenium re-resolves
+    the JS-returned element reference automatically), or None if nothing
+    qualifies -- callers must not click anything when this returns None."""
+    try:
+        candidates = drv.execute_script(_FIND_NEW_CHAT_CANDIDATE_JS) or []
+    except Exception as e:
+        append_runtime_log(f'{prefix} NEW_CHAT_TARGET_LOOKUP_ERROR: {e}')
+        return None
+    if not candidates:
+        append_runtime_log(f'{prefix} NEW_CHAT_TARGET_NONE_FOUND')
+        return None
+    chosen = None
+    for c in candidates:
+        append_runtime_log(
+            f"{prefix} NEW_CHAT_TARGET via={c['via']} tag={c['tag']} text='{c['text']}' "
+            f"aria='{c['aria']}' testid='{c['testid']}' rect={c['rect']} center={c['center']} "
+            f"topElement={c['topTag']} occluded={not c['owns']}"
+        )
+        if c['owns'] and chosen is None:
+            chosen = c
+    if chosen is None:
+        append_runtime_log(f'{prefix} NEW_CHAT_TARGET_ALL_OCCLUDED — refusing to click a covered element')
+        return None
+    return chosen['el']
+
+
+def _click_element_with_fallbacks(drv, element, label, prefix=''):
+    """Native Selenium click first (closest to a real user click), then
+    ActionChains move+click, then a JS .click() only as a last resort --
+    a JS click alone is not proof a real click landed, so it is
+    deliberately the least-preferred path, used only to avoid failing a
+    job outright when the element is technically clickable but Selenium's
+    own click machinery (e.g. an intercepted-click check) balks at it."""
+    try:
+        drv.execute_script("arguments[0].scrollIntoView({block:'center', inline:'center'});", element)
+        time.sleep(0.15)
+    except Exception:
+        pass
+    if not _log_click_rect_and_occlusion(drv, element, label, prefix):
+        append_runtime_log(f'{prefix} {label}_OCCLUDED_AFTER_SCROLL — not clicking')
+        return False
+    try:
+        element.click()
+        append_runtime_log(f'{prefix} {label}_CLICK method=native')
+        return True
+    except Exception as e:
+        append_runtime_log(f'{prefix} {label}_NATIVE_CLICK_FAILED: {e}')
+    try:
+        ActionChains(drv).move_to_element(element).click().perform()
+        append_runtime_log(f'{prefix} {label}_CLICK method=action_chains')
+        return True
+    except Exception as e:
+        append_runtime_log(f'{prefix} {label}_ACTIONCHAINS_FAILED: {e}')
+    try:
+        drv.execute_script('arguments[0].click();', element)
+        append_runtime_log(f'{prefix} {label}_CLICK method=js (last resort)')
+        return True
+    except Exception as e:
+        append_runtime_log(f'{prefix} {label}_JS_CLICK_FAILED: {e}')
+    return False
+
 
 def open_new_chat_and_reload(drv, tid: int, job_id: str='') -> str:
     """
@@ -1516,24 +2403,38 @@ def open_new_chat_and_reload(drv, tid: int, job_id: str='') -> str:
     """
     prefix = f'[T{tid}][{job_id}]' if job_id else f'[T{tid}]'
     for attempt in range(1, MAX_NEW_CHAT_RETRIES + 1):
+        # Counters proving this is a single transaction, not a click/reload
+        # loop -- a normal successful new-chat should show
+        # new_chat_click_count=1 nav_count<=1 refresh_count=0. Logged once
+        # at the end of the attempt so a regression shows up immediately.
+        new_chat_click_count = 0
+        nav_count = 0
+        refresh_count = 0
         try:
             old_url = drv.current_url
-            log(f'{prefix} NEW_CHAT_START (attempt {attempt}) OLD_URL={old_url}')
-            clicked = False
-            res = drv.execute_script('\n                var sels = [\n                    \'a[aria-label="New chat"]\',\n                    \'button[aria-label="New chat"]\',\n                    \'div[aria-label="New chat"]\',\n                    \'[data-test-id="new-chat-button"]\',\n                    \'a[href="/app"]\',\n                ];\n                for (var s = 0; s < sels.length; s++) {\n                    var els = document.querySelectorAll(sels[s]);\n                    for (var i = 0; i < els.length; i++) {\n                        if (els[i].offsetParent !== null) {\n                            els[i].click(); return \'OK:\' + sels[s];\n                        }\n                    }\n                }\n                return \'NO\';\n            ')
-            if res and res.startswith('OK:'):
-                clicked = True
-                log(f'{prefix} NEW_CHAT_CLICK -> {res}')
+            append_runtime_log(f'{prefix} NEW_CHAT_START (attempt {attempt}) OLD_URL={old_url}')
+            new_chat_btn = _find_verified_new_chat_button(drv, prefix)
+            if new_chat_btn is not None and _click_element_with_fallbacks(drv, new_chat_btn, 'NEW_CHAT', prefix):
+                new_chat_click_count += 1
             else:
+                append_runtime_log(f'{prefix} NEW_CHAT_TARGET_UNAVAILABLE — falling back to direct navigation')
                 drv.get(GEMINI_APP_URL)
-                clicked = True
-                log(f'{prefix} NEW_CHAT_NAVIGATE -> {GEMINI_APP_URL}')
+                nav_count += 1
+                append_runtime_log(f'{prefix} NEW_CHAT_NAVIGATE -> {GEMINI_APP_URL}')
             time.sleep(0.3)
             dialog_handled = _dismiss_new_chat_dialog(drv)
             if dialog_handled:
-                log(f'{prefix} DIALOG_HANDLED')
+                append_runtime_log(f'{prefix} DIALOG_HANDLED')
                 time.sleep(0.4)
-            url_deadline = time.time() + 8.0
+            # A tab already sitting on the bare GEMINI_APP_URL (its first
+            # use, right after _create_gemini_tab()) clicking "New chat"
+            # produces no URL change at all -- there is nothing to wait
+            # for. Polling the full 8s here every time was pure wasted
+            # time on every T-slot's first job, re-searching for a URL
+            # change that structurally cannot happen from that starting
+            # point; a short poll is enough to still catch it if Gemini's
+            # behavior ever changes.
+            url_deadline = time.time() + (1.5 if old_url == GEMINI_APP_URL else 8.0)
             new_url = None
             while time.time() < url_deadline:
                 cur = drv.current_url
@@ -1548,25 +2449,50 @@ def open_new_chat_and_reload(drv, tid: int, job_id: str='') -> str:
                 cur = drv.current_url
                 if 'gemini.google.com/app' in cur:
                     new_url = cur
-                    log(f'{prefix} NEW_CHAT_URL_UNCHANGED — accepting base URL: {new_url}')
+                    append_runtime_log(f'{prefix} NEW_CHAT_URL_UNCHANGED — accepting base URL: {new_url}')
             if not new_url:
-                log(f'{prefix} NEW_CHAT_URL_NOT_CHANGED (attempt {attempt}) — retrying')
+                append_runtime_log(f'{prefix} NEW_CHAT_URL_NOT_CHANGED (attempt {attempt}) — retrying')
                 time.sleep(0.5)
                 continue
-            log(f'{prefix} NEW_CHAT_URL={new_url}')
-            log(f'{prefix} RELOADING NEW CHAT URL')
-            drv.get(new_url)
-            time.sleep(1.0)
-            log(f'{prefix} NEW_CHAT_RELOADED')
-            if _verify_clean_composer(drv):
-                log(f'{prefix} NEW_CHAT_VERIFIED ✅')
+            append_runtime_log(f'{prefix} NEW_CHAT_URL={new_url}')
+            # PART 8/9 fix: this used to unconditionally drv.get(new_url)
+            # here even when the browser was ALREADY on new_url (e.g. the
+            # NEW_CHAT_URL_UNCHANGED case just above, right after already
+            # navigating there) -- a redundant second full-page reload on
+            # top of the click/navigate above, which is exactly the kind of
+            # repeated navigation that can surface Gemini's "Create a new
+            # chat and delete this one?" dialog a second time. Only reload
+            # if the browser isn't already there.
+            if drv.current_url != new_url:
+                append_runtime_log(f'{prefix} RELOADING NEW CHAT URL')
+                drv.get(new_url)
+                refresh_count += 1
+                time.sleep(1.0)
+                append_runtime_log(f'{prefix} NEW_CHAT_RELOADED')
+            else:
+                append_runtime_log(f'{prefix} NEW_CHAT_ALREADY_AT_URL — skipping redundant reload')
+            append_runtime_log(
+                f'{prefix} NEW_CHAT_NAV_COUNTERS click={new_chat_click_count} '
+                f'nav={nav_count} refresh={refresh_count}'
+            )
+            clean = _verify_clean_composer(drv)
+            try:
+                snap = _gemini_ui_snapshot(drv)
+            except Exception:
+                snap = {}
+            append_runtime_log(
+                f"{prefix} NEW_CHAT_POSTCHECK url={drv.current_url} composer_visible={bool(snap.get('composer_placeholder') and snap.get('composer_placeholder') != 'NO_EDITOR')} "
+                f"composer_empty={snap.get('composer_text_len') == 0} clean_composer={clean}"
+            )
+            if clean:
+                append_runtime_log(f'{prefix} NEW_CHAT_VERIFIED ✅')
                 return new_url
             else:
-                log(f'{prefix} NEW_CHAT_COMPOSER_NOT_CLEAN (attempt {attempt}) — retrying')
+                append_runtime_log(f'{prefix} NEW_CHAT_COMPOSER_NOT_CLEAN (attempt {attempt}) — retrying')
                 time.sleep(0.5)
                 continue
         except Exception as e:
-            log(f'{prefix} NEW_CHAT_EXCEPTION (attempt {attempt}): {e}', file=sys.stderr)
+            append_runtime_log(f'{prefix} NEW_CHAT_EXCEPTION (attempt {attempt}): {e}', file=sys.stderr)
             time.sleep(0.5)
             continue
     raise NewChatFailed(f'Tab T{tid}: Could not create a verified new Gemini chat after {MAX_NEW_CHAT_RETRIES} attempts')
@@ -1712,14 +2638,19 @@ def _verify_flash_selected(drv, timeout=3.0):
 
 def ensure_flash_mode(drv, tid=0, job_id=''):
     prefix = f'[T{tid}][{job_id}]' if job_id else f'[T{tid}]'
+    append_runtime_log(f'{prefix} GEMINI_FLASH_CHECK')
     current = _get_current_model_text(drv)
+    progress_detail(job_id, 'flash_current', current or 'unknown')
     if current and 'flash' in current.lower() and ('lite' not in current.lower()):
-        log(f"{prefix} FLASH_VERIFIED (already active: '{current}')")
+        append_runtime_log(f"{prefix} FLASH_VERIFIED (already active: '{current}')")
+        append_runtime_log(f"{prefix} GEMINI_FLASH_VERIFIED model_text='{current}'")
+        progress_detail(job_id, 'flash_verified', True)
         return True
     for attempt in range(1, 4):
         if not _open_model_picker(drv):
             time.sleep(0.4)
             continue
+        progress_detail(job_id, 'flash_picker', True)
         time.sleep(0.3)
         try:
             clicked = _click_flash_in_picker(drv)
@@ -1729,8 +2660,12 @@ def ensure_flash_mode(drv, tid=0, job_id=''):
             except Exception:
                 pass
             raise
+        if clicked:
+            progress_detail(job_id, 'flash_role', True)
         if clicked and _verify_flash_selected(drv, timeout=2.5):
-            log(f'{prefix} FLASH_VERIFIED ✅')
+            append_runtime_log(f'{prefix} FLASH_VERIFIED ✅')
+            append_runtime_log(f"{prefix} GEMINI_FLASH_VERIFIED model_text='{_get_current_model_text(drv)}'")
+            progress_detail(job_id, 'flash_verified', True)
             return True
         try:
             drv.find_element(By.TAG_NAME, 'body').send_keys(Keys.ESCAPE)
@@ -1739,24 +2674,137 @@ def ensure_flash_mode(drv, tid=0, job_id=''):
         time.sleep(0.3)
     raise RuntimeError(f'Tab T{tid}: Flash mode could not be verified')
 
-def click_plus_button(drv):
+_COMPOSER_PLUS_BUTTON_JS = r"""
+    var editor = arguments[0];
+    var sels = [
+        'button[aria-label="Upload and tools"]',
+        'button[aria-label*="Upload"]',
+        'button[aria-label*="Tools"]',
+        'button[jslog*="300142"]',
+        'button[aria-haspopup="menu"][aria-label*="Upload"]'
+    ];
+    function vis(el) {
+        if (!el) return false;
+        var r = el.getBoundingClientRect();
+        return r.width > 0 && r.height > 0 && el.offsetParent !== null;
+    }
+    function collect(root) {
+        var res = [];
+        for (var s = 0; s < sels.length; s++) {
+            var els = root.querySelectorAll(sels[s]);
+            for (var i = 0; i < els.length; i++) if (vis(els[i])) res.push(els[i]);
+        }
+        // Icon-based fallback: a plus-shaped mat-icon resolved to its
+        // ancestor button, same as the aria-label matches above.
+        var icons = root.querySelectorAll('mat-icon[fonticon="plus"], mat-icon[data-mat-icon-name="plus"], mat-icon[fonticon="add"], mat-icon[data-mat-icon-name="add"]');
+        for (var j = 0; j < icons.length; j++) {
+            var b = icons[j].closest('button');
+            if (b && vis(b) && res.indexOf(b) === -1) res.push(b);
+        }
+        return res;
+    }
+    // Walk up from the ACTIVE composer looking for an ancestor that
+    // already contains a plus/upload/tools candidate -- exactly the same
+    // pattern _SEND_BUTTON_JS uses, so the "+" found can never belong to
+    // the left sidebar, page header, or another tab/job's composer on
+    // this shared-driver page.
+    var el = editor;
+    for (var depth = 0; depth < 8 && el; depth++) {
+        var found = collect(el);
+        if (found.length > 0) {
+            var b = found[0];
+            var r = b.getBoundingClientRect();
+            var cx = r.x + r.width / 2, cy = r.y + r.height / 2;
+            var top = document.elementFromPoint(cx, cy);
+            var owns = top === b || b.contains(top) || (top && top.contains(b));
+            return {
+                el: b, scoped: true, aria: b.getAttribute('aria-label') || '',
+                text: (b.textContent || '').trim().slice(0, 40),
+                rect: {x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height)},
+                center: {x: Math.round(cx), y: Math.round(cy)}, topTag: top ? top.tagName : 'NONE', owns: !!owns
+            };
+        }
+        el = el.parentElement;
+    }
+    return null;
+"""
+
+
+def _find_composer_plus_button(drv, tid=0, job_id=''):
+    """Composer-scoped "+" lookup: find the ACTIVE visible composer first
+    (get_active_gemini_image_composer, already used for prompt/send), then
+    search only its own ancestor chain for the upload/tools button --
+    never a raw document-wide button scan, which previously risked
+    matching the wrong tab's or the sidebar's controls on this
+    shared-driver multi-tab page."""
+    prefix = f'[T{tid}][{job_id}]' if job_id else f'[T{tid}]'
+    editor = get_active_gemini_image_composer(drv, tid=tid, job_id=job_id)
+    if editor is None:
+        append_runtime_log(f'{prefix} PLUS_TARGET_NO_COMPOSER')
+        return None
     try:
-        res = drv.execute_script('\n            var btns = document.querySelectorAll(\'button\');\n            for (var i = 0; i < btns.length; i++) {\n                var b = btns[i];\n                if (b.offsetParent === null) continue;\n                var lbl = (b.getAttribute(\'aria-label\') || \'\').toLowerCase();\n                if (lbl.indexOf(\'upload\') !== -1 || lbl.indexOf(\'tools\') !== -1 || lbl.indexOf(\'plus\') !== -1) {\n                    b.click(); return \'OK\';\n                }\n                var icon = b.querySelector(\'mat-icon[fonticon="plus"], mat-icon[data-mat-icon-name="plus"]\');\n                if (icon) { b.click(); return \'OK\'; }\n            } return \'NO\';\n        ')
-        if res == 'OK':
+        result = drv.execute_script(_COMPOSER_PLUS_BUTTON_JS, editor)
+    except Exception as e:
+        append_runtime_log(f'{prefix} PLUS_TARGET_LOOKUP_ERROR: {e}')
+        return None
+    if not result:
+        append_runtime_log(f'{prefix} PLUS_TARGET_NOT_FOUND (composer-scoped)')
+        return None
+    append_runtime_log(
+        f"{prefix} PLUS_TARGET aria='{result['aria']}' text='{result['text']}' rect={result['rect']} "
+        f"center={result['center']} topElement={result['topTag']} owned={result['owns']}"
+    )
+    if not result['owns']:
+        append_runtime_log(f'{prefix} PLUS_TARGET_OCCLUDED by <{result["topTag"]}>')
+        return None
+    return result['el']
+
+
+def _verify_upload_tools_drawer_open(drv, tid=0, job_id=''):
+    """Real evidence the upload/tools drawer actually opened after a "+"
+    click -- a click() call not raising is not proof of that; this file's
+    own past bugs (CreateImg✅ while the browser still showed plain 'Ask
+    Gemini') came from exactly this kind of unverified click-as-success
+    assumption."""
+    prefix = f'[T{tid}][{job_id}]' if job_id else f'[T{tid}]'
+    try:
+        items = []
+        for sel in ["button[role='menuitemcheckbox'].toolbox-drawer-item-list-button",
+                    "[role='menuitemcheckbox']", "[role='menuitem']"]:
+            for el in drv.find_elements(By.CSS_SELECTOR, sel):
+                if el.is_displayed():
+                    items.append((el.text or '').strip()[:40])
+        open_ = len(items) > 0
+        append_runtime_log(f'{prefix} DRAWER_VERIFY={"PASS" if open_ else "FAIL"} visible_items={items[:12]}')
+        return open_
+    except Exception as e:
+        append_runtime_log(f'{prefix} DRAWER_VERIFY_ERROR: {e}')
+        return False
+
+
+def click_plus_button(drv, tid=0, job_id=''):
+    """Composer-scoped "+" click with real drawer-open verification and up
+    to 3 retries -- replaces the old global document.querySelectorAll('button')
+    scan, which could click any visible button anywhere on the page whose
+    aria-label happened to contain 'upload'/'tools'/'plus', including
+    controls belonging to a different tab/job or the page chrome."""
+    prefix = f'[T{tid}][{job_id}]' if job_id else f'[T{tid}]'
+    for attempt in range(1, 4):
+        btn = _find_composer_plus_button(drv, tid=tid, job_id=job_id)
+        if btn is None:
             time.sleep(0.3)
-            return True
-    except Exception:
-        pass
-    for sel in ['button[aria-label="Upload and tools"]', 'button[jslog*="300142"]', 'button[aria-haspopup="menu"][aria-label*="Upload"]']:
-        try:
-            for btn in drv.find_elements(By.CSS_SELECTOR, sel):
-                if btn.is_displayed():
-                    drv.execute_script('arguments[0].click();', btn)
-                    time.sleep(0.3)
-                    return True
-        except Exception:
             continue
+        if not _click_element_with_fallbacks(drv, btn, 'PLUS', prefix):
+            time.sleep(0.3)
+            continue
+        time.sleep(0.3)
+        if _verify_upload_tools_drawer_open(drv, tid=tid, job_id=job_id):
+            append_runtime_log(f'{prefix} PLUS_CLICKED attempt={attempt} DRAWER_VERIFY=PASS')
+            return True
+        append_runtime_log(f'{prefix} PLUS_CLICKED_BUT_DRAWER_NOT_OPEN attempt={attempt}/3 — retrying')
+        time.sleep(0.3)
     return False
+
 
 def is_create_image_mode(drv):
     try:
@@ -1772,57 +2820,384 @@ def is_create_image_mode(drv):
         return False
     except Exception:
         return False
-        signals = ["mat-icon[data-mat-icon-name='image_create']", "mat-icon[fonticon='image_create']", "button[aria-label*='Aspect ratio']", "//span[contains(text(), 'Aspect ratio')]", "//button[contains(., 'Images')]"]
-        for sig in signals:
-            by = By.XPATH if sig.startswith('//') else By.CSS_SELECTOR
-            for el in drv.find_elements(by, sig):
-                if el.is_displayed():
-                    return True
-        return len(editors) > 0
+
+
+# ---------------------------------------------------------------------------
+# FORENSIC RUNTIME DIAGNOSTICS (single-job Gemini workflow test)
+# Every critical browser stage writes an exact GEMINI_* event to worker.log
+# (never the notebook console), plus a COMPACT browser-state snapshot at each
+# checkpoint -- current URL, visible model selector text, composer
+# placeholder/text, relevant buttons, menu items, Create-Image-related
+# elements, send-button state, stop/generation control. No full HTML dumps.
+# ---------------------------------------------------------------------------
+
+_DEBUG_SCREENSHOT_DIR = Path('debug/screenshots')
+
+_GEMINI_UI_SNAPSHOT_JS = r"""
+function vis(el){ return !!(el && el.offsetParent !== null); }
+function txt(el, n){ var t = (el.innerText || el.textContent || '').replace(/\s+/g,' ').trim(); return t.length > n ? t.slice(0,n)+'~' : t; }
+var out = {};
+// The ACTIVE visible composer: last visible ql-editor is Gemini's current
+// one when a draft chat exists alongside the main input-area.
+var eds = Array.prototype.filter.call(document.querySelectorAll('div.ql-editor'), vis);
+var ed = eds.length ? eds[eds.length - 1] : null;
+out.composer_text = ed ? txt(ed, 80) : '';
+out.composer_text_len = ed ? (ed.innerText || '').trim().length : -1;
+out.composer_placeholder = ed ? (ed.getAttribute('data-placeholder') || '') : 'NO_EDITOR';
+out.ask_gemini_visible = false;
+try {
+  var walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null);
+  var tn;
+  while ((tn = walker.nextNode())) {
+    var v = (tn.nodeValue || '').trim();
+    if (v === 'Ask Gemini' || v === 'Where should we start?') {
+      var pe = tn.parentElement;
+      if (pe && vis(pe)) { out.ask_gemini_visible = true; break; }
+    }
+  }
+} catch (e) {}
+// Visible mode/model selector text (Flash pill etc.)
+var pill = document.querySelector("div[data-test-id='logo-pill-label-container'], button[data-test-id='bard-mode-menu-button']");
+out.visible_mode_text = pill && vis(pill) ? txt(pill, 60) : '';
+// Toolbox drawer Create-image option + its selection state
+out.create_image_visible = false;
+out.selected_create_image = false;
+var ciEls = document.querySelectorAll(".toolbox-drawer-item-list-button, [role='menuitemcheckbox']");
+for (var i = 0; i < ciEls.length; i++) {
+  var el = ciEls[i];
+  if (!vis(el)) continue;
+  var t = (el.textContent || '').toLowerCase();
+  if (t.indexOf('create image') === -1) continue;
+  out.create_image_visible = true;
+  var a = (el.getAttribute('aria-checked') || '') + '|' + (el.getAttribute('aria-selected') || '') + '|' + (el.className || '');
+  if (/true|checked|selected/i.test(a)) out.selected_create_image = true;
+}
+// Image-generation composer/tool state (the POSITIVE signal)
+out.image_mode_signal = '';
+if (ed) {
+  var ph = (ed.getAttribute('data-placeholder') || '').toLowerCase();
+  if (ph.indexOf('describe') !== -1 && ph.indexOf('image') !== -1) out.image_mode_signal = 'placeholder:' + ph;
+}
+if (!out.image_mode_signal) {
+  var ars = document.querySelectorAll("button[aria-label*='Aspect ratio']");
+  for (var j = 0; j < ars.length; j++) if (vis(ars[j])) { out.image_mode_signal = 'aspect_ratio_control'; break; }
+}
+// Send button state
+var sendBtn = null;
+Array.prototype.forEach.call(document.querySelectorAll("mat-icon[data-mat-icon-name='arrow_upward'], mat-icon[fonticon='arrow_upward'], mat-icon[fonticon='send'], button[aria-label='Send message']"), function(e){
+  var b = e.tagName === 'BUTTON' ? e : e.closest('button');
+  if (b && vis(b)) sendBtn = b;
+});
+out.send_visible = !!sendBtn;
+out.send_enabled = sendBtn ? !sendBtn.disabled : false;
+// Stop/Cancel generation control
+var stop = null;
+Array.prototype.forEach.call(document.querySelectorAll("button[aria-label='Stop generating'], button[aria-label='Cancel'], mat-icon[fonticon='stop'], mat-icon[data-mat-icon-name='stop']"), function(e){
+  var b = e.tagName === 'BUTTON' ? e : e.closest('button') || e;
+  if (b && vis(b)) stop = b;
+});
+out.stop_ctrl = stop ? 'PRESENT' : 'NONE';
+// Compact extras kept for worker.log forensics
+out.buttons = [];
+Array.prototype.forEach.call(document.querySelectorAll('button'), function(b){
+  if (!vis(b)) return;
+  var lbl = b.getAttribute('aria-label') || txt(b, 24);
+  if (lbl) out.buttons.push(lbl.slice(0, 30));
+});
+out.menu_items = [];
+Array.prototype.forEach.call(document.querySelectorAll("[role='menuitem'], [role='menuitemcheckbox'], [role='option'], cdk-overlay-pane button"), function(m){
+  if (vis(m)) out.menu_items.push(txt(m, 40));
+});
+return out;
+"""
+
+
+def _gemini_ui_snapshot(drv) -> dict:
+    """Reusable compact structured snapshot of the CURRENT live Gemini UI
+    (no page_source dumps). Keys: url, composer_text, composer_text_len,
+    composer_placeholder, visible_mode_text, ask_gemini_visible,
+    create_image_visible, selected_create_image, image_mode_signal,
+    flash_visible, send_visible, send_enabled, stop_ctrl, buttons,
+    menu_items. Best-effort: never raises."""
+    info = {'url': 'ERR'}
+    try:
+        info['url'] = drv.current_url
+    except Exception:
+        pass
+    try:
+        js_result = drv.execute_script(_GEMINI_UI_SNAPSHOT_JS) or {}
+        info.update(js_result)
+    except Exception as snap_err:
+        info['snapshot_error'] = str(snap_err)[:200]
+    info.setdefault('composer_text', '')
+    info.setdefault('composer_placeholder', '')
+    info.setdefault('visible_mode_text', '')
+    info.setdefault('ask_gemini_visible', False)
+    info.setdefault('create_image_visible', False)
+    info.setdefault('selected_create_image', False)
+    info.setdefault('image_mode_signal', '')
+    info.setdefault('send_visible', False)
+    info.setdefault('send_enabled', False)
+    info.setdefault('stop_ctrl', 'NONE')
+    info['flash_visible'] = 'flash' in str(info.get('visible_mode_text', '')).lower()
+    return info
+
+
+def _gemini_state_snapshot(drv, checkpoint: str, tid=0, job_id='', screenshot=False) -> dict:
+    """Capture compact DOM/browser state at a forensic checkpoint into
+    worker.log. Returns the info dict so callers can include it in failure
+    messages (e.g. CREATE_IMAGE_VERIFY_FAILED). Best-effort: never raises."""
+    prefix = f'[T{tid}][{job_id}]' if job_id else f'[T{tid}]'
+    info = _gemini_ui_snapshot(drv)
+    append_runtime_log(
+        f"{prefix} BROWSER_STATE[{checkpoint}] url={str(info.get('url',''))[:90]} "
+        f"mode='{info.get('visible_mode_text','')}' composer_ph='{info.get('composer_placeholder','')}' "
+        f"composer_len={info.get('composer_text_len','?')} composer_head='{str(info.get('composer_text',''))[:40]}' "
+        f"ask_gemini={info.get('ask_gemini_visible')} ci_vis={info.get('create_image_visible')} "
+        f"ci_sel={info.get('selected_create_image')} img_sig='{info.get('image_mode_signal','')}' "
+        f"send={info.get('send_visible')}/{info.get('send_enabled')} stop={info.get('stop_ctrl','?')} "
+        f"menu_items={info.get('menu_items', [])[:10]} buttons={info.get('buttons', [])[:25]}"
+    )
+    if screenshot:
+        try:
+            _DEBUG_SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
+            fname = _DEBUG_SCREENSHOT_DIR / f"T{tid}_{job_id[:24] or 'na'}_{checkpoint}.png"
+            drv.save_screenshot(str(fname))
+            append_runtime_log(f"{prefix} SCREENSHOT_SAVED {fname}")
+        except Exception as ss_err:
+            append_runtime_log(f"{prefix} SCREENSHOT_FAILED {checkpoint}: {ss_err}")
+    return info
+
+
+def _create_image_signal_1(drv) -> bool:
+    """Signal 1 (independent of signal 2): an ACTIVE/SELECTED Create Image
+    indicator in the toolbox drawer -- a menuitemcheckbox whose text says
+    'create image' AND which reports itself checked/selected (aria-
+    checked=true or aria-selected=true or the Angular 'checked' class).
+    This is browser-DOM evidence the toggle is on, not that a click
+    returned without raising."""
+    try:
+        return bool(drv.execute_script("""
+            var els = document.querySelectorAll("button[role='menuitemcheckbox'].toolbox-drawer-item-list-button, [role='menuitemcheckbox']");
+            for (var i = 0; i < els.length; i++) {
+                var el = els[i];
+                if (el.offsetParent === null) continue;
+                var t = (el.textContent || '').toLowerCase();
+                if (t.indexOf('create image') === -1) continue;
+                var a = (el.getAttribute('aria-checked') || '') + (el.getAttribute('aria-selected') || '') + (el.className || '');
+                if (/true|checked|selected/i.test(a)) return true;
+            }
+            return false;
+        """))
     except Exception:
         return False
 
+
+def _create_image_signal_2(drv) -> bool:
+    """Signal 2 (independent of signal 1): the image-generation composer/
+    tool state -- a VISIBLE editor whose placeholder names image creation
+    ("Describe ... image ..."), or the dedicated image-mode toolbar
+    (aspect-ratio control / image_create icon outside a closed drawer)."""
+    try:
+        return bool(drv.execute_script("""
+            var eds = document.querySelectorAll('div.ql-editor');
+            for (var i = 0; i < eds.length; i++) {
+                var el = eds[i];
+                if (el.offsetParent === null) continue;
+                var ph = (el.getAttribute('data-placeholder') || '').toLowerCase();
+                if (ph.indexOf('describe') !== -1 && ph.indexOf('image') !== -1) return true;
+            }
+            var sels = ["button[aria-label*='Aspect ratio']", "mat-icon[data-mat-icon-name='image_create']", "mat-icon[fonticon='image_create']"];
+            for (var s = 0; s < sels.length; s++) {
+                var els = document.querySelectorAll(sels[s]);
+                for (var j = 0; j < els.length; j++) {
+                    // icons inside the collapsed + drawer don't count; only
+                    // ones with a visible aspect-ratio/button context do
+                    if (els[j].offsetParent !== null) return true;
+                }
+            }
+            return false;
+        """))
+    except Exception:
+        return False
+
+
+def _create_image_verified(drv) -> tuple:
+    """STRICT fail-closed verification that Gemini is ACTUALLY in
+    image-generation mode right now -- POSITIVE and NEGATIVE evidence both
+    required (a weak selector that exists in BOTH chat and image mode can
+    no longer produce a false ✅):
+
+      POSITIVE (one of):
+        P1 selected_create_image : visible Create-image option reporting
+                                   aria-checked/aria-selected=true
+        P2 image_mode_signal     : ACTIVE visible composer's placeholder is
+                                   the image-creation one, OR a visible
+                                   Aspect-ratio image-tool control exists
+      NEGATIVE (required):
+        N1 ask_gemini_visible == False : the normal 'Ask Gemini' /
+            'Where should we start?' empty-chat UI is NOT present anymore
+
+    Returns (verified, reason, snapshot_dict)."""
+    snap = _gemini_ui_snapshot(drv)
+    positive = None
+    if snap.get('selected_create_image'):
+        positive = 'selected_create_image'
+    elif snap.get('image_mode_signal'):
+        positive = f"image_mode_signal={snap['image_mode_signal']}"
+    else:
+        # corroborated legacy composite check (same evidence class, kept so
+        # behavior never regresses below the proven baseline)
+        try:
+            if _create_image_signal_2(drv):
+                positive = 'legacy_composite'
+        except Exception:
+            pass
+    negative_ok = not snap.get('ask_gemini_visible')
+    if positive and negative_ok:
+        return True, positive, snap
+    if positive and not negative_ok:
+        return False, f"POSITIVE({positive}) but Ask-Gemini chat UI STILL VISIBLE (negative check failed)", snap
+    return False, "NO positive image-mode evidence (no selected Create-image option, no image composer/tool state)", snap
+
+
 def ensure_create_image_mode(drv, tid=0, job_id=''):
+    """Activate Gemini's Create Image mode with STRICT, FAIL-CLOSED proof.
+
+    The console claims of the past (CreateImg ✅ / ImgMode(confirmed) while
+    the browser still visibly showed 'Ask Gemini') came from trusting weak
+    selectors and click-no-throw as success. This version requires BOTH:
+      * POSITIVE evidence the image-generation composer/tool is actually
+        active (_create_image_verified), AND
+      * NEGATIVE evidence the normal 'Ask Gemini' chat UI is gone.
+    It also logs exactly WHAT was clicked (tag/text/role/aria/class/
+    data-test-id/visible) to worker.log before verifying the POST-CLICK
+    browser state. If verification fails after all attempts, it raises
+    CREATE_IMAGE_VERIFY_FAILED with the observed UI state -- the pipeline
+    STOPS here; upload/prompt/send must never run against a plain chat.
+    """
     prefix = f'[T{tid}][{job_id}]' if job_id else f'[T{tid}]'
+    append_runtime_log(f'{prefix} GEMINI_CREATE_IMAGE_REQUESTED')
+    _gemini_state_snapshot(drv, 'create_image_before', tid, job_id)
+
+    def _check(via: str):
+        ok, reason, snap = _create_image_verified(drv)
+        append_runtime_log(
+            f"{prefix} CREATE_IMAGE_VERIFY via={via} result={'PASS' if ok else 'FAIL'} "
+            f"reason='{reason}' ask_gemini_visible={snap.get('ask_gemini_visible')} "
+            f"ci_vis={snap.get('create_image_visible')} ci_sel={snap.get('selected_create_image')} "
+            f"img_sig='{snap.get('image_mode_signal')}' mode='{snap.get('visible_mode_text')}' "
+            f"composer_ph='{snap.get('composer_placeholder')}'"
+        )
+        return ok, snap
+
+    # Fast path: already in Create Image mode (fresh tab reusing prior state)
     deadline = time.time() + 4.0
+    last_snap = None
     while time.time() < deadline:
-        if is_create_image_mode(drv):
-            log(f'{prefix} CREATE_IMAGE_VERIFIED')
+        ok, last_snap = _check('precheck')
+        if ok:
+            append_runtime_log(f'{prefix} GEMINI_CREATE_IMAGE_VERIFIED via=precheck')
+            progress_detail(job_id, 'createimg', True)
+            progress_detail(job_id, 'imgmode', 'confirmed')
             return True
         time.sleep(0.5)
+
     for attempt in range(1, 3):
-        if click_plus_button(drv):
+        append_runtime_log(f'{prefix} GEMINI_CREATE_IMAGE_ATTEMPT {attempt}/2')
+        if click_plus_button(drv, tid=tid, job_id=job_id):
             time.sleep(0.5)
+            menu_dump = _gemini_state_snapshot(drv, f'menu_open_a{attempt}', tid, job_id)
+            append_runtime_log(f"{prefix} GEMINI_CREATE_IMAGE_MENU_OPENED items={menu_dump.get('menu_items', [])[:12]}")
+            clicked_info = None
+            clicked_btn = None
             try:
                 btns = drv.find_elements(By.CSS_SELECTOR, "button[role='menuitemcheckbox'].toolbox-drawer-item-list-button")
-                for btn in btns:
-                    if btn.is_displayed() and 'create image' in btn.text.lower():
-                        drv.execute_script('arguments[0].click();', btn)
-                        time.sleep(1.0)
-                        break
-                else:
+                candidates = list(btns)
+            except Exception:
+                candidates = []
+            if not candidates:
+                try:
+                    candidates = list(drv.find_elements(By.CSS_SELECTOR, "[role='menuitemcheckbox'], [role='menuitem']"))
+                except Exception:
+                    candidates = []
+            for btn in candidates:
+                try:
+                    if not btn.is_displayed():
+                        continue
+                    b_txt = (btn.text or '').lower()
+                    if 'create image' not in b_txt:
+                        continue
+                    clicked_info = drv.execute_script(
+                        "var e=arguments[0];return {"
+                        " tag: e.tagName,"
+                        " text: (e.innerText||e.textContent||'').replace(/\\s+/g,' ').trim().slice(0,60),"
+                        " role: e.getAttribute('role')||'',"
+                        " aria: e.getAttribute('aria-label')||'',"
+                        " cls: (e.className||'').toString().slice(0,80),"
+                        " dtid: e.getAttribute('data-test-id')||'',"
+                        " vis: !!(e.offsetParent!==null)};", btn)
+                    clicked_btn = btn
+                    break
+                except Exception:
+                    continue
+            if clicked_info is None:
+                # fallback: locate via the image_create icon itself
+                try:
                     for icon in drv.find_elements(By.CSS_SELECTOR, "mat-icon[data-mat-icon-name='image_create'], mat-icon[fonticon='image_create']"):
                         if icon.is_displayed():
                             btn = drv.execute_script("var e=arguments[0];while(e&&e.tagName!=='BUTTON')e=e.parentElement;return e;", icon)
                             if btn and btn.is_displayed():
-                                drv.execute_script('arguments[0].click();', btn)
-                                time.sleep(1.0)
+                                clicked_info = drv.execute_script(
+                                    "var e=arguments[0];return {"
+                                    " tag: e.tagName,"
+                                    " text: (e.innerText||e.textContent||'').replace(/\\s+/g,' ').trim().slice(0,60),"
+                                    " role: e.getAttribute('role')||'',"
+                                    " aria: e.getAttribute('aria-label')||'',"
+                                    " cls: (e.className||'').toString().slice(0,80),"
+                                    " dtid: e.getAttribute('data-test-id')||'',"
+                                    " vis: !!(e.offsetParent!==null)};", btn)
+                                clicked_btn = btn
+                                candidates = [btn]
                                 break
-            except Exception:
-                pass
-        deadline = time.time() + 3.0
-        while time.time() < deadline:
-            if is_create_image_mode(drv):
-                log(f'{prefix} CREATE_IMAGE_VERIFIED')
-                return True
-            time.sleep(0.5)
-    raise RuntimeError(f'Tab T{tid}: Failed to activate Create image mode')
+                except Exception:
+                    pass
+            if clicked_info and clicked_btn is not None:
+                append_runtime_log(
+                    f"{prefix} CREATE_IMAGE_TARGET tag={clicked_info.get('tag')} "
+                    f"text='{clicked_info.get('text')}' role='{clicked_info.get('role')}' "
+                    f"aria='{clicked_info.get('aria')}' class='{clicked_info.get('cls')}' "
+                    f"data_test_id='{clicked_info.get('dtid')}' visible={clicked_info.get('vis')}"
+                )
+                _click_element_with_fallbacks(drv, clicked_btn, 'CREATE_IMAGE', prefix)
+                append_runtime_log(f'{prefix} GEMINI_CREATE_IMAGE_CLICKED')
+                # Wait for the UI transition, then verify strictly.
+                deadline = time.time() + 4.0
+                while time.time() < deadline:
+                    ok, last_snap = _check(f'click_attempt_{attempt}')
+                    if ok:
+                        append_runtime_log(f'{prefix} GEMINI_CREATE_IMAGE_VERIFIED via=click_attempt_{attempt}')
+                        progress_detail(job_id, 'createimg', True)
+                        progress_detail(job_id, 'imgmode', 'confirmed')
+                        return True
+                    time.sleep(0.5)
+            else:
+                append_runtime_log(f'{prefix} CREATE_IMAGE_OPTION_NOT_FOUND attempt={attempt}')
+                try:
+                    drv.find_element(By.TAG_NAME, 'body').send_keys(Keys.ESCAPE)
+                except Exception:
+                    pass
+
+    final_state = _gemini_state_snapshot(drv, 'create_image_failed', tid, job_id, screenshot=True)
+    if last_snap:
+        final_state.update(last_snap)
+    raise RuntimeError(f'Tab T{tid}: CREATE_IMAGE_VERIFY_FAILED observed_ui={json.dumps(final_state, default=str)[:1500]}')
 
 def open_upload_drawer(drv, tid=0, job_id='') -> bool:
     """Open the upload/tools drawer by clicking the + button."""
     prefix = f'[T{tid}][{job_id}]' if job_id else f'[T{tid}]'
-    if not click_plus_button(drv):
-        log(f'{prefix} DRAWER_FAILED: Could not click plus button', file=sys.stderr)
+    if not click_plus_button(drv, tid=tid, job_id=job_id):
+        append_runtime_log(f'{prefix} DRAWER_FAILED: Could not click plus button', file=sys.stderr)
         return False
     time.sleep(0.25)
     return True
@@ -1847,67 +3222,309 @@ def click_upload_files_in_drawer(drv):
         pass
     return False
 
-def find_file_input_strict(drv, tid=0, job_id=''):
-    """
-    Finds the file input element. Raises FileInputMissing if not found.
-    Never silently continues.
-    """
-    prefix = f'[T{tid}][{job_id}]' if job_id else f'[T{tid}]'
-    deadline = time.time() + 4.0
+def _snapshot_file_inputs(drv):
+    """Identity set for every <input type=file> currently in the DOM, used
+    to detect which one is NEW after opening the upload drawer -- Gemini's
+    page can have more than one file input (other upload entry points,
+    leftover ones from earlier UI states), so grabbing querySelectorAll(...)
+    [0] unconditionally can silently tag and send files to the WRONG
+    input. Identity is the element reference itself (via a WeakSet-unsafe
+    but good-enough per-element marker attribute), not index, since index
+    can also shift under DOM mutation."""
+    try:
+        return set(drv.execute_script(
+            "var out=[];"
+            "document.querySelectorAll('input[type=\"file\"]').forEach(function(el, i){"
+            "  var m = el.getAttribute('data-vl-input-marker');"
+            "  if (!m) { m = 'm' + Date.now() + '_' + i + '_' + Math.random().toString(36).slice(2); el.setAttribute('data-vl-input-marker', m); }"
+            "  out.push(m);"
+            "});"
+            "return out;"
+        ) or [])
+    except Exception:
+        return set()
+
+
+def _describe_file_input(drv, el):
+    """Forensic snapshot of one candidate file input -- used only to log
+    why an ambiguous set of candidates couldn't be resolved. Never used to
+    pick a winner by guessing."""
+    try:
+        return drv.execute_script(
+            "var e=arguments[0]; if(!e) return {exists:false};"
+            "var r=e.getBoundingClientRect();"
+            "return {exists:true, connected:e.isConnected,"
+            "visible:!!(e.offsetWidth||e.offsetHeight||e.getClientRects().length),"
+            "disabled:!!e.disabled, multiple:!!e.multiple, accept:e.accept||'',"
+            "rect:{x:r.x,y:r.y,w:r.width,h:r.height},"
+            "files:e.files?e.files.length:0, outer:e.outerHTML.slice(0,500)};",
+            el,
+        )
+    except Exception as e:
+        return {'exists': False, 'error': str(e)}
+
+
+def _poll_for_file_input(drv, timeout: float, before_markers, prefix=''):
+    """Return ONLY a file input that appeared AFTER before_markers was
+    snapshotted -- i.e. one Gemini just created/exposed for the upload
+    action that was just clicked. NEVER falls back to inputs[0]/any
+    pre-existing input: that fallback was the actual root cause of
+    tagging/sending files to an unrelated input and
+    verify_attachment_count() timing out at expected=3, actual!=3.
+    Returns None (never a guess) if no new input appears, or if more than
+    one new input appears and none can be disambiguated."""
+    deadline = time.time() + timeout
     while time.time() < deadline:
         try:
-            drv.execute_script('\n                document.querySelectorAll(\'input[type="file"]\').forEach(function(el){\n                    el.style.cssText=\'display:block!important;opacity:1!important;position:fixed!important;top:0;left:0;z-index:99999;width:200px;height:50px;\';\n                    el.removeAttribute(\'hidden\'); el.removeAttribute(\'disabled\');\n                });\n            ')
+            inputs = drv.find_elements(By.CSS_SELECTOR, "input[type='file']")
         except Exception:
-            pass
-        inputs = drv.find_elements(By.CSS_SELECTOR, "input[type='file']")
-        if inputs:
-            return inputs[0]
-        time.sleep(0.3)
-    raise FileInputMissing(f'Tab T{tid}: file input not found after Create Image mode was verified (4s wait)')
-
-def upload_reference_files(drv, abs_paths: list, tid=0, job_id='') -> bool:
-    """Send file paths to the file input. Returns True on success."""
-    prefix = f'[T{tid}][{job_id}]' if job_id else f'[T{tid}]'
-    valid_paths = [p for p in abs_paths if p and os.path.exists(p)]
-    if not valid_paths:
-        log(f'{prefix} UPLOAD_SKIPPED: No valid reference paths')
-        return True
-    try:
-        fi = find_file_input_strict(drv, tid, job_id)
-        fi.send_keys('\n'.join(valid_paths))
-        return True
-    except FileInputMissing:
-        raise
-    except Exception as e:
-        log(f'{prefix} UPLOAD_FAILED: send_keys error: {e}', file=sys.stderr)
-        return False
-
-def verify_attachment_count(drv, expected: int, tid=0, job_id='') -> tuple:
-    """
-    Polls until attachment chip count == expected (exact match required).
-    Returns (verified: bool, actual_count: int).
-    FAIL on count < expected OR count > expected.
-    If not verified within timeout, returns (False, actual_count).
-    """
-    prefix = f'[T{tid}][{job_id}]' if job_id else f'[T{tid}]'
-    t0 = time.time()
-    chip_count = 0
-    while time.time() - t0 < 15.0:
-        chips = []
-        for sel in ["button[aria-label='close attachment']", 'gem-media-attachment', 'uploader-file-preview', '.attachment-preview-wrapper', "div[data-test-id='uploaded-img']"]:
+            inputs = []
+        candidates = []
+        for el in inputs:
             try:
-                for el in drv.find_elements(By.CSS_SELECTOR, sel):
-                    if el.is_displayed():
-                        chips.append(id(el))
+                marker = drv.execute_script(
+                    "var m = arguments[0].getAttribute('data-vl-input-marker');"
+                    "if (!m) { m = 'vlm_' + Date.now() + '_' + Math.random().toString(36).slice(2); "
+                    "arguments[0].setAttribute('data-vl-input-marker', m); } return m;", el)
+            except Exception:
+                continue
+            if marker not in before_markers:
+                candidates.append((marker, el))
+        if len(candidates) == 1:
+            el = candidates[0][1]
+            # Only THIS element gets made interactable -- never every file
+            # input on the page (that used to force-expose unrelated
+            # inputs elsewhere, making it easier to grab the wrong one).
+            try:
+                drv.execute_script(
+                    "arguments[0].style.cssText='display:block!important;opacity:1!important;"
+                    "position:fixed!important;top:0;left:0;z-index:99999;width:200px;height:50px;';"
+                    "arguments[0].removeAttribute('hidden'); arguments[0].removeAttribute('disabled');", el)
             except Exception:
                 pass
-        chip_count = len(set(chips))
-        if chip_count == expected:
-            log(f'{prefix} ATTACHMENTS {chip_count}/{expected} ✅ (exact match)')
-            return (True, chip_count)
-        time.sleep(0.35)
-    log(f'{prefix} ATTACHMENT_MISMATCH: expected exactly {expected}, got {chip_count} (must be exact — not >= or >)', file=sys.stderr)
-    return (False, chip_count)
+            return el
+        if len(candidates) > 1:
+            descriptions = [_describe_file_input(drv, el) for _, el in candidates]
+            append_runtime_log(f'{prefix} FILE_INPUT_AMBIGUOUS count={len(candidates)} candidates={json.dumps(descriptions, default=str)[:1500]}')
+            return None
+        time.sleep(0.15)
+    return None
+
+def find_file_input_strict(drv, tid=0, job_id=''):
+    """
+    Finds the NEW file input Gemini exposes for an "Upload files" click.
+    Raises FileInputMissing if one can't be uniquely identified -- never
+    guesses (see _poll_for_file_input()).
+
+    Sequence: open the + drawer -> snapshot existing file inputs -> click
+    "Upload files" -> poll for a NEW input only. Snapshotting must happen
+    AFTER the drawer opens and BEFORE "Upload files" is clicked, not
+    before anything (the previous version snapshotted/polled before ever
+    opening the drawer at all, which could match a stale/unrelated input
+    that already existed on the page).
+    """
+    prefix = f'[T{tid}][{job_id}]' if job_id else f'[T{tid}]'
+    for attempt in range(1, 4):
+        if not open_upload_drawer(drv, tid, job_id):
+            append_runtime_log(f'{prefix} FILE_INPUT_RETRY (attempt {attempt}/3): could not open + drawer')
+            time.sleep(0.5)
+            continue
+        before_markers = _snapshot_file_inputs(drv)
+        if not click_upload_files_in_drawer(drv):
+            append_runtime_log(f'{prefix} FILE_INPUT_RETRY (attempt {attempt}/3): "Upload files" not found in drawer')
+            try:
+                drv.find_element(By.TAG_NAME, 'body').send_keys(Keys.ESCAPE)
+            except Exception:
+                pass
+            time.sleep(0.5)
+            continue
+        fi = _poll_for_file_input(drv, timeout=4.0, before_markers=before_markers, prefix=prefix)
+        if fi is not None:
+            return fi
+        append_runtime_log(f'{prefix} FILE_INPUT_RETRY (attempt {attempt}/3): no NEW file input could be uniquely identified')
+        try:
+            drv.find_element(By.TAG_NAME, 'body').send_keys(Keys.ESCAPE)
+        except Exception:
+            pass
+        time.sleep(0.5)
+    raise FileInputMissing(f'Tab T{tid}: NEW upload file input could not be uniquely identified after 3 drawer-open attempts')
+
+def _tag_upload_input(drv, file_input, job_id: str) -> str:
+    """Marks the exact <input type=file> element used for this upload with
+    a unique token, so verify_attachment_count() can later read that same
+    element's real `.files.length` -- the actual browser-side ground truth
+    for how many files this input holds -- instead of inferring a count
+    from unrelated DOM preview elements."""
+    token = f'vl-upload-{job_id}-{uuid.uuid4().hex[:8]}'
+    drv.execute_script("arguments[0].setAttribute('data-vl-upload-token', arguments[1]);", file_input, token)
+    return token
+
+def _attachment_input_debug(drv, upload_token, tid=0, job_id=''):
+    """Full forensic snapshot of the exact tagged <input type=file> right
+    after send_keys() -- goes to worker.log only. Answers "did the files
+    actually land on the input we think they did" directly, instead of
+    inferring it from whether verify_attachment_count() eventually times
+    out."""
+    try:
+        return drv.execute_script(
+            "var token = arguments[0];"
+            "var el = document.querySelector('input[type=\"file\"][data-vl-upload-token=\"' + CSS.escape(token) + '\"]');"
+            "if (!el) return {exists: false};"
+            "return {"
+            "  exists: true,"
+            "  connected: el.isConnected,"
+            "  files_length: el.files ? el.files.length : 0,"
+            "  files: el.files ? Array.from(el.files).map(function(f){return {name:f.name, size:f.size, type:f.type};}) : [],"
+            "  displayed: !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length),"
+            "  outer: el.outerHTML.slice(0, 300)"
+            "};",
+            upload_token,
+        )
+    except Exception as e:
+        return {'exists': False, 'error': str(e)}
+
+
+def upload_reference_files(drv, abs_paths: list, tid=0, job_id='') -> dict:
+    """Send file paths to the file input. Returns {expected, token, paths}.
+    Zero valid reference files is ALWAYS a hard failure -- a job with no
+    references was previously treated as a successful upload (UPLOAD_SKIPPED
+    -> return True), silently proceeding to prompt a Gemini chat with no
+    attachments at all."""
+    prefix = f'[T{tid}][{job_id}]' if job_id else f'[T{tid}]'
+    valid_paths = [str(Path(p).resolve()) for p in abs_paths if p and os.path.exists(p)]
+    if not valid_paths:
+        raise RuntimeError(f'{prefix} UPLOAD_FAILED: no valid reference files')
+    fi = find_file_input_strict(drv, tid, job_id)
+    token = _tag_upload_input(drv, fi, job_id)
+    append_runtime_log(
+        f'{prefix} UPLOAD_ARMED window={drv.current_window_handle} url={drv.current_url} '
+        f'expected_count={len(valid_paths)} upload_token={token} paths={valid_paths}'
+    )
+    fi.send_keys('\n'.join(valid_paths))
+    append_runtime_log(f'{prefix} UPLOAD_SENT files={len(valid_paths)}')
+    debug = _attachment_input_debug(drv, token, tid, job_id)
+    append_runtime_log(f'{prefix} UPLOAD_INPUT_DEBUG {json.dumps(debug, default=str)[:1000]}')
+    return {'expected': len(valid_paths), 'token': token, 'paths': valid_paths}
+
+def _attachment_dom_forensic(drv, upload_token=None):
+    """Diagnostic-only DOM snapshot taken when verify_attachment_count() is
+    about to give up. Never used as a pass/fail signal itself -- it exists
+    so a real ATTACHMENT_MISMATCH carries enough evidence (which selectors
+    matched what, and the tagged input's own state) to tell whether the
+    canonical UI selectors are stale for the current Gemini DOM, whether
+    the tagged input was replaced/disconnected, or whether the files
+    genuinely never attached."""
+    try:
+        return drv.execute_script(
+            "var token = arguments[0];"
+            "var out = {tagged_input_files_length: null, tagged_input_connected: null,"
+            "  all_file_input_count: 0, candidates: [], candidate_count: 0};"
+            "if (token) {"
+            "  var tagged = document.querySelector('input[type=\"file\"][data-vl-upload-token=\"' + CSS.escape(token) + '\"]');"
+            "  if (tagged) {"
+            "    out.tagged_input_connected = tagged.isConnected;"
+            "    out.tagged_input_files_length = tagged.files ? tagged.files.length : 0;"
+            "  }"
+            "}"
+            "out.all_file_input_count = document.querySelectorAll('input[type=\"file\"]').length;"
+            "var selectors = ['gem-media-attachment', 'uploader-file-preview', '[data-test-id=\"uploaded-img\"]',"
+            "  \"button[aria-label*='Remove']\", \"button[aria-label*='attachment']\"];"
+            "selectors.forEach(function(sel) {"
+            "  document.querySelectorAll(sel).forEach(function(el) {"
+            "    var r = el.getBoundingClientRect();"
+            "    out.candidates.push({selector: sel, tag: el.tagName,"
+            "      aria: el.getAttribute('aria-label'), testid: el.getAttribute('data-test-id'),"
+            "      visible: r.width > 0 && r.height > 0, rect: [Math.round(r.x), Math.round(r.y), Math.round(r.width), Math.round(r.height)]});"
+            "  });"
+            "});"
+            "out.candidate_count = out.candidates.length;"
+            "return out;",
+            upload_token,
+        )
+    except Exception as e:
+        return {'error': str(e)}
+
+
+def verify_attachment_count(drv, expected: int, tid=0, job_id='', upload_token=None, timeout_s=15.0) -> tuple:
+    """
+    Polls until the attachment count == expected (exact match required).
+    Returns (True, actual_count) on success; RAISES RuntimeError otherwise
+    -- it never returns a bare False for the caller to accidentally ignore,
+    which is exactly what happened before: the call site printed
+    "ATTACHMENTS VERIFIED" unconditionally after calling this function,
+    regardless of what it returned, so a real "expected 3, got 5" mismatch
+    logged a MISMATCH line and then proceeded anyway.
+
+    PRIMARY evidence: `.files.length` read directly off the exact
+    <input type=file> element used for the upload (tagged by
+    upload_reference_files() via upload_token) -- the real browser-side
+    fact of how many files that input holds, not an inference from DOM
+    preview widgets.
+
+    SECONDARY (used only if the tagged input can't be read, e.g. Gemini
+    replaced the input after upload): canonical UI evidence counting only
+    visible <gem-media-attachment> elements. A prior version of this check
+    combined gem-media-attachment + uploader-file-preview +
+    [data-test-id="uploaded-img"] in one query -- but those selectors can
+    each match a DIFFERENT real DOM node for the SAME single attached file
+    (an outer wrapper plus its own nested preview/image node), so summing
+    them produced ATTACHMENT_OVERCOUNT for a real, correctly-sized upload.
+    gem-media-attachment alone is the top-level attachment component and
+    is what a known-working reference implementation of this same check
+    used successfully.
+    """
+    prefix = f'[T{tid}][{job_id}]' if job_id else f'[T{tid}]'
+    if expected <= 0:
+        raise RuntimeError(f'{prefix} ATTACHMENT_VERIFY_FAILED: expected={expected}')
+
+    deadline = time.time() + timeout_s
+    last_actual = None
+    while time.time() < deadline:
+        if upload_token:
+            try:
+                actual = drv.execute_script(
+                    "var el = document.querySelector('input[type=\"file\"][data-vl-upload-token=\"' + CSS.escape(arguments[0]) + '\"]');"
+                    "if (!el) return -1;"
+                    "return el.files ? el.files.length : 0;",
+                    upload_token,
+                )
+            except Exception:
+                actual = None
+            if actual is not None and actual >= 0:
+                last_actual = int(actual)
+                if last_actual == expected:
+                    append_runtime_log(f'{prefix} ATTACHMENTS {last_actual}/{expected} ✅ FILELIST EXACT')
+                    return (True, last_actual)
+                if last_actual > expected:
+                    raise RuntimeError(f'{prefix} ATTACHMENT_OVERCOUNT source=FILELIST: expected {expected}, got {last_actual}')
+
+        try:
+            result = drv.execute_script(
+                "var nodes = document.querySelectorAll('gem-media-attachment');"
+                "var count = 0;"
+                "nodes.forEach(function(el) { if (el.offsetParent !== null) count++; });"
+                "return count;"
+            )
+        except Exception:
+            result = None
+        if result is not None:
+            last_actual = result
+            if result == expected:
+                append_runtime_log(f'{prefix} ATTACHMENTS {result}/{expected} ✅ CANONICAL UI EXACT')
+                return (True, result)
+            if result > expected:
+                raise RuntimeError(f'{prefix} ATTACHMENT_OVERCOUNT source=CANONICAL_UI: expected {expected}, got {result}')
+
+        time.sleep(0.25)
+
+    forensic = _attachment_dom_forensic(drv, upload_token)
+    append_runtime_log(f'{prefix} ATTACHMENT_DOM_FORENSIC {json.dumps(forensic, default=str)[:8000]}')
+    raise RuntimeError(
+        f'{prefix} ATTACHMENT_MISMATCH: expected exactly {expected}, got {last_actual} '
+        f'(tagged_input={forensic.get("tagged_input_files_length")}, '
+        f'all_file_inputs={forensic.get("all_file_input_count")}, '
+        f'candidate_nodes={forensic.get("candidate_count")})'
+    )
 
 def normalize_prompt_text(text):
     if not text:
@@ -1927,116 +3544,383 @@ def _set_clipboard_xclip(text):
     except Exception:
         return False
 
-def get_quill_editor(drv):
-    for sel in ["div.ql-editor[data-placeholder='Describe your image']", "div.ql-editor[contenteditable='true']", "rich-textarea div[contenteditable='true']", "div[contenteditable='true']"]:
-        try:
-            for el in drv.find_elements(By.CSS_SELECTOR, sel):
-                if el.is_displayed():
-                    return el
-        except Exception:
-            pass
-    return None
+_COMPOSER_VISIBILITY_JS = """
+    function visible(el) {
+        if (!el) return false;
+        var r = el.getBoundingClientRect();
+        if (r.width <= 0 || r.height <= 0) return false;
+        var cs = window.getComputedStyle(el);
+        if (cs.visibility === 'hidden' || cs.display === 'none') return false;
+        if (parseFloat(cs.opacity) === 0) return false;
+        return el.offsetParent !== null;
+    }
+    var groups = [
+        ["div.ql-editor[data-placeholder='Describe your image']", 1],
+        ["div.ql-editor[contenteditable='true']", 2],
+        ["rich-textarea div[contenteditable='true']", 3],
+        ["div[contenteditable='true']", 4],
+    ];
+    for (var g = 0; g < groups.length; g++) {
+        var els = document.querySelectorAll(groups[g][0]);
+        for (var i = 0; i < els.length; i++) {
+            if (visible(els[i])) {
+                var el = els[i];
+                var r = el.getBoundingClientRect();
+                return {
+                    el: el,
+                    prio: groups[g][1],
+                    placeholder: el.getAttribute('data-placeholder') || '',
+                    tag: el.tagName,
+                    cls: (el.className || '').toString().slice(0, 80),
+                    rect: [Math.round(r.x), Math.round(r.y), Math.round(r.width), Math.round(r.height)],
+                };
+            }
+        }
+    }
+    return null;
+"""
 
-def _verify_editor_prompt(drv, editor, expected_text, tid=0, job_id=''):
+
+def get_active_gemini_image_composer(drv, tid=0, job_id=''):
+    """Locate the ONE currently-visible active Gemini image-generation
+    composer -- never a hidden/detached/background editor. Priority order:
+    (1) exact "Describe your image" placeholder, (2) any visible ql-editor,
+    (3) rich-textarea contenteditable, (4) any visible contenteditable.
+    Visibility is proven via boundingClientRect size, computed style, and
+    offsetParent -- not just Selenium's own is_displayed() heuristic.
+    Logs which candidate was chosen (forensic detail only, never to
+    console) so a composer-targeting regression is diagnosable from
+    worker.log alone. Returns the WebElement, or None if nothing visible
+    matched."""
     prefix = f'[T{tid}][{job_id}]' if job_id else f'[T{tid}]'
     try:
-        actual_raw = editor.text or ''
-        if not actual_raw:
-            actual_raw = drv.execute_script("return (arguments[0].textContent || '');", editor) or ''
-        expected_norm = normalize_prompt_text(expected_text)
-        actual_norm = normalize_prompt_text(actual_raw)
-        exp_len = len(expected_norm)
-        act_len = len(actual_norm)
-        log(f'{prefix} PROMPT_LENGTH expected={exp_len} actual={act_len}')
-        if exp_len == 0:
-            return act_len == 0
-        coverage = act_len / exp_len if exp_len > 0 else 0
-        if coverage < 0.98 or coverage > 1.05:
-            log(f'{prefix} PROMPT_LENGTH_MISMATCH coverage={coverage:.2%}')
-            return False
-        prefix_len = min(80, exp_len)
-        if actual_norm[:prefix_len] != expected_norm[:prefix_len]:
-            log(f"{prefix} PROMPT_START_MISMATCH: '{actual_norm[:30]}' != '{expected_norm[:30]}'")
-            return False
-        log(f'{prefix} PROMPT_START_VERIFIED')
-        suffix_len = min(80, exp_len)
-        if actual_norm[-suffix_len:] != expected_norm[-suffix_len:]:
-            log(f"{prefix} PROMPT_END_MISMATCH: '{actual_norm[-30:]}' != '{expected_norm[-30:]}'")
-            return False
-        log(f'{prefix} PROMPT_END_VERIFIED')
-        log(f'{prefix} PROMPT_VERIFIED ✅')
-        return True
+        result = drv.execute_script(_COMPOSER_VISIBILITY_JS)
     except Exception as e:
-        log(f'{prefix} Prompt verification error: {e}')
+        append_runtime_log(f'{prefix} PROMPT_COMPOSER_LOOKUP_ERROR: {e}')
+        return None
+    if not result:
+        append_runtime_log(f'{prefix} PROMPT_COMPOSER_NOT_FOUND')
+        return None
+    append_runtime_log(
+        f"{prefix} PROMPT_COMPOSER_FOUND prio={result['prio']} placeholder='{result['placeholder']}' "
+        f"tag={result['tag']} class='{result['cls']}' rect={result['rect']}"
+    )
+    return result['el']
+
+
+def get_quill_editor(drv):
+    """Backward-compatible name kept for the few callers that just need
+    *a* composer (e.g. the Enter-key send fallback); prefer
+    get_active_gemini_image_composer() wherever the choice is logged and
+    matters for verification."""
+    return get_active_gemini_image_composer(drv)
+
+# _verify_editor_prompt() (post-paste content verification) was tried
+# twice now (V16.3 removed it for speed, V16.4 restored it) and V16.4
+# produced a confirmed FALSE NEGATIVE in a real run: worker.log recorded
+# PromptFailed on all methods for a job whose Gemini composer screenshot
+# at that exact moment showed the correct, complete production prompt
+# actually present. Whatever the fresh-composer re-find or coverage/
+# prefix/suffix check was doing wrong, it was rejecting a genuinely
+# successful paste -- worse than no verification at all, since it turns
+# working jobs into failures. Removed again by explicit instruction
+# (V16.5): _inject_prompt_atomic() is back to a single unverified
+# clipboard paste. If prompt correctness needs checking again in the
+# future, the fresh-composer lookup / coverage logic needs to be fixed
+# and proven against a real run BEFORE being wired back in as a gate.
+
+def _clear_editor(drv, editor, tid=0, job_id=''):
+    """Clear the composer and PROVE it's actually empty afterward -- a
+    clear that silently didn't take (e.g. focus was stolen mid-sequence)
+    previously proceeded straight to injection, letting new text get
+    appended after leftover content instead of replacing it. Returns
+    True only if a fresh read of the live composer confirms zero visible
+    text; callers that ignore a False return are exactly reintroducing
+    this bug."""
+    drv.execute_script('arguments[0].focus();', editor)
+    time.sleep(0.1)
+    ActionChains(drv).click(editor).key_down(Keys.CONTROL).send_keys('a').key_up(Keys.CONTROL).perform()
+    time.sleep(0.05)
+    ActionChains(drv).send_keys(Keys.DELETE).perform()
+    drv.execute_script(
+        "arguments[0].focus();"
+        "document.execCommand('selectAll',false,null);"
+        "document.execCommand('delete',false,null);", editor)
+    time.sleep(0.15)
+    fresh = get_active_gemini_image_composer(drv, tid=tid, job_id=job_id)
+    if not fresh:
         return False
+    try:
+        actual = drv.execute_script(
+            "return (arguments[0].innerText || arguments[0].textContent || '');", fresh) or ''
+    except Exception:
+        return False
+    return not normalize_prompt_text(actual)
+
+
+def _focus_and_verify_composer(drv, editor, prefix='') -> bool:
+    """Prove focus landed on the composer before injecting -- never run an
+    injection method against an element that Selenium merely called
+    .focus() on without confirming document.activeElement actually moved
+    there (Gemini's own JS can steal focus back)."""
+    try:
+        drv.execute_script("arguments[0].scrollIntoView({block:'center'});", editor)
+    except Exception:
+        pass
+    try:
+        ok = drv.execute_script(
+            "arguments[0].focus(); return document.activeElement === arguments[0];", editor
+        )
+    except Exception:
+        ok = False
+    if not ok:
+        append_runtime_log(f'{prefix} PROMPT_FOCUS_MISMATCH — retrying focus')
+        try:
+            editor.click()
+            ok = drv.execute_script("return document.activeElement === arguments[0];", editor)
+        except Exception:
+            ok = False
+    return bool(ok)
+
+
+def _prep_composer_for_tier(drv, tid, job_id, prefix):
+    """Re-find the CURRENT visible composer, clear it, and prove focus --
+    run at the start of every tier so no tier ever operates on a stale
+    WebElement left over from a previous tier's DOM re-render. Fails
+    closed (returns None) if the composer can't be found, clearing
+    raises, or focus is never actually proven to land -- a tier used to
+    proceed to inject text regardless of whether focus verification
+    passed, which meant CDP/execCommand/send_keys could all fire against
+    an unfocused element and still "work" by accident, masking a real
+    focus problem instead of surfacing it."""
+    editor = get_active_gemini_image_composer(drv, tid=tid, job_id=job_id)
+    if not editor:
+        append_runtime_log(f'{prefix} PROMPT_PREP FAIL=COMPOSER_NOT_FOUND')
+        return None
+    try:
+        cleared = _clear_editor(drv, editor, tid=tid, job_id=job_id)
+    except Exception as e:
+        append_runtime_log(f'{prefix} PROMPT_PREP FAIL=CLEAR_ERROR {e}')
+        return None
+    if not cleared:
+        append_runtime_log(f'{prefix} PROMPT_PREP FAIL=CLEAR_NOT_VERIFIED')
+        return None
+    if not _focus_and_verify_composer(drv, editor, prefix=prefix):
+        append_runtime_log(f'{prefix} PROMPT_PREP FAIL=FOCUS_NOT_VERIFIED')
+        return None
+    return editor
+
 
 def _inject_prompt_atomic(drv, text, tid=0, job_id=''):
     """
-    Inject full prompt in ONE atomic operation.
-    Primary: Chrome CDP Input.insertText
-    Fallback: single xclip Ctrl+V
-    No chunked/loop typing ever.
+    V16.5, by explicit instruction: single clipboard paste, no post-paste
+    content verification. Sequence: find the current composer, focus it,
+    clear it (pre-paste setup -- not content verification), put the full
+    text on the X11 clipboard via xclip, click+Ctrl+V once, a tiny
+    UI-settle delay, done.
+
+    The ONLY fallback to a different injection mechanism is a real
+    xclip failure (the clipboard write itself failing) -- never because
+    of unverified content, since no such verification runs here. The
+    fallback methods are likewise unverified and single-shot.
     """
     prefix = f'[T{tid}][{job_id}]' if job_id else f'[T{tid}]'
-    editor = get_quill_editor(drv)
-    if not editor:
-        raise PromptFailed(f'Tab T{tid}: Quill editor not found')
-    for attempt in range(1, 3):
-        try:
-            drv.execute_script('arguments[0].focus();', editor)
-            time.sleep(0.1)
-            ActionChains(drv).click(editor).key_down(Keys.CONTROL).send_keys('a').key_up(Keys.CONTROL).perform()
-            time.sleep(0.05)
-            ActionChains(drv).send_keys(Keys.DELETE).perform()
-            drv.execute_script("document.execCommand('selectAll',false,null);document.execCommand('delete',false,null);")
-            time.sleep(0.1)
-            cdp_ok = False
-            try:
-                drv.execute_cdp_cmd('Input.insertText', {'text': text})
-                cdp_ok = True
-                log(f'{prefix} PROMPT_INJECTING via CDP')
-            except Exception as cdp_err:
-                log(f'{prefix} CDP notice ({cdp_err}), trying xclip fallback...')
-            if not cdp_ok:
-                if _set_clipboard_xclip(text):
-                    drv.execute_script('arguments[0].focus();', editor)
-                    ActionChains(drv).click(editor).key_down(Keys.CONTROL).send_keys('v').key_up(Keys.CONTROL).perform()
-                    log(f'{prefix} PROMPT_INJECTING via xclip Ctrl+V')
-                else:
-                    log(f'{prefix} xclip failed', file=sys.stderr)
-            time.sleep(0.3)
-            if _verify_editor_prompt(drv, editor, text, tid=tid, job_id=job_id):
-                return True
-            else:
-                log(f'{prefix} PROMPT_VERIFY_FAIL attempt {attempt} — clearing and retrying')
-                drv.execute_script("arguments[0].focus();document.execCommand('selectAll',false,null);document.execCommand('delete',false,null);", editor)
-                time.sleep(0.3)
-        except PromptFailed:
-            raise
-        except Exception as e:
-            log(f'{prefix} Prompt injection exception (attempt {attempt}): {e}')
-            try:
-                drv.execute_script("arguments[0].focus();document.execCommand('selectAll',false,null);document.execCommand('delete',false,null);", editor)
-            except Exception:
-                pass
-            time.sleep(0.3)
-    raise PromptFailed(f'Tab T{tid}: Prompt injection failed after 2 atomic attempts')
+    append_runtime_log(f'{prefix} GEMINI_PROMPT_INJECT_STARTED len={len(text)}')
 
-def _click_send_button(drv):
+    editor = _prep_composer_for_tier(drv, tid, job_id, prefix)
+    if not editor:
+        raise PromptFailed(f'Tab T{tid}: composer not found/focus+clear not proven before prompt injection')
+
+    if _set_clipboard_xclip(text):
+        ActionChains(drv).click(editor).key_down(Keys.CONTROL).send_keys('v').key_up(Keys.CONTROL).perform()
+        time.sleep(0.1)
+        append_runtime_log(f'{prefix} PROMPT_METHOD_USED=clipboard (unverified)')
+        progress_detail(job_id, 'prompt_method', 'clipboard')
+        return True
+
+    # xclip itself failed to write the clipboard -- a real OS-level
+    # failure, not a content-verification failure -- fall back, still
+    # with no post-paste verification.
+    append_runtime_log(f'{prefix} PROMPT_CLIPBOARD_SET_FAIL — falling back to execCommand')
     try:
-        res = drv.execute_script('\n            var sels = [\'mat-icon[fonticon="arrow_upward"]\', \'mat-icon[data-mat-icon-name="arrow_upward"]\',\n                        \'mat-icon[fonticon="send"]\', \'button[aria-label="Send message"]\'];\n            for (var s = 0; s < sels.length; s++) {\n                var els = document.querySelectorAll(sels[s]);\n                for (var i = 0; i < els.length; i++) {\n                    var b = els[i].tagName === \'BUTTON\' ? els[i] : els[i].closest(\'button\');\n                    if (b && !b.disabled && b.offsetParent !== null) { b.click(); return \'OK\'; }\n                }\n            } return \'NO\';\n        ')
-        if res == 'OK':
-            return True
+        drv.execute_script(
+            "var editor=arguments[0], text=arguments[1];"
+            "editor.focus();"
+            "document.execCommand('insertText', false, text);"
+            "editor.dispatchEvent(new InputEvent('input', {bubbles:true, inputType:'insertText', data:text}));",
+            editor, text,
+        )
+        time.sleep(0.1)
+        append_runtime_log(f'{prefix} PROMPT_METHOD_USED=execCommand (unverified, xclip-fallback)')
+        progress_detail(job_id, 'prompt_method', 'execCommand')
+        return True
+    except Exception as e:
+        append_runtime_log(f'{prefix} PROMPT_EXECCOMMAND_ERROR: {e}')
+
+    try:
+        editor.send_keys(text)
+        time.sleep(0.1)
+        append_runtime_log(f'{prefix} PROMPT_METHOD_USED=send_keys (unverified, xclip-fallback)')
+        progress_detail(job_id, 'prompt_method', 'send_keys')
+        return True
+    except Exception as e:
+        append_runtime_log(f'{prefix} PROMPT_SENDKEYS_ERROR: {e}')
+
+    raise PromptFailed(f'Tab T{tid}: xclip clipboard set failed and all fallback injection methods raised')
+
+def _log_click_rect_and_occlusion(drv, element, label, prefix=''):
+    """Logs the element's viewport rect before a critical click, and whether
+    something else is actually on top of it at that point -- so a failed
+    click shows up in logs as "occluded by X" instead of just "click didn't
+    work", matching this file's DOM-state-verification pattern elsewhere
+    (attachment count, prompt length) applied to click targets too."""
+    try:
+        info = drv.execute_script(
+            "var r = arguments[0].getBoundingClientRect();"
+            "var cx = r.x + r.width / 2, cy = r.y + r.height / 2;"
+            "var top = document.elementFromPoint(cx, cy);"
+            "var owns = top === arguments[0] || arguments[0].contains(top) || (top && top.contains(arguments[0]));"
+            "return {x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height),"
+            "        owns: !!owns, topTag: top ? top.tagName : 'NONE'};",
+            element,
+        )
+        if not info:
+            return True  # couldn't inspect -- don't block the click over it
+        append_runtime_log(f"{prefix} {label}_RECT x={info['x']} y={info['y']} w={info['w']} h={info['h']}")
+        if not info['owns']:
+            append_runtime_log(f"{prefix} {label}_OCCLUDED by <{info['topTag']}>")
+        return info['owns']
+    except Exception:
+        return True
+
+_SEND_BUTTON_JS = """
+    var editor = arguments[0];
+    var sels = ['mat-icon[fonticon="arrow_upward"]', 'mat-icon[data-mat-icon-name="arrow_upward"]',
+                'mat-icon[fonticon="send"]', 'mat-icon[data-mat-icon-name="send"]',
+                'button[aria-label="Send message"]', "button[data-test-id='send-button']"];
+
+    function collect(root) {
+        var res = [];
+        for (var s = 0; s < sels.length; s++) {
+            var els = root.querySelectorAll(sels[s]);
+            for (var i = 0; i < els.length; i++) {
+                var b = els[i].tagName === 'BUTTON' ? els[i] : els[i].closest('button');
+                if (b && !b.disabled && b.offsetParent !== null) res.push(b);
+            }
+        }
+        return res;
+    }
+
+    // Walk up from the composer looking for an ancestor that already
+    // contains a send-button candidate -- that ancestor is the composer's
+    // real input-area container, so a click found there can't cross-target
+    // another tab/job's send button elsewhere on a shared-driver page.
+    var el = editor;
+    for (var depth = 0; depth < 8 && el; depth++) {
+        var found = collect(el);
+        if (found.length > 0) return {scoped: true, btns: found};
+        el = el.parentElement;
+    }
+    return {scoped: false, btns: collect(document)};
+"""
+
+
+def _click_send_button_once(drv, tid=0, job_id=''):
+    """Fail-closed by design: with T0-T3 sharing one Chrome driver, a
+    page-wide Send scan risks clicking a button that doesn't actually
+    belong to THIS job's verified composer. If the composer can't be
+    found, or no send button is found scoped to it, this returns False
+    rather than falling back to an unscoped page-wide click."""
+    prefix = f'[T{tid}][{job_id}]' if job_id else f'[T{tid}]'
+    editor = get_active_gemini_image_composer(drv, tid=tid, job_id=job_id)
+    if editor is None:
+        append_runtime_log(f'{prefix} SEND_ABORT no active composer to scope from')
+        return False
+    try:
+        result = drv.execute_script(_SEND_BUTTON_JS, editor)
+    except Exception as e:
+        append_runtime_log(f'{prefix} SEND_SCOPE_LOOKUP_ERROR: {e}')
+        return False
+    if not result:
+        append_runtime_log(f'{prefix} SEND_SCOPE_FAILED no send button found in composer scope')
+        return False
+    if not result.get('scoped'):
+        append_runtime_log(f'{prefix} SEND_SCOPE_FAILED no composer-scoped ancestor found (not falling back to page-wide)')
+        return False
+    for btn in result.get('btns') or []:
+        if not _log_click_rect_and_occlusion(drv, btn, 'SEND', prefix):
+            continue
+        drv.execute_script('arguments[0].click();', btn)
+        return True
+    return False
+
+
+MAX_SEND_RETRIES = 6
+SEND_RETRY_GAP_S = 0.3
+
+
+def _click_send_button(drv, tid=0, job_id=''):
+    """Retries the send-button click -- the button can still be disabled
+    for a brief moment right after prompt injection finishes, so a single
+    attempt (the previous behavior) could spuriously fail a job whose
+    prompt was actually verified. Falls back to Enter on the composer if
+    no clickable send button is ever found.
+
+    PART 9: clicking without raising is only SEND_CLICKED. This function
+    now additionally proves the message ACTUALLY LEFT the composer: after
+    a successful click it polls the live UI snapshot until the active
+    visible composer has emptied and/or real generation evidence appeared
+    (GEMINI_SEND_VERIFIED in worker.log). A click that leaves the prompt
+    sitting in the box returns False -- never a silent True."""
+    prefix = f'[T{tid}][{job_id}]' if job_id else f'[T{tid}]'
+    # Pre-click length of the ACTIVE visible composer (what we expect to
+    # disappear once the message is really sent).
+    pre_len = -1
+    try:
+        pre_len = int(_gemini_ui_snapshot(drv).get('composer_text_len') or -1)
     except Exception:
         pass
-    for xp in ["//mat-icon[@data-mat-icon-name='arrow_upward']/ancestor::button", "//mat-icon[@fonticon='arrow_upward']/ancestor::button", "//button[@aria-label='Send message']"]:
+    # PART: Send:Target/Send:Click/Sent detail goes to worker.log only --
+    # the single per-job live line (JOB_PROGRESS 'send' stage, marked
+    # run/ok/fail by the caller) is the only notebook-visible output for
+    # this job, so this function no longer prints its own extra lines.
+    clicked = False
+    for attempt in range(1, MAX_SEND_RETRIES + 1):
+        if _click_send_button_once(drv, tid=tid, job_id=job_id):
+            clicked = True
+            break
+        time.sleep(SEND_RETRY_GAP_S)
+    if not clicked:
         try:
-            for btn in drv.find_elements(By.XPATH, xp):
-                if btn.is_displayed() and btn.is_enabled():
-                    drv.execute_script('arguments[0].click();', btn)
-                    return True
-        except Exception:
-            continue
+            editor = get_active_gemini_image_composer(drv, tid=tid, job_id=job_id)
+            if editor and editor.is_displayed():
+                editor.send_keys(Keys.RETURN)
+                append_runtime_log(f'{prefix} SEND via Enter fallback')
+                clicked = True
+        except Exception as e:
+            append_runtime_log(f'{prefix} Enter fallback failed: {e}')
+    if not clicked:
+        return False
+    append_runtime_log(f'{prefix} GEMINI_SEND_CLICKED pre_composer_len={pre_len}')
+    deadline = time.time() + 8.0
+    while time.time() < deadline:
+        snap = _gemini_ui_snapshot(drv)
+        composer_empty = snap.get('composer_text_len', -1) == 0
+        gen_evidence = snap.get('stop_ctrl') == 'PRESENT'
+        if gen_evidence or (pre_len > 0 and composer_empty):
+            append_runtime_log(
+                f"{prefix} GEMINI_SEND_VERIFIED composer_emptied={composer_empty} "
+                f"gen_evidence={gen_evidence} composer_len={snap.get('composer_text_len')}"
+            )
+            append_runtime_log(f'{prefix} SEND_VERIFIED ✅')
+            progress_detail(job_id, 'sent', True)
+            progress_detail(job_id, 'waiting_generation', True)
+            return True
+        time.sleep(0.4)
+    append_runtime_log(
+        f"{prefix} SEND_NOT_CONFIRMED composer did not empty / no generation evidence within 8s "
+        f"(last composer_len={_gemini_ui_snapshot(drv).get('composer_text_len')})"
+    )
     return False
 
 def verify_generation_started(drv, timeout=6.0):
@@ -2151,24 +4035,50 @@ def nb_check_image(drv, urls_before, chat_urls):
             return ('TIMEOUT', None)
     return ('WAITING', None)
 
-def _hover_and_dl_single_click(drv, urls_before, chat_urls) -> bool:
+def _hover_and_dl_single_click_once(drv, urls_before, chat_urls) -> bool:
     """
     Primary download method: hover over the generated image, click Download button.
     Returns True if download button was clicked.
     """
 
+    def _find_and_click_dl_btn():
+        for sel in ["button[data-test-id='download-generated-image-button']", "//mat-icon[@data-mat-icon-name='download']/ancestor::button", "//mat-icon[@fonticon='download']/ancestor::button", "button[aria-label*='Download']"]:
+            by = By.XPATH if sel.startswith('//') else By.CSS_SELECTOR
+            for btn in reversed(drv.find_elements(by, sel)):
+                if btn.is_displayed() and btn.is_enabled():
+                    drv.execute_script('arguments[0].click();', btn)
+                    return True
+        return False
+
     def _try_hover(img):
         try:
-            drv.execute_script("arguments[0].scrollIntoView({block:'center',behavior:'instant'});", img)
-            time.sleep(0.15)
-            ActionChains(drv).move_to_element(img).perform()
-            time.sleep(0.2)
-            for sel in ["button[data-test-id='download-generated-image-button']", "//mat-icon[@data-mat-icon-name='download']/ancestor::button", "//mat-icon[@fonticon='download']/ancestor::button", "button[aria-label*='Download']"]:
-                by = By.XPATH if sel.startswith('//') else By.CSS_SELECTOR
-                for btn in reversed(drv.find_elements(by, sel)):
-                    if btn.is_displayed() and btn.is_enabled():
-                        drv.execute_script('arguments[0].click();', btn)
-                        return True
+            drv.execute_script("arguments[0].scrollIntoView({block:'center',behavior:'smooth'});", img)
+            time.sleep(0.4)
+            try:
+                ActionChains(drv).move_to_element(img).perform()
+                time.sleep(0.5)
+                if _find_and_click_dl_btn():
+                    return True
+            except Exception:
+                pass
+            # Real ActionChains hover can miss Gemini's hover-triggered download
+            # button (proven behavior from the older browser implementation) --
+            # dispatch synthetic mouse events as a second attempt before giving
+            # up on this image.
+            try:
+                drv.execute_script(
+                    "var el=arguments[0];"
+                    "['mouseenter','mouseover','mousemove'].forEach(function(evt){"
+                    "el.dispatchEvent(new MouseEvent(evt,{bubbles:true,cancelable:true,view:window,"
+                    "clientX:el.getBoundingClientRect().left+el.offsetWidth/2,"
+                    "clientY:el.getBoundingClientRect().top+el.offsetHeight/2}));});",
+                    img,
+                )
+                time.sleep(0.5)
+                if _find_and_click_dl_btn():
+                    return True
+            except Exception:
+                pass
         except Exception:
             pass
         return False
@@ -2198,6 +4108,55 @@ def _hover_and_dl_single_click(drv, urls_before, chat_urls) -> bool:
     except Exception:
         pass
     return False
+
+
+DOWNLOAD_BUTTON_RETRIES = 3
+DOWNLOAD_BUTTON_RETRY_GAP_S = 0.5
+
+
+def _hover_and_dl_single_click(drv, urls_before, chat_urls, prefix='') -> bool:
+    """Retries the hover+click download attempt -- Gemini's download button
+    is hover-triggered and can take a moment to render, so a single pass
+    (the previous behavior, whose return value the caller didn't even
+    check) could miss it even though the image was ready."""
+    for attempt in range(1, DOWNLOAD_BUTTON_RETRIES + 1):
+        if _hover_and_dl_single_click_once(drv, urls_before, chat_urls):
+            return True
+        append_runtime_log(f'{prefix} DOWNLOAD_BUTTON_NOT_FOUND attempt {attempt}/{DOWNLOAD_BUTTON_RETRIES}')
+        if attempt < DOWNLOAD_BUTTON_RETRIES:
+            time.sleep(DOWNLOAD_BUTTON_RETRY_GAP_S)
+    return False
+
+def _check_gemini_download_snackbar(drv, prefix='') -> bool:
+    """Poll briefly for Gemini's own "Downloading full size..." snackbar
+    (div.snackbar-message [data-test-id="label"]) right after the download
+    button click -- real evidence straight from the Gemini UI that IT
+    believes a download just started, confirmed by production DOM (the
+    exact markup pasted in the request this was added for).
+
+    This is a SECOND, independent UI-level signal alongside the existing
+    CDP Browser.downloadWillBegin event and the filesystem
+    partial/final-file check -- never a replacement for either, and never
+    by itself proof the file is complete. It's a fast (<=2s) best-effort
+    check: its absence is not an error (a fast download can finish before
+    this ever gets a chance to see the snackbar), so it never raises and
+    never blocks the real start-detection loop that follows it."""
+    deadline = time.time() + 2.0
+    while time.time() < deadline:
+        try:
+            for el in drv.find_elements(By.CSS_SELECTOR, 'div.snackbar-message [data-test-id="label"]'):
+                if not el.is_displayed():
+                    continue
+                txt = (el.text or '').strip()
+                if 'downloading' in txt.lower():
+                    append_runtime_log(f'{prefix} [GEMINI-DL] UI_DOWNLOAD_STARTED')
+                    append_runtime_log(f'{prefix} [GEMINI-DL] snackbar="{txt}"')
+                    return True
+        except Exception:
+            pass
+        time.sleep(0.2)
+    return False
+
 
 def _direct_fetch_cdp(drv, save_path, urls_before) -> bool:
     """
@@ -2235,7 +4194,41 @@ def fetch_generation(gen_id):
     finally:
         conn.close()
 
+ALLOW_PROMPT_FALLBACK = os.environ.get('ALLOW_PROMPT_FALLBACK', '0') == '1'
+
+def _safe_url_for_log(url):
+    """Strip query params before logging a reference URL -- these are R2
+    public URLs with no secrets in the path, but any future signed URL
+    could carry a token/signature in its query string, so this is
+    stripped defensively rather than assumed safe."""
+    try:
+        parsed = urllib.parse.urlparse(str(url))
+        if not parsed.scheme:
+            return str(url)[:180]
+        return f'{parsed.scheme}://{parsed.netloc}{parsed.path}'
+    except Exception:
+        return '<unparseable-url>'
+
+
+def _download_labeled_ref(label, url, gen_id):
+    """download_remote_image() wrapper that logs WHICH reference field and
+    WHICH (query-stripped) URL failed before re-raising -- a bare
+    REF_HTTP_PERMANENT_FAILURE/REF_DOWNLOAD_FAILED gave no way to tell
+    whether a real run's 404s were bad/deleted R2 objects (data problem)
+    or a URL-construction bug on our side (code problem)."""
+    try:
+        return sys.modules['fashion_studio'].download_remote_image(url, REFS_CACHE_DIR)
+    except Exception as e:
+        append_runtime_log(f'[{gen_id}] REF_DOWNLOAD_FAILED_FIELD label={label} url={_safe_url_for_log(url)} error={e}')
+        raise
+
+
 def resolve_prompt_and_refs(gen):
+    db_prompt = gen.get('prompt')
+    if isinstance(db_prompt, str):
+        db_prompt = db_prompt.strip()
+    if not db_prompt and not ALLOW_PROMPT_FALLBACK:
+        raise RuntimeError(f"PROMPT_MISSING_IN_DB: generation {gen['id']} has no prompt (set ALLOW_PROMPT_FALLBACK=1 to allow the generic fallback prompt in development)")
     params = gen.get('params') or {}
     if isinstance(params, str):
         try:
@@ -2249,10 +4242,10 @@ def resolve_prompt_and_refs(gen):
         raise ValueError(f"Generation {gen['id']}: No garment reference found in params.")
     model_img_url = params.get('modelImage') or gen.get('model_angle_url') or gen.get('model_image_url')
     holo_url = params.get('styleImage') or gen.get('hologram_url')
-    garment_path = sys.modules['fashion_studio'].download_remote_image(garment_url, REFS_CACHE_DIR)
-    model_path = sys.modules['fashion_studio'].download_remote_image(model_img_url, REFS_CACHE_DIR) if model_img_url else None
-    holo_path = sys.modules['fashion_studio'].download_remote_image(holo_url, REFS_CACHE_DIR) if holo_url else None
-    prompt = gen.get('prompt') or sys.modules['fashion_studio'].fashion_tryon_prompt(has_model=bool(model_path))
+    garment_path = _download_labeled_ref('garment', garment_url, gen['id'])
+    model_path = _download_labeled_ref('model', model_img_url, gen['id']) if model_img_url else None
+    holo_path = _download_labeled_ref('hologram', holo_url, gen['id']) if holo_url else None
+    prompt = db_prompt or sys.modules['fashion_studio'].fashion_tryon_prompt(has_model=bool(model_path))
     return (prompt, garment_path, model_path, holo_path)
 
 def record_dead_letter(gen, failed_reason, attempts_made, max_attempts, error_stack=None):
@@ -2272,6 +4265,11 @@ def record_dead_letter(gen, failed_reason, attempts_made, max_attempts, error_st
 class JobState(Enum):
     QUEUED = "QUEUED"
     GEMINI_RESERVED = "GEMINI_RESERVED"
+    GEMINI_NEW_CHAT = "GEMINI_NEW_CHAT"
+    GEMINI_MODE_SELECT = "GEMINI_MODE_SELECT"
+    GEMINI_UPLOADING = "GEMINI_UPLOADING"
+    GEMINI_PROMPT = "GEMINI_PROMPT"
+    GEMINI_SEND_PENDING = "GEMINI_SEND_PENDING"
     GEMINI_GENERATING = "GEMINI_GENERATING"
     RAW_DOWNLOAD_START = "RAW_DOWNLOAD_START"
     GEMINI_RELEASED = "GEMINI_RELEASED"
@@ -2316,19 +4314,72 @@ class JobContext:
     raw_path: Optional[str] = None
     clean_png_path: Optional[str] = None
     webp_path: Optional[str] = None
+    output_url: Optional[str] = None
     
     error: Optional[str] = None
     completed_at: Optional[float] = None
 
+    # BullMQ's own retry bookkeeping for THIS job, copied from the Job
+    # object in process_bullmq_job -- used to decide whether a failure here
+    # is final (mark DB failed + refund) or merely this attempt's failure
+    # with BullMQ retries still remaining (leave DB/credits alone and let
+    # the next attempt run). attempts_made is 0-based (BullMQ's own
+    # job.attemptsMade before this attempt); max_attempts is job.attempts.
+    attempts_made: int = 0
+    max_attempts: int = 1
+
+    # Timing checkpoints for the JOB TIMING report printed at completion --
+    # each set once, the first time execution reaches the corresponding
+    # state, from _set_state_threadsafe's _TIMING_FIELD_BY_STATE map.
+    received_at: float = field(default_factory=time.time)
+    gemini_start_at: Optional[float] = None
+    raw_download_start_at: Optional[float] = None
+    raw_ready_at: Optional[float] = None
+    wmr_start_at: Optional[float] = None
+    clean_download_start_at: Optional[float] = None
+    clean_ready_at: Optional[float] = None
+    webp_at: Optional[float] = None
+    r2_at: Optional[float] = None
+
     state_waiters: Dict[JobState, List[asyncio.Future]] = field(default_factory=dict)
+
+    # Central Gemini scheduler bookkeeping -- gemini_done_future is resolved
+    # by gemini_scheduler_loop() (success) or _handle_gemini_failure()
+    # (exception) once this job's Gemini phase (setup through download-start
+    # + resource release) is fully done; execute_pipeline() awaits it instead
+    # of calling GEMINI_BROKER.acquire()/GeminiWorker directly, since only
+    # the scheduler is allowed to touch the shared Gemini driver now.
+    gemini_done_future: Optional[asyncio.Future] = None
+    gemini_acquired_at: Optional[float] = None
+    generation_started_at: Optional[float] = None
+    gemini_staging_dir: Optional[Path] = None
+    # Guards GEMINI_ADMISSION_GATE.release() from firing twice for the same
+    # job (once on setup success, once if a LATER failure -- e.g. during
+    # download -- also routes through _handle_gemini_failure after the
+    # gate was already released).
+    gemini_admission_released: bool = False
 
     def transition_sync(self, new_state: JobState):
         self.loop.call_soon_threadsafe(self._set_state_threadsafe, new_state)
 
+    _TIMING_FIELD_BY_STATE = {
+        JobState.GEMINI_GENERATING: "gemini_start_at",
+        JobState.RAW_DOWNLOAD_START: "raw_download_start_at",
+        JobState.RAW_READY: "raw_ready_at",
+        JobState.WMR_PROCESSING: "wmr_start_at",
+        JobState.WMR_DOWNLOAD_START: "clean_download_start_at",
+        JobState.CLEAN_READY: "clean_ready_at",
+        JobState.WEBP_READY: "webp_at",
+        JobState.R2_READY: "r2_at",
+    }
+
     def _set_state_threadsafe(self, new_state: JobState):
         old = self.state
         self.state = new_state
-        print(f"[STATE] {self.job_id}: {old.name} -> {new_state.name}")
+        append_runtime_log(f"[STATE][{self.job_id}] {old.name} -> {new_state.name}")
+        _timing_field = self._TIMING_FIELD_BY_STATE.get(new_state)
+        if _timing_field is not None and getattr(self, _timing_field) is None:
+            setattr(self, _timing_field, time.time())
         if new_state in (JobState.COMPLETED, JobState.FAILED):
             self.completed_at = time.time()
 
@@ -2364,6 +4415,14 @@ class DownloadRecord:
     target_state: JobState
     started_at: float
     created_at: float
+    # Chrome's own suggestedFilename from Browser.downloadWillBegin when
+    # available (e.g. "Gemini_Generated_Image_xxx.png") -- used as a
+    # correlation hint in poll_downloads_loop before falling back to
+    # newest-file-since-started_at. Never required to equal
+    # expected_filename; ownership is proven by the exclusive staging_dir,
+    # not by either filename matching.
+    suggested_filename: Optional[str] = None
+    attempt: int = 0
 
 DOWNLOAD_REGISTRY: Dict[str, DownloadRecord] = {}
 DOWNLOAD_REGISTRY_LOCK = threading.RLock()
@@ -2384,6 +4443,8 @@ class ResourceRecord:
     last_error: Optional[str] = None
     last_used: float = 0.0
     last_health_check: float = 0.0
+    acquired_at: float = 0.0
+    last_release_at: float = 0.0
 
 class ResourceAcquireTimeout(Exception):
     def __init__(self, broker_name: str, job_id: str, wait_s: float, resource_states: Dict[str, str]):
@@ -2399,21 +4460,44 @@ class ResourceAcquireTimeout(Exception):
 MAX_RESOURCE_FAILURES = 5
 RECOVERY_COOLDOWN_BASE_S = 15
 RECOVERY_COOLDOWN_MAX_S = 300
-RESOURCE_ACQUIRE_TIMEOUT_S = 120
+# A Gemini (T0-T3) resource is held from acquire through setup (NewChat/
+# Flash/CreateImage/Upload/Prompt/Send, tens of seconds) + the generation
+# wait (GENERATION_TIMEOUT_S=240) + the download-start window
+# (DOWNLOAD_START_WINDOW_S), i.e. up to ~300s worst case, before
+# release_gemini_once() runs. With BULLMQ_CONCURRENCY > len(resources), a
+# queued job legitimately waiting its turn for a slot -- not stuck on a
+# dead resource, which is handled separately via fail()/recovery -- could
+# need to wait close to that long. The previous 120s value failed jobs
+# purely from normal queuing depth, well before any resource actually
+# hung. Sized with headroom above the worst realistic single-job hold time.
+RESOURCE_ACQUIRE_TIMEOUT_S = 600
 
 class FirstFreeBroker:
     def __init__(self, name: str, resources: List[str]):
         self.name = name
         self.resource_ids = resources
         self._records: Dict[str, ResourceRecord] = {r: ResourceRecord(resource_id=r) for r in resources}
-        self._free_heap = []
-        self._seq = 0
+        # A set of currently-free resource IDs, scanned in self.resource_ids
+        # order on acquire -- NOT a release-order queue. A heap keyed by a
+        # monotonically increasing release sequence (the previous
+        # implementation) always returns whichever resource has been free
+        # LONGEST, which drifts away from a deterministic "always prefer
+        # T0, then T1, then T2, then T3" policy the moment resources are
+        # released out of ID order -- e.g. T2 releasing before T0 would
+        # then hand T2 to the next job even though T0 is also free.
+        self._free_set = set(resources)
         self._lock = threading.Lock()
         self._condition = threading.Condition(self._lock)
+        # FIFO ticket queue: notify_all() alone wakes every waiting thread
+        # but does NOT guarantee arrival order wins the resource -- OS/GIL
+        # thread-scheduling under contention could let a job that started
+        # waiting later grab a freshly-released resource before an earlier
+        # waiter. Only the ticket at position 0 may take a resource; every
+        # other woken thread checks it isn't at the front and goes back to
+        # waiting. This is what actually guarantees T0-first selection
+        # AND arrival-order fairness together, not just one or the other.
+        self._waiters = deque()
         self._recovery_fn = None
-        for r in resources:
-            self._seq += 1
-            heapq.heappush(self._free_heap, (self._seq, r))
 
     def set_recovery_fn(self, fn):
         """fn(resource_id) -> bool. Called off-lock in a background thread to restart the
@@ -2424,34 +4508,88 @@ class FirstFreeBroker:
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, self._acquire_sync, job_id, timeout)
 
+    async def acquire_preferred(self, job_id: str, timeout: float = RESOURCE_ACQUIRE_TIMEOUT_S) -> str:
+        """Explicit name for what acquire() already does: _acquire_sync's
+        resource scan runs under self._condition (a real lock) end to end
+        -- the free-set scan, the discard, and marking the resource BUSY
+        all happen in that one critical section, so there is no window for
+        a second acquirer to race in between. Given resource_ids is
+        constructed T0,T1,T2,T3 (see FirstFreeBroker.__init__ callers),
+        that scan is already the deterministic T0-first, atomic,
+        FIFO-fair allocation the resource-order policy requires -- this is
+        a thin alias, not a second/different code path, so the two can
+        never disagree. gemini_scheduler_loop() is this broker's only
+        caller, so there is also no second caller to race against."""
+        return await self.acquire(job_id, timeout)
+
     def _acquire_sync(self, job_id: str, timeout: float) -> str:
         t0 = time.monotonic()
+        short = short_job_id(job_id)
+        ticket = object()
         with self._condition:
-            while not self._free_heap:
-                remaining = timeout - (time.monotonic() - t0)
-                if remaining <= 0:
-                    raise ResourceAcquireTimeout(self.name, job_id, time.monotonic() - t0, self.snapshot_locked())
-                self._condition.wait(timeout=remaining)
-            _, resource_id = heapq.heappop(self._free_heap)
-            rec = self._records[resource_id]
-            rec.state = ResourceState.BUSY
-            rec.current_job_id = job_id
-            rec.last_used = time.time()
-            print(f"[{self.name} BROKER] Acquired {resource_id} for {job_id}")
-            return resource_id
+            self._waiters.append(ticket)
+            had_to_wait = False
+            try:
+                while True:
+                    if self._waiters[0] is ticket:
+                        skipped = []
+                        resource_id = None
+                        append_runtime_log(f"[{self.name}] REQUEST job={short} | TRY={self.resource_ids[0]}")
+                        for r in self.resource_ids:
+                            if r in self._free_set:
+                                resource_id = r
+                                break
+                            skipped.append(r)
+                        if resource_id is not None:
+                            for r in skipped:
+                                append_runtime_log(f"[{self.name} BROKER] job={short} {r}=BUSY -> checking next")
+                            idx = self.resource_ids.index(resource_id)
+                            if idx > 0:
+                                append_runtime_log(f"[{self.name}] REQUEST job={short} | {self.resource_ids[idx - 1]}=BUSY -> TRY={resource_id}")
+                            self._free_set.discard(resource_id)
+                            self._waiters.popleft()
+                            rec = self._records[resource_id]
+                            rec.state = ResourceState.BUSY
+                            rec.current_job_id = job_id
+                            rec.acquired_at = time.time()
+                            rec.last_used = rec.acquired_at
+                            tag = 'FIFO ACQUIRE' if had_to_wait else 'ACQUIRE'
+                            append_runtime_log(f"[{self.name} BROKER] {tag} job={short} resource={resource_id}")
+                            append_runtime_log(f"[{self.name}] ACQUIRE job={short} -> {resource_id}")
+                            self._condition.notify_all()
+                            return resource_id
+                    if not had_to_wait:
+                        append_runtime_log(f"[{self.name} BROKER] job={short} WAITING resources={','.join(self.resource_ids)}")
+                        busy_summary = ' '.join(f"{r}=BUSY" for r in self.resource_ids)
+                        append_runtime_log(f"[{self.name}] WAIT job={short} | {busy_summary}")
+                        had_to_wait = True
+                    remaining = timeout - (time.monotonic() - t0)
+                    if remaining <= 0:
+                        raise ResourceAcquireTimeout(self.name, job_id, time.monotonic() - t0, self.snapshot_locked())
+                    self._condition.wait(timeout=remaining)
+            except BaseException:
+                try:
+                    self._waiters.remove(ticket)
+                except ValueError:
+                    pass
+                self._condition.notify_all()
+                raise
 
     def release(self, resource_id: str):
         with self._condition:
             rec = self._records.get(resource_id)
             if rec is None or rec.state in (ResourceState.DEAD, ResourceState.RECOVERING):
                 return
+            released_job = rec.current_job_id
             rec.state = ResourceState.AVAILABLE
             rec.current_job_id = None
             rec.last_health_check = time.time()
-            if not any((res_id == resource_id for _, res_id in self._free_heap)):
-                self._seq += 1
-                heapq.heappush(self._free_heap, (self._seq, resource_id))
-                print(f"[{self.name} BROKER] Released {resource_id}")
+            rec.last_release_at = time.time()
+            if resource_id not in self._free_set:
+                self._free_set.add(resource_id)
+                _rj = short_job_id(released_job) if released_job else 'unknown'
+                append_runtime_log(f"[{self.name} BROKER] RELEASE resource={resource_id} job={_rj}")
+                append_runtime_log(f"[{self.name}] RELEASE job={_rj} -> {resource_id}")
                 self._condition.notify_all()
 
     def fail(self, resource_id: str, error: str = ""):
@@ -2468,7 +4606,7 @@ class FirstFreeBroker:
                 return
             rec.state = ResourceState.RECOVERING
             cooldown = min(RECOVERY_COOLDOWN_BASE_S * (2 ** (rec.failure_count - 1)), RECOVERY_COOLDOWN_MAX_S)
-            print(f"[{self.name} BROKER] {resource_id} FAILED (#{rec.failure_count}): {rec.last_error} -> RECOVERY_QUEUED for {cooldown:.0f}s")
+            append_runtime_log(f"[{self.name} BROKER] {resource_id} FAILED (#{rec.failure_count}): {rec.last_error} -> RECOVERY_QUEUED for {cooldown:.0f}s")
             timer = threading.Timer(cooldown, self._recover, args=(resource_id,))
             timer.daemon = True
             timer.start()
@@ -2479,7 +4617,7 @@ class FirstFreeBroker:
             try:
                 ok = bool(self._recovery_fn(resource_id))
             except Exception as e:
-                print(f"[{self.name} BROKER] {resource_id} recovery_fn raised: {e}")
+                append_runtime_log(f"[{self.name} BROKER] {resource_id} recovery_fn raised: {e}")
                 ok = False
         with self._condition:
             rec = self._records.get(resource_id)
@@ -2488,10 +4626,9 @@ class FirstFreeBroker:
             rec.last_health_check = time.time()
             if ok:
                 rec.state = ResourceState.AVAILABLE
-                if not any((res_id == resource_id for _, res_id in self._free_heap)):
-                    self._seq += 1
-                    heapq.heappush(self._free_heap, (self._seq, resource_id))
-                print(f"[{self.name} BROKER] {resource_id} RECOVERY_COMPLETE -> AVAILABLE")
+                if resource_id not in self._free_set:
+                    self._free_set.add(resource_id)
+                append_runtime_log(f"[{self.name} BROKER] {resource_id} RECOVERY_COMPLETE -> AVAILABLE")
                 self._condition.notify_all()
             else:
                 rec.failure_count += 1
@@ -2500,7 +4637,7 @@ class FirstFreeBroker:
                     print(f"[{self.name} BROKER] {resource_id} PERMANENTLY DEAD after {rec.failure_count} failed recovery attempts")
                 else:
                     cooldown = min(RECOVERY_COOLDOWN_BASE_S * (2 ** (rec.failure_count - 1)), RECOVERY_COOLDOWN_MAX_S)
-                    print(f"[{self.name} BROKER] {resource_id} RECOVERY_FAILED -> retrying in {cooldown:.0f}s")
+                    append_runtime_log(f"[{self.name} BROKER] {resource_id} RECOVERY_FAILED -> retrying in {cooldown:.0f}s")
                     timer = threading.Timer(cooldown, self._recover, args=(resource_id,))
                     timer.daemon = True
                     timer.start()
@@ -2512,52 +4649,139 @@ class FirstFreeBroker:
         with self._condition:
             return self.snapshot_locked()
 
+    def snapshot_full(self) -> Dict[str, dict]:
+        """Same as snapshot() but also carries current_job_id/last_used, for
+        heartbeat's JOB=/AGE= reporting on BUSY resources."""
+        with self._condition:
+            return {
+                rid: {"state": rec.state.value, "job_id": rec.current_job_id, "last_used": rec.last_used}
+                for rid, rec in self._records.items()
+            }
+
     @property
     def free_resources(self):
         with self._condition:
             return [rid for rid, rec in self._records.items() if rec.state == ResourceState.AVAILABLE]
 
-def _detect_download_start(drv, staging_dir: Path, timeout: float = 60.0) -> Tuple[Optional[str], str]:
+def _log_download_start_confirmed(prefix: str, dl_guid: Optional[str], source: str):
+    """Never call a filesystem-only detection a 'REAL CHROME GUID' -- that
+    was misleading (dl_guid is None on the filesystem path, so the old
+    print literally read "REAL CHROME GUID = None (source=filesystem)").
+    Log what's actually true for each source."""
+    if source == 'cdp' and dl_guid:
+        append_runtime_log(f'{prefix} DOWNLOAD_START_CONFIRMED source=cdp CDP_GUID={dl_guid}')
+    else:
+        append_runtime_log(f'{prefix} DOWNLOAD_START_CONFIRMED source=filesystem CDP_GUID=NOT_CAPTURED')
+
+def _snapshot_staging_dir(staging_dir: Path) -> set:
+    try:
+        return {f.name for f in staging_dir.iterdir()} if staging_dir.exists() else set()
+    except Exception:
+        return set()
+
+
+def _detect_download_start_once(drv, before: set, staging_dir: Path) -> Optional[Tuple[Optional[str], str, Optional[str]]]:
+    """Single-iteration check, so callers that share a Chrome session across
+    multiple threads (e.g. Gemini's CHROME_DRIVER_LOCK) can hold the lock
+    only around this brief call instead of the whole timeout window.
+    Returns (guid, source, suggested_filename)."""
+    try:
+        for entry in drv.get_log('performance'):
+            try:
+                msg = json.loads(entry['message'])['message']
+                if msg['method'] == 'Browser.downloadWillBegin':
+                    # Forensic: log the RAW GUID straight from Chrome --
+                    # never synthesized. (GUID provenance note: see
+                    # Phase-11 concurrency risk documented below.)
+                    _guid = msg['params'].get('guid')
+                    _suggested = msg['params'].get('suggestedFilename')
+                    append_runtime_log(
+                        f"[PERFLOG] Browser.downloadWillBegin guid={_guid} "
+                        f"suggestedFilename={_suggested} url_prefix={str(msg['params'].get('url',''))[:60]}"
+                    )
+                    return (_guid, "cdp", _suggested)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    try:
+        if staging_dir.exists():
+            new_names = [f.name for f in staging_dir.iterdir() if f.name not in before]
+            # START vs COMPLETE are different questions. A .crdownload/.tmp/
+            # .part file is Chrome actively writing to disk right now -- that
+            # IS the download starting, not something to skip. Skipping it
+            # here (the old behavior) meant a real, in-progress download on
+            # a large/slow image produced nothing but a bare
+            # "Download start timeout after 15s" even though Chrome had
+            # already started writing the file -- the completion side
+            # (poll_downloads_loop) is the one place that must still ignore
+            # these same extensions, since a .crdownload is never a
+            # finished, valid image.
+            partial = [n for n in new_names if n.endswith(('.crdownload', '.tmp', '.part', '.download'))]
+            if partial:
+                append_runtime_log(f"[DL-START] filesystem partial file appeared: {partial[0]}")
+                # The .crdownload name itself, minus the suffix, is real
+                # evidence of what Chrome is naming the file -- a genuine
+                # hint, not a guess, since it's Chrome's own in-progress
+                # filename observed directly on disk.
+                _hint = partial[0].rsplit('.crdownload', 1)[0] if partial[0].endswith('.crdownload') else None
+                return (None, "filesystem", _hint)
+            if new_names:
+                return (None, "filesystem", new_names[0])
+    except Exception:
+        pass
+    return None
+
+
+def _detect_download_start(drv, staging_dir: Path, timeout: float = DOWNLOAD_START_WINDOW_S) -> Tuple[Optional[str], str, Optional[str]]:
     """
     Detect a download starting inside staging_dir, which must already be scoped
     exclusively to one job/resource (never a shared directory).
     Primary: real Browser.downloadWillBegin CDP GUID.
     Fallback: a newly-created, non-partial file appearing in staging_dir — ownership
     is proven by directory exclusivity, never by guessing a filename across jobs.
-    Returns (guid_or_None, source) where source is "cdp" or "filesystem".
+    Returns (guid_or_None, source, suggested_filename_or_None) where
+    source is "cdp" or "filesystem".
     Raises RuntimeError on timeout; never guesses.
+
+    CROSS-JOB get_log('performance') CONSUMPTION: not currently possible.
+    driver.get_log('performance') consumes entries as it reads them, and
+    T0-T3 are tabs of ONE shared chrome_driver session -- so this WOULD be
+    a real race if two jobs' arm-drain/detect calls could ever interleave.
+    They can't: gemini_scheduler_loop() is the sole owner of all Gemini
+    browser actions and runs them through a single-worker executor, so at
+    most one job's setup-or-check (which includes this whole arm -> click
+    -> detect-start sequence) is ever in flight at a time. The WMR path
+    calls this function too, but each WMR resource already has its own
+    dedicated Chrome process/driver (WmrDriverThread), never a shared one.
     """
     t0 = time.time()
-    try:
-        before = {f.name for f in staging_dir.iterdir()} if staging_dir.exists() else set()
-    except Exception:
-        before = set()
+    before = _snapshot_staging_dir(staging_dir)
     while time.time() - t0 < timeout:
-        try:
-            for entry in drv.get_log('performance'):
-                try:
-                    msg = json.loads(entry['message'])['message']
-                    if msg['method'] == 'Browser.downloadWillBegin':
-                        return (msg['params']['guid'], "cdp")
-                except Exception:
-                    pass
-        except Exception:
-            pass
-        try:
-            if staging_dir.exists():
-                for f in staging_dir.iterdir():
-                    if f.name in before:
-                        continue
-                    if f.name.endswith(('.crdownload', '.tmp', '.part')):
-                        continue
-                    return (None, "filesystem")
-        except Exception:
-            pass
+        result = _detect_download_start_once(drv, before, staging_dir)
+        if result is not None:
+            return result
         time.sleep(0.5)
     raise RuntimeError(f"Download start timeout after {timeout}s (dir={staging_dir})")
 
-GEMINI_BROKER = FirstFreeBroker("GEMINI", [f"T{i}" for i in range(4)])
-WMR_BROKER = FirstFreeBroker("WMR", [f"W{i}-T{j}" for i in range(4) for j in range(2)])
+# Reuse the previous run's brokers if this cell is re-running against a
+# reused chrome_driver -- a fresh broker here would forget every resource's
+# real state (BUSY/DEAD/failure counts) and, worse, its own background
+# recovery timers would be orphaned from whichever chrome_driver a fresh
+# create_chrome_driver() call just launched (see the V16_STATE comment near
+# the top of this file for the full "target window already closed" story).
+if V16_STATE.GEMINI_BROKER is not None:
+    GEMINI_BROKER = V16_STATE.GEMINI_BROKER
+else:
+    GEMINI_BROKER = FirstFreeBroker("GEMINI", [f"T{i}" for i in range(MAX_CONCURRENT_TABS)])
+    V16_STATE.GEMINI_BROKER = GEMINI_BROKER
+
+if V16_STATE.WMR_BROKER is not None:
+    WMR_BROKER = V16_STATE.WMR_BROKER
+else:
+    WMR_BROKER = FirstFreeBroker("WMR", [f"W{i}-T{j}" for i in range(4) for j in range(2)])
+    V16_STATE.WMR_BROKER = WMR_BROKER
+
 CHROME_DRIVER_LOCK = threading.RLock()
 
 def _recover_gemini_resource(resource_id: str) -> bool:
@@ -2568,52 +4792,53 @@ def _recover_gemini_resource(resource_id: str) -> bool:
     tid_int = int(resource_id.replace('T', ''))
     with CHROME_DRIVER_LOCK:
         try:
+            # Dead-whole-browser detection/relaunch now lives in the shared
+            # _ensure_chrome_alive() (also used by _create_gemini_tab() for
+            # first-time tab creation) -- called here BEFORE touching
+            # worker.handle, since `worker.handle in
+            # chrome_driver.window_handles` itself calls
+            # chrome_driver.window_handles and would raise first if the
+            # whole process were dead, skipping any relaunch logic placed
+            # after it (the bug in an earlier version of this function).
+            _ensure_chrome_alive()
+
             if worker.handle and worker.handle in chrome_driver.window_handles:
                 try:
                     chrome_driver.switch_to.window(worker.handle)
                     chrome_driver.close()
                 except Exception:
                     pass
+
             worker.handle = None
             worker.driver = None
+
             new_handle = _create_gemini_tab(tid_int)
             chrome_driver.switch_to.window(new_handle)
             _ = chrome_driver.title
             worker.handle = new_handle
             worker.driver = chrome_driver
-            log(f"[GEMINI BROKER] {resource_id} RECOVERY_HEALTH_CHECK = OK (new tab {new_handle})")
+            append_runtime_log(f"[GEMINI BROKER] {resource_id} RECOVERY_HEALTH_CHECK = OK (new tab {new_handle})")
             return True
         except Exception as e:
-            log(f"[GEMINI BROKER] {resource_id} RECOVERY_HEALTH_CHECK = FAILED: {e}")
+            append_runtime_log(f"[GEMINI BROKER] {resource_id} RECOVERY_HEALTH_CHECK = FAILED: {e}")
             worker.handle = None
             worker.driver = None
             return False
 
 def _recover_wmr_resource(resource_id: str) -> bool:
-    """Restart this WMR slot's dedicated Chrome process and prove it responds."""
+    """Restart this WMR slot's dedicated Chrome process and prove it responds.
+    Runs on the broker's recovery-timer thread, so the actual driver
+    quit/recreate must happen on the WmrDriverThread that owns it (via the
+    RECOVER command queue), never touched directly from here."""
     thread = WMR_THREADS.get(resource_id)
     if thread is None:
         return False
-    try:
-        if thread.driver is not None:
-            try:
-                thread.driver.quit()
-            except Exception:
-                pass
-            thread.driver = None
-        thread.driver = create_wmr_chrome_driver(resource_id)
-        _ = thread.driver.title
-        log(f"[WMR BROKER] {resource_id} RECOVERY_HEALTH_CHECK = OK")
-        return True
-    except Exception as e:
-        log(f"[WMR BROKER] {resource_id} RECOVERY_HEALTH_CHECK = FAILED: {e}")
-        try:
-            if thread.driver:
-                thread.driver.quit()
-        except Exception:
-            pass
-        thread.driver = None
-        return False
+    ok = request_wmr_recover(thread)
+    if ok:
+        append_runtime_log(f"[WMR BROKER] {resource_id} RECOVERY_HEALTH_CHECK = OK")
+    else:
+        append_runtime_log(f"[WMR BROKER] {resource_id} RECOVERY_HEALTH_CHECK = FAILED")
+    return ok
 
 GEMINI_BROKER.set_recovery_fn(_recover_gemini_resource)
 WMR_BROKER.set_recovery_fn(_recover_wmr_resource)
@@ -2633,97 +4858,574 @@ def release_wmr_once(ctx: JobContext):
 # ------------------------------------------------------------------------------
 
 from concurrent.futures import ThreadPoolExecutor
-GEMINI_EXECUTOR = ThreadPoolExecutor(max_workers=4)
+# max_workers=1 by explicit request: only ONE Gemini browser action (a
+# job's setup, or one status-check-and-maybe-finish) is ever in flight at
+# a time -- see gemini_scheduler_loop(), the sole caller of this executor.
+GEMINI_EXECUTOR = ThreadPoolExecutor(max_workers=1)
+
+DEBUG_DIR = Path('debug')
+
+def _dump_gemini_debug_artifacts(tid: str, handle: Optional[str], job_id: str, reason: str):
+    """On a Gemini job failure, capture a screenshot, the page's URL/text,
+    and a DOM geometry dump (every button/input's rect + whatever element
+    actually sits on top of it at that point) into debug/{job_id}/ -- so a
+    failed click shows up as "occluded by X" or "off-screen" in the saved
+    artifacts instead of just a bare exception message. Best-effort only;
+    never raises, since this runs inside an already-failing job's cleanup."""
+    if not handle:
+        return
+    try:
+        if handle not in chrome_driver.window_handles:
+            return
+        chrome_driver.switch_to.window(handle)
+        debug_dir = DEBUG_DIR / job_id
+        debug_dir.mkdir(parents=True, exist_ok=True)
+        (debug_dir / 'reason.txt').write_text(f'[T{tid}] {reason}', encoding='utf-8')
+        chrome_driver.save_screenshot(str(debug_dir / 'error.png'))
+        (debug_dir / 'url.txt').write_text(chrome_driver.current_url, encoding='utf-8')
+        (debug_dir / 'body.txt').write_text(
+            chrome_driver.find_element(By.TAG_NAME, 'body').text, encoding='utf-8'
+        )
+        geom = chrome_driver.execute_script(
+            "var out = {url: window.location.href, buttons: []};"
+            "var els = document.querySelectorAll('button, input, [role=\"menuitem\"], [role=\"dialog\"], .cdk-overlay-pane');"
+            "els.forEach(function(el) {"
+            "  var r = el.getBoundingClientRect();"
+            "  if (r.width === 0 || r.height === 0) return;"
+            "  var cx = r.x + r.width / 2, cy = r.y + r.height / 2;"
+            "  var top = document.elementFromPoint(cx, cy);"
+            "  out.buttons.push({"
+            "    tag: el.tagName, text: (el.innerText || '').slice(0, 30),"
+            "    aria: el.getAttribute('aria-label'),"
+            "    rect: {x: r.x, y: r.y, w: r.width, h: r.height},"
+            "    topElement: top ? (top.tagName + '.' + top.className) : 'NONE'"
+            "  });"
+            "});"
+            "return out;"
+        )
+        (debug_dir / 'geom.json').write_text(json.dumps(geom, indent=2), encoding='utf-8')
+        append_runtime_log(f'[T{tid}][{job_id}] DEBUG_ARTIFACTS_SAVED -> {debug_dir}')
+    except Exception as dump_err:
+        append_runtime_log(f'[T{tid}][{job_id}] DEBUG_ARTIFACT_DUMP_FAILED: {dump_err}')
 
 class GeminiWorker:
     def __init__(self, tid: str):
         self.tid = tid
         self.driver = None
         self.handle = None
+        # Stored (not just local) so a LATER, separate
+        # check_and_maybe_finish_sync() call (a different scheduler tick)
+        # can read this tab's own generation baseline URLs.
+        self.urls_before = set()
+        self.chat_urls = set()
+        self.current_job_id = None
 
-    def do_execute_sync(self, ctx: JobContext):
-        prefix = f"[{self.tid}][{ctx.job_id}]"
+    def run_setup_sync(self, ctx: JobContext):
+        """PHASE 1 ONLY: New Chat -> Flash -> Create Image -> upload ->
+        attach-verify -> prompt -> Send -> verify_generation_started.
+
+        Called by gemini_scheduler_loop() -- the single owner of the shared
+        Gemini driver -- via a one-worker executor, so only one job's setup
+        (or one job's status check, see check_and_maybe_finish_sync below)
+        is ever in flight at a time on the real browser. Raises on any
+        failure; the scheduler (not this method) is solely responsible for
+        cleanup and resource release on failure, via _handle_gemini_failure.
+
+        On success this stores urls_before/chat_urls/current_job_id on
+        self, and generation_started_at/gemini_staging_dir on ctx, so a
+        LATER, SEPARATE call to check_and_maybe_finish_sync() -- from a
+        different scheduler tick, possibly seconds or minutes later, after
+        other jobs' setups/checks have run in between -- can pick up
+        exactly where this left off without re-deriving anything."""
+        prefix = f"[GEMINI][{self.tid}][{ctx.job_id}]"
+        append_runtime_log(f"{prefix} START")
+        tid_int = int(self.tid.replace('T', ''))
+        # State was previously set to GEMINI_GENERATING here, before New
+        # Chat/Flash/Create Image/upload/prompt/send even ran -- so the
+        # dashboard could show "GENERATING" for many seconds while the
+        # browser was still sitting on the plain "Where should we
+        # start?" composer. Each state below is only set AFTER the
+        # browser action it names has actually run; GEMINI_GENERATING
+        # itself is only set once verify_generation_started() below
+        # returns True.
+        ctx.transition_sync(JobState.GEMINI_NEW_CHAT)
+        ctx.gemini_acquired_at = time.time()
+        append_runtime_log(f"{prefix} GEMINI_ACQUIRED resource={self.tid}")
+
+        # Setup is a short, bounded sequence of Selenium operations -- held
+        # under the lock for its whole duration since these need the
+        # shared chrome_driver's focused window to stay put between calls.
         with CHROME_DRIVER_LOCK:
-            try:
-                ctx.transition_sync(JobState.GEMINI_GENERATING)
-                tid_int = int(self.tid.replace('T', ''))
-
                 # T0-T3 are TABS of the single shared, already-authenticated chrome_driver
                 # (see _create_gemini_tab) -- never a second Chrome process on the same profile.
+                append_runtime_log(f"{prefix} OPENING GEMINI")
                 if self.handle is None or self.handle not in chrome_driver.window_handles:
                     self.handle = _create_gemini_tab(tid_int)
-                    log(f"{prefix} PHYSICAL_TAB_CREATED handle={self.handle}")
+                    append_runtime_log(f"{prefix} PHYSICAL_TAB_CREATED handle={self.handle}")
                 chrome_driver.switch_to.window(self.handle)
                 self.driver = chrome_driver
 
+                append_runtime_log(f"{prefix} NEW CHAT")
+                append_runtime_log(f'{prefix} GEMINI_NEW_CHAT_STARTED')
+                job_mark(ctx.job_id, 'newchat', 'run')
                 tab_id_str = open_new_chat_and_reload(self.driver, tid_int, ctx.job_id)
                 if not tab_id_str:
+                    job_mark(ctx.job_id, 'newchat', 'fail')
                     raise RuntimeError("Failed to create/find target tab")
+                _gemini_state_snapshot(self.driver, 'after_new_chat', tid_int, ctx.job_id)
+                append_runtime_log(f'{prefix} GEMINI_NEW_CHAT_READY')
+                job_mark(ctx.job_id, 'newchat', 'ok')
 
                 job_dir, staging_dir = get_chrome_job_dir(tid_int, ctx.job_id)
-                set_tab_download_dir(self.driver, str(staging_dir))
+                _dl_dir_ok = set_tab_download_dir(self.driver, str(staging_dir), resource_id=self.tid)
+                if not _dl_dir_ok:
+                    raise RuntimeError(f"DOWNLOAD_DIR_SET_FAILED for {self.tid} -- Page.setDownloadBehavior raised, downloads for this job would go to Chrome's real default directory instead of {staging_dir}")
+                ctx.gemini_staging_dir = staging_dir
 
+                ctx.transition_sync(JobState.GEMINI_MODE_SELECT)
+                append_runtime_log(f"{prefix} FLASH MODE")
+                job_mark(ctx.job_id, 'flash', 'run')
+                ensure_flash_mode(self.driver, tid_int, ctx.job_id)
+                job_mark(ctx.job_id, 'flash', 'ok')
+                _gemini_state_snapshot(self.driver, 'after_flash', tid_int, ctx.job_id)
+
+                append_runtime_log(f"{prefix} CREATE IMAGE MODE")
+                job_mark(ctx.job_id, 'picker', 'run')
                 ensure_create_image_mode(self.driver, tid_int, ctx.job_id)
+                job_mark(ctx.job_id, 'picker', 'ok')
+                job_mark(ctx.job_id, 'createimg', 'ok')
+                job_mark(ctx.job_id, 'imgmode', 'ok')
+                _gemini_state_snapshot(self.driver, 'after_create_image', tid_int, ctx.job_id)
 
-                upload_reference_files(self.driver, ctx.reference_paths, tid_int, ctx.job_id)
-                verify_attachment_count(self.driver, expected=len(ctx.reference_paths), tid=tid_int, job_id=ctx.job_id)
+                ctx.transition_sync(JobState.GEMINI_UPLOADING)
+                append_runtime_log(f"{prefix} UPLOADING REFERENCES")
+                append_runtime_log(f'{prefix} GEMINI_UPLOAD_STARTED n_refs={len(ctx.reference_paths)}')
+                job_mark(ctx.job_id, 'upload', 'run')
+                progress_detail(ctx.job_id, 'upload_files', True)
+                upload_result = upload_reference_files(self.driver, ctx.reference_paths, tid_int, ctx.job_id)
+                append_runtime_log(f"{prefix} GEMINI_UPLOAD_COMPLETED files={upload_result['expected']}")
+                _ok_att, _actual_att = verify_attachment_count(self.driver, upload_result["expected"], tid=tid_int, job_id=ctx.job_id, upload_token=upload_result["token"])
+                job_attach(ctx.job_id, _actual_att, upload_result["expected"])
+                job_mark(ctx.job_id, 'upload', 'ok')
+                append_runtime_log(f"{prefix} ATTACHMENTS VERIFIED")
+                append_runtime_log(f"{prefix} GEMINI_ATTACHMENTS_VERIFIED count={upload_result['expected']}")
+                _gemini_state_snapshot(self.driver, 'after_attachments', tid_int, ctx.job_id)
 
+                ctx.transition_sync(JobState.GEMINI_PROMPT)
+                job_mark(ctx.job_id, 'prompt', 'run')
                 _inject_prompt_atomic(self.driver, ctx.prompt, tid_int, ctx.job_id)
+                job_mark(ctx.job_id, 'prompt', 'ok')
+                append_runtime_log(f"{prefix} PROMPT INJECTED")
+                _gemini_state_snapshot(self.driver, 'after_prompt', tid_int, ctx.job_id)
 
+                ctx.transition_sync(JobState.GEMINI_SEND_PENDING)
+                job_mark(ctx.job_id, 'send', 'run')
+                # No prompt re-verification here by explicit choice (V16.3):
+                # Send follows the paste immediately, matching the proven V9
+                # paste-then-send behavior with no verification stage between
+                # the two stages.
                 urls_before = snapshot_urls(self.driver)
-                _click_send_button(self.driver)
+                append_runtime_log(f'{prefix} GEMINI_SEND_REQUESTED')
+                if not _click_send_button(self.driver, tid_int, ctx.job_id):
+                    job_mark(ctx.job_id, 'send', 'fail')
+                    raise RuntimeError("SEND_FAILED: Could not click send button")
+                job_mark(ctx.job_id, 'send', 'ok')
+                append_runtime_log(f"{prefix} SEND CLICKED")
+                append_runtime_log(f'{prefix} GEMINI_SEND_CLICKED')
+                _gemini_state_snapshot(self.driver, 'after_send', tid_int, ctx.job_id)
 
                 started = verify_generation_started(self.driver)
                 if not started:
-                    raise RuntimeError("Generation did not start")
-
-                _has_generated_image(self.driver, urls_before)
-
+                    _gemini_state_snapshot(self.driver, 'generation_start_failed', tid_int, ctx.job_id, screenshot=True)
+                    job_mark(ctx.job_id, 'genstart', 'fail')
+                    raise RuntimeError("GENERATION_START_FAILED: verify_generation_started() saw no browser evidence (stop button / loading overlay / generating indicator) after Send")
+                job_mark(ctx.job_id, 'genstart', 'ok')
+                ctx.transition_sync(JobState.GEMINI_GENERATING)
+                append_runtime_log(f"{prefix} GENERATION STARTED")
+                append_runtime_log(f'{prefix} GEMINI_GENERATION_STARTED')
                 chat_urls = snapshot_urls(self.driver)
-                _hover_and_dl_single_click(self.driver, urls_before, chat_urls)
+                self.urls_before = urls_before
+                self.chat_urls = chat_urls
+                self.current_job_id = ctx.job_id
+                ctx.generation_started_at = time.time()
 
-                expected_png = f"{ctx.job_id}.png"
+    def check_and_maybe_finish_sync(self, ctx: JobContext) -> bool:
+        """ONE-SHOT status check for a job already past setup (GENERATING).
 
-                ctx.transition_sync(JobState.RAW_DOWNLOAD_START)
-                dl_guid, source = _detect_download_start(self.driver, staging_dir, timeout=60)
-                ctx.raw_guid = dl_guid
+        Called repeatedly by gemini_scheduler_loop()'s round robin, never
+        in its own internal wait loop -- that's the whole point of
+        splitting this out of the old monolithic do_execute_sync(): no
+        single call here can hog the one shared Gemini thread for the
+        whole 15-240s generation wait the way the old always-poll-to-
+        completion loop did.
 
-                record_id = f"gemini:{ctx.job_id}:{time.monotonic_ns()}"
-                with DOWNLOAD_REGISTRY_LOCK:
-                    DOWNLOAD_REGISTRY[record_id] = DownloadRecord(
-                        record_id=record_id,
-                        guid=dl_guid,
-                        job_id=ctx.job_id,
-                        resource_id=self.tid,
-                        resource_type="gemini",
-                        source=source,
-                        staging_dir=str(staging_dir),
-                        expected_filename=expected_png,
-                        actual_filename=None,
-                        target_state=JobState.RAW_VALIDATED,
-                        started_at=time.time(),
-                        created_at=time.time()
-                    )
+        Returns True once this job's Gemini phase is fully complete (image
+        downloaded, resource released); False if still generating and this
+        tab should be checked again on a later tick. Raises on a terminal
+        failure (refused/limit/error/timeout) -- the caller (the scheduler)
+        handles cleanup exactly like a setup failure, via
+        _handle_gemini_failure.
 
-                release_gemini_once(ctx)
-                ctx.transition_sync(JobState.GEMINI_RELEASED)
-                ctx.transition_sync(JobState.RAW_DOWNLOADING)
+        When status is SUCCESS, this same call also arms + clicks download
+        and waits (briefly, up to DOWNLOAD_START_WINDOW_S) for confirmed
+        download-start, then releases the Gemini resource -- by explicit
+        request: "if generated then click on download and move to other
+        free tab", i.e. the check step itself performs the hand-off the
+        moment it finds the image ready, rather than merely reporting it."""
+        prefix = f"[GEMINI][{self.tid}][{ctx.job_id}]"
+        tid_int = int(self.tid.replace('T', ''))
+        urls_before = self.urls_before
+        chat_urls = self.chat_urls
+        staging_dir = ctx.gemini_staging_dir
 
-            except Exception as e:
-                ctx.error = str(e)
-                ctx.transition_sync(JobState.FAILED)
-                GEMINI_BROKER.fail(self.tid, str(e))
+        with CHROME_DRIVER_LOCK:
+            chrome_driver.switch_to.window(self.handle)
+            status, img_src = nb_check_image(self.driver, urls_before, chat_urls)
+
+        if status == "WAITING":
+            if time.time() - ctx.generation_started_at > GENERATION_TIMEOUT_S:
+                raise RuntimeError(f"Generation timed out after {GENERATION_TIMEOUT_S}s waiting for image (last status=WAITING)")
+            return False
+        elif status == "REFUSED":
+            raise RuntimeError("Gemini refused the prompt")
+        elif status == "LIMIT":
+            raise RuntimeError("Gemini image-generation limit reached")
+        elif status == "ERROR":
+            raise RuntimeError("Gemini reported an error during generation")
+        elif status != "SUCCESS":
+            raise RuntimeError(f"Generation timed out after {GENERATION_TIMEOUT_S}s waiting for image (last status={status})")
+
+        append_runtime_log(f"{prefix} IMAGE DETECTED")
+        _t_img = time.time()
+        _jp = JOB_PROGRESS.get(ctx.job_id)
+        if _jp is not None:
+            _jp['image_at'] = _t_img
+        job_mark(ctx.job_id, 'image', 'ok')
+        try:
+            _kind = 'blob_new' if str(img_src).startswith('blob:') else ('googleusercontent' if 'googleusercontent' in str(img_src) else 'other')
+        except Exception:
+            _kind = 'unknown'
+        append_runtime_log(f'{prefix} GEMINI_IMAGE_DETECTED source={_kind} elapsed_from_acquire={_t_img - ctx.gemini_acquired_at:.1f}s')
+        _gemini_state_snapshot(self.driver, 'after_image_detected', tid_int, ctx.job_id)
+
+        # ARM FIRST, then click. The staging-dir snapshot AND a full drain
+        # of the shared driver's performance log happen BEFORE the
+        # download-button click, so any Browser.downloadWillBegin event
+        # observed afterwards is provably caused by THIS click -- never a
+        # stale queued event from an earlier action/job on this tab
+        # (get_log('performance') consumes entries as it reads them).
+        before_click_at = time.time()
+        with CHROME_DRIVER_LOCK:
+            chrome_driver.switch_to.window(self.handle)
+            before_files = _snapshot_staging_dir(staging_dir)
+            try:
+                _drained = self.driver.get_log('performance')
+                append_runtime_log(f"{prefix} DOWNLOAD_ARMED perflog_entries_drained={len(_drained)} staging_snapshot={sorted(before_files)[:5]}")
+            except Exception as drain_err:
+                append_runtime_log(f"{prefix} DOWNLOAD_ARMED perflog_drain_failed={drain_err}")
+            clicked = _hover_and_dl_single_click(self.driver, urls_before, chat_urls, prefix=prefix)
+            if not clicked:
+                raise RuntimeError("DOWNLOAD_BUTTON_NOT_FOUND")
+            append_runtime_log(f"{prefix} DOWNLOAD CLICKED")
+            append_runtime_log(f'{prefix} GEMINI_DOWNLOAD_CLICKED')
+            append_runtime_log(f'{prefix} [GEMINI-DL] CLICKED')
+            # UI-level confirmation only -- never proof of completion, and
+            # its absence is not a failure (see _check_gemini_download_snackbar).
+            _check_gemini_download_snackbar(self.driver, prefix=prefix)
+
+        expected_png = f"{ctx.job_id}.png"
+        job_mark(ctx.job_id, 'download', 'run')
+        ctx.transition_sync(JobState.RAW_DOWNLOAD_START)
+        append_runtime_log(f'{prefix} [GEMINI-DL] EXPECTED_DIR={staging_dir}')
+        append_runtime_log(f'{prefix} [GEMINI-DL] EXPECTED_FILENAME={expected_png}')
+
+        # PHASE A (start detection) and PHASE B (completion) are
+        # deliberately separate concerns with separate timeouts -- a
+        # previous version of this code collapsed them into one 15s wait
+        # for the FINAL file, which meant a real, slow/large download
+        # produced "Download start timeout after 15s" even while Chrome
+        # was actively writing it to disk. _detect_download_start_once()
+        # already treats a CDP Browser.downloadWillBegin event, a new
+        # .crdownload/.tmp/.part/.download partial file, OR a new final
+        # image file as valid START evidence (not just the final file) --
+        # any one of them is enough to release the Gemini resource right
+        # here. Completion (waiting for the partial to become a real,
+        # stable, valid PNG) is a SEPARATE, unbounded-by-this-loop concern
+        # already handled independently by poll_downloads_loop() once the
+        # DownloadRecord below is registered.
+        #
+        # DOWNLOAD_START_SAFETY_TIMEOUT_S is not a normal-operation limit
+        # -- by explicit request there is no such limit -- it exists only
+        # to eventually fail a job whose browser/resource is genuinely
+        # dead (Chrome never even begins writing anything), not one that
+        # is merely downloading slowly.
+        append_runtime_log(f'{prefix} [GEMINI-DL] SEARCHING_FOR_FILE')
+        result = None
+        deadline = time.time() + DOWNLOAD_START_SAFETY_TIMEOUT_S
+        while time.time() < deadline:
+            with CHROME_DRIVER_LOCK:
+                chrome_driver.switch_to.window(self.handle)
+                result = _detect_download_start_once(self.driver, before_files, staging_dir)
+            if result is not None:
+                break
+            time.sleep(0.5)
+        if result is None:
+            observed_files = sorted(_snapshot_staging_dir(staging_dir) - before_files)
+            # Diagnostic only -- never accepted as this job's file. If the
+            # registered staging dir stayed empty despite the UI/click
+            # evidence, look under the whole Chrome download base for
+            # anything created AFTER this attempt started, so a
+            # misconfigured download path (e.g. DOWNLOAD_DIR_SET_FAILED
+            # upstream) shows up as "found elsewhere" instead of a bare
+            # timeout with no clue why.
+            stray_hits = []
+            try:
+                for p in Path(CHROME_DL_BASE).rglob('*'):
+                    try:
+                        if p.is_file() and p.stat().st_mtime >= before_click_at:
+                            stray_hits.append(str(p))
+                    except Exception:
+                        continue
+                    if len(stray_hits) >= 10:
+                        break
+            except Exception:
+                pass
+            append_runtime_log(
+                f"{prefix} [GEMINI-DL] UI_STARTED_BUT_FILE_NOT_FOUND "
+                f"expected_dir={staging_dir} job={ctx.job_id} resource={self.tid} "
+                f"attempt={_job_attempt(ctx.job_id)} files_in_expected_dir={observed_files} "
+                f"chrome_base_search_hits={stray_hits}"
+            )
+            append_runtime_log(
+                f"{prefix} DOWNLOAD_START_TIMEOUT resource={self.tid} job={ctx.job_id} "
+                f"configured_dir={staging_dir} files_before={sorted(before_files)[:5]} "
+                f"newly_seen_files={observed_files} click=True safety_window_s={DOWNLOAD_START_SAFETY_TIMEOUT_S}"
+            )
+            raise RuntimeError(f"No download-start evidence after {DOWNLOAD_START_SAFETY_TIMEOUT_S}s (dir={staging_dir}) -- resource likely dead")
+        dl_guid, source, suggested_filename = result
+        ctx.raw_guid = dl_guid
+        append_runtime_log(f"{prefix} DOWNLOAD START DETECTED")
+        append_runtime_log(f'{prefix} [GEMINI-DL] SOURCE={source}')
+        if source == 'cdp':
+            append_runtime_log(f'{prefix} GEMINI_DOWNLOAD_EVENT GUID={dl_guid}')
+            append_runtime_log(f'{prefix} GEMINI_DOWNLOAD_STARTED guid={dl_guid}')
+            append_runtime_log(f'{prefix} [GEMINI-DL] CDP_DOWNLOAD_STARTED guid={dl_guid} suggestedFilename={suggested_filename}')
+        else:
+            append_runtime_log(f'{prefix} GEMINI_DOWNLOAD_STARTED guid=NOT_CAPTURED source=filesystem')
+            append_runtime_log(f'{prefix} [GEMINI-DL] CDP_DOWNLOAD_STARTED guid=NOT_CAPTURED')
+            append_runtime_log(f'{prefix} [GEMINI-DL] DOWNLOAD_CDP_MISSED -- filesystem fallback hint={suggested_filename}')
+        append_runtime_log(f'{prefix} [GEMINI-DL] EXPECTED_DIR={staging_dir}')
+        _log_download_start_confirmed(prefix, dl_guid, source)
+
+        record_id = f"gemini:{ctx.job_id}:{time.monotonic_ns()}"
+        with DOWNLOAD_REGISTRY_LOCK:
+            DOWNLOAD_REGISTRY[record_id] = DownloadRecord(
+                record_id=record_id,
+                guid=dl_guid,
+                job_id=ctx.job_id,
+                resource_id=self.tid,
+                resource_type="gemini",
+                source=source,
+                staging_dir=str(staging_dir),
+                expected_filename=expected_png,
+                actual_filename=None,
+                target_state=JobState.RAW_VALIDATED,
+                started_at=time.time(),
+                created_at=time.time(),
+                suggested_filename=suggested_filename,
+                attempt=_job_attempt(ctx.job_id),
+            )
+
+        job_mark(ctx.job_id, 'download', 'ok')
+        job_mark(ctx.job_id, 'released', 'ok')
+        release_gemini_once(ctx)
+        append_runtime_log(f'{prefix} [GEMINI-DL] RESOURCE_RELEASED')
+        ctx.transition_sync(JobState.GEMINI_RELEASED)
+        ctx.transition_sync(JobState.RAW_DOWNLOADING)
+        append_runtime_log(f"{prefix} GEMINI RESOURCE RELEASED")
+        append_runtime_log(f'{prefix} GEMINI_RELEASED immediately_after_download_start={time.strftime("%H:%M:%S")}')
+        append_runtime_log(f"{prefix} RAW DOWNLOAD CONTINUES")
+        return True
+
+def _handle_gemini_failure(worker: 'GeminiWorker', ctx: JobContext, e: Exception):
+    """Shared failure path for both run_setup_sync() and
+    check_and_maybe_finish_sync(), called by gemini_scheduler_loop() --
+    consolidates exactly what the old do_execute_sync()'s single
+    try/except used to do (job_stop/FAILED transition/broker.fail/debug
+    dump/tab close/resource release), plus resolving gemini_done_future
+    with the exception so execute_pipeline()'s await raises it there."""
+    ctx.error = str(e)
+    _err = str(e)
+    if 'CREATE_IMAGE_VERIFY_FAILED' in _err:
+        job_stop(ctx.job_id, 'CREATE_IMAGE_VERIFY_FAILED')
+    elif 'PROMPT_VERIFY_FAILED' in _err or 'Prompt injection failed' in _err:
+        job_stop(ctx.job_id, 'PROMPT_VERIFY_FAILED')
+    else:
+        job_stop(ctx.job_id, type(e).__name__ + ': ' + _err[:60])
+    ctx.transition_sync(JobState.FAILED)
+    GEMINI_BROKER.fail(worker.tid, str(e))
+    _dump_gemini_debug_artifacts(worker.tid, worker.handle, ctx.job_id, str(e))
+    try:
+        with CHROME_DRIVER_LOCK:
+            if worker.handle and worker.handle in chrome_driver.window_handles:
+                chrome_driver.switch_to.window(worker.handle)
+                chrome_driver.close()
+    except Exception:
+        pass
+    worker.handle = None
+    worker.driver = None
+    release_gemini_once(ctx)
+    _release_admission_gate(ctx)
+    if ctx.gemini_done_future is not None and not ctx.gemini_done_future.done():
+        ctx.gemini_done_future.set_exception(RuntimeError(ctx.error))
+
+# Reuse the previous run's GeminiWorker instances -- each holds a live
+# `.handle`/`.driver` pointing at an actual open Chrome tab; a fresh dict
+# here would forget every real tab and force _recover_gemini_resource to
+# treat all of them as needing recreation even when they're fine.
+if V16_STATE.GEMINI_WORKERS is not None:
+    GEMINI_WORKERS = V16_STATE.GEMINI_WORKERS
+else:
+    GEMINI_WORKERS = {f"T{i}": GeminiWorker(f"T{i}") for i in range(MAX_CONCURRENT_TABS)}
+    V16_STATE.GEMINI_WORKERS = GEMINI_WORKERS
+
+# ------------------------------------------------------------------------------
+# CENTRAL GEMINI SCHEDULER -- by explicit request, only ONE browser action
+# sequence (one job's full setup, OR one status-check-and-maybe-finish on an
+# already-generating tab) is ever in flight at a time, never four
+# independent worker threads racing for CHROME_DRIVER_LOCK. GEMINI_EXECUTOR
+# is a single-worker executor for exactly this reason -- it is the
+# mechanism that makes "only one thing happening at a time" a hard
+# guarantee rather than a convention.
+# ------------------------------------------------------------------------------
+GEMINI_READY_QUEUE: "asyncio.Queue[JobContext]" = asyncio.Queue()
+GEMINI_ACTIVE: Dict[str, JobContext] = {}
+_GEMINI_RR_CURSOR = {'idx': 0}
+
+# By explicit request: BullMQ keeps a high concurrency (so a job doing
+# WMR/R2/DB work never blocks a NEW job from being fetched -- lowering
+# BULLMQ_CONCURRENCY itself caused exactly that regression earlier this
+# session), but only ONE job may be resolving its prompt/refs and waiting
+# to enter Gemini setup at a time. It's acquired in execute_pipeline()
+# right before a job is resolved/queued for Gemini, and released the
+# moment THIS job's setup reaches Send (not when its whole Gemini phase,
+# including download, finishes) -- so "pick one job, submit it into a
+# tab, only then fetch/prepare the next one" holds at the admission point,
+# while multiple already-submitted jobs still generate in their own tabs
+# in parallel afterward.
+GEMINI_ADMISSION_GATE = asyncio.Semaphore(1)
+
+
+def _release_admission_gate(ctx: JobContext):
+    if not ctx.gemini_admission_released:
+        ctx.gemini_admission_released = True
+        GEMINI_ADMISSION_GATE.release()
+
+async def gemini_scheduler_loop():
+    """The single owner of all Gemini browser interaction.
+
+    Every tick, in priority order:
+      A) If a Gemini resource is free (not already in GEMINI_ACTIVE) AND a
+         job is waiting in GEMINI_READY_QUEUE, acquire that resource and
+         run the job's FULL setup (run_setup_sync) -- "pick job N from
+         queue and do all process up to the enter thing into chat".
+      B) Otherwise, round-robin to exactly ONE already-generating tab and
+         run check_and_maybe_finish_sync on it -- "continuous checkout [of]
+         the previous generation tab" -- if it comes back ready, that same
+         call already clicked download and released the resource, so the
+         very next tick's step A can immediately reuse that same tab for a
+         new job ("if T0 already download[ed] ... it is free so new job
+         go into that T0, no need to create new tab").
+
+    Both steps run on GEMINI_EXECUTOR (max_workers=1), so this loop never
+    has two browser actions in flight at once; it only ever waits on
+    whichever single action is currently running, then immediately decides
+    the next one."""
+    loop = asyncio.get_running_loop()
+    append_runtime_log("[GEMINI SCHED] loop started")
+    tick_n = 0
+    while True:
+        # Every sibling background loop (worker_heartbeat_loop,
+        # poll_downloads_loop, redis_queue_monitor_loop) wraps its whole
+        # tick body in try/except so one bad tick logs and continues.
+        # This loop is a bare `asyncio.create_task(...)` that nothing ever
+        # awaits or retrieves the result of -- without this same top-level
+        # guard, ANY uncaught exception anywhere in a tick (not just inside
+        # the two narrow try/excepts below) silently kills the loop
+        # forever: GEMINI_ACTIVE freezes, no resource is ever acquired
+        # again, and every queued job sits at "WAIT Gemini" with no error
+        # visible on the (overwritten) live dashboard.
+        try:
+            did_work = False
+            tick_n += 1
+            if tick_n % 100 == 0:
+                append_runtime_log(f"[GEMINI SCHED] alive tick={tick_n} active={list(GEMINI_ACTIVE.keys())} queue_size={GEMINI_READY_QUEUE.qsize()} admission_gate_free={GEMINI_ADMISSION_GATE._value}")
+            # Cheap pre-check only: "is anything free at all", so Step A
+            # doesn't attempt (and block on) an acquire when every tab is
+            # busy. It does NOT decide WHICH resource gets used -- that
+            # T0-first guarantee comes solely from acquire_preferred()'s
+            # own atomic, lock-scoped scan below, which is the single
+            # source of truth for allocation order.
+            any_free = bool(set(GEMINI_BROKER.free_resources) - set(GEMINI_ACTIVE.keys()))
+
+            if any_free and not GEMINI_READY_QUEUE.empty():
+                ctx = await GEMINI_READY_QUEUE.get()
                 try:
-                    if self.handle and self.handle in chrome_driver.window_handles:
-                        chrome_driver.switch_to.window(self.handle)
-                        chrome_driver.close()
-                except Exception:
-                    pass
-                self.handle = None
-                self.driver = None
-                release_gemini_once(ctx)
+                    tid = await GEMINI_BROKER.acquire_preferred(ctx.job_id)
+                except Exception as e:
+                    append_runtime_log(f"[GEMINI SCHED] acquire failed job={ctx.job_id}: {e}")
+                    _release_admission_gate(ctx)
+                    if ctx.gemini_done_future is not None and not ctx.gemini_done_future.done():
+                        ctx.gemini_done_future.set_exception(e)
+                    continue
+                progress_detail(ctx.job_id, 'gemini_wait', False)
+                ctx.gemini_resource = tid
+                _jp = JOB_PROGRESS.get(ctx.job_id)
+                if _jp is not None:
+                    _jp['resource'] = tid
+                ctx.transition_sync(JobState.GEMINI_RESERVED)
+                append_runtime_log(f"[PIPELINE][{ctx.job_id}] Gemini acquired = {tid}")
+                worker = GEMINI_WORKERS[tid]
+                try:
+                    await loop.run_in_executor(GEMINI_EXECUTOR, worker.run_setup_sync, ctx)
+                    GEMINI_ACTIVE[tid] = ctx
+                    # Setup reached Send -- this job is submitted into its
+                    # tab. Release the admission gate now (not when the
+                    # whole Gemini phase, including download, finishes) so
+                    # the NEXT queued job can be fetched/resolved and enter
+                    # setup while this one generates in the background.
+                    _release_admission_gate(ctx)
+                except Exception as e:
+                    _handle_gemini_failure(worker, ctx, e)
+                did_work = True
+            elif GEMINI_ACTIVE:
+                tids = list(GEMINI_ACTIVE.keys())
+                idx = _GEMINI_RR_CURSOR['idx'] % len(tids)
+                _GEMINI_RR_CURSOR['idx'] += 1
+                tid = tids[idx]
+                ctx = GEMINI_ACTIVE[tid]
+                worker = GEMINI_WORKERS[tid]
+                try:
+                    finished = await loop.run_in_executor(GEMINI_EXECUTOR, worker.check_and_maybe_finish_sync, ctx)
+                    if finished:
+                        GEMINI_ACTIVE.pop(tid, None)
+                        if ctx.gemini_done_future is not None and not ctx.gemini_done_future.done():
+                            ctx.gemini_done_future.set_result(True)
+                except Exception as e:
+                    GEMINI_ACTIVE.pop(tid, None)
+                    _handle_gemini_failure(worker, ctx, e)
+                did_work = True
 
-GEMINI_WORKERS = {f"T{i}": GeminiWorker(f"T{i}") for i in range(4)}
+            if not did_work:
+                await asyncio.sleep(0.2)
+        except Exception as loop_err:
+            append_runtime_log(f"[GEMINI SCHED] TICK_ERROR (loop survives): {type(loop_err).__name__}: {loop_err}")
+            try:
+                import traceback
+                append_runtime_log("[GEMINI SCHED] " + traceback.format_exc().replace("\n", " | "))
+            except Exception:
+                pass
+            await asyncio.sleep(1.0)
 
 class WmrDriverThread(threading.Thread):
     def __init__(self, resource_id: str):
@@ -2731,38 +5433,137 @@ class WmrDriverThread(threading.Thread):
         self.resource_id = resource_id
         self.command_queue = queue.Queue()
         self.driver = None
+        # Single-flight guard: the broker's recovery-timer thread can fire
+        # again while a previous RECOVER is still queued/running for this
+        # same resource -- without this, multiple RECOVER commands could
+        # stack up on one owner thread's command_queue.
+        self.recovery_lock = threading.Lock()
+        self.recovery_pending = False
 
     def run(self):
         while True:
-            cmd, ctx = self.command_queue.get()
-            if cmd == "EXECUTE":
-                prefix = f"[{self.resource_id}][{ctx.job_id}]"
+            cmd, payload = self.command_queue.get()
+            if cmd == "SHUTDOWN":
+                # Selenium quit() must happen on THIS thread -- it's the
+                # sole owner of self.driver. shutdown_worker() previously
+                # called thread.driver.quit() directly from the asyncio
+                # thread, racing with this thread's own cleanup and
+                # violating the one-owner-thread-per-driver invariant this
+                # class exists to enforce.
+                ack = payload
                 try:
+                    if self.driver is not None:
+                        self.driver.quit()
+                finally:
+                    self.driver = None
+                try:
+                    ack.put_nowait(True)
+                except queue.Full:
+                    pass
+                self.command_queue.task_done()
+                return
+            if cmd == "RECOVER":
+                # Same one-owner-thread rule as SHUTDOWN: recreate this
+                # slot's Selenium driver ON THIS THREAD, never from the
+                # broker's recovery-timer thread that requested it.
+                ack = payload
+                ok = False
+                try:
+                    if self.driver is not None:
+                        try:
+                            self.driver.quit()
+                        except Exception:
+                            pass
+                        self.driver = None
+                    self.driver = create_wmr_chrome_driver(self.resource_id)
+                    _ = self.driver.title
+                    ok = True
+                except Exception as e:
+                    append_runtime_log(f"[WMR-{self.resource_id}] RECOVER_FAILED: {e}")
+                    try:
+                        if self.driver:
+                            self.driver.quit()
+                    except Exception:
+                        pass
+                    self.driver = None
+                try:
+                    ack.put_nowait(ok)
+                except queue.Full:
+                    pass
+                self.command_queue.task_done()
+                continue
+            ctx = payload
+            if cmd == "EXECUTE":
+                prefix = f"[WMR][{self.resource_id}][{ctx.job_id}]"
+                append_runtime_log(f"{prefix} START")
+                try:
+                    job_mark(ctx.job_id, 'wmr', 'run')
                     if self.driver is None:
                         self.driver = create_wmr_chrome_driver(self.resource_id)
-                        self.driver.get("https://www.watermarkremover.io/upload")
-                    
-                    ctx.transition_sync(JobState.WMR_PROCESSING)
-                    
-                    staging_dir = Path(WMR_STAGING_BASE) / self.resource_id / ctx.job_id
-                    staging_dir.mkdir(parents=True, exist_ok=True)
-                    
-                    set_tab_download_dir(self.driver, str(staging_dir))
+                    append_runtime_log(f"{prefix} DRIVER READY")
+                    # Navigate to the real production WMR service on EVERY
+                    # job, not only when the driver was just (re)created --
+                    # a previous version only navigated once per driver
+                    # lifetime (to the wrong site, see below), so every job
+                    # after the first on this same resource silently reused
+                    # whatever page state the prior job's completed run left
+                    # behind (its before/after result view) instead of a
+                    # fresh upload page.
+                    self.driver.get(WMR_SERVICE_URL)
+                    append_runtime_log(f"{prefix} OPENING WMR url={WMR_SERVICE_URL}")
 
+                    ctx.transition_sync(JobState.WMR_PROCESSING)
+
+                    # ATTEMPT ISOLATION: per-attempt staging dir -- a retry of
+                    # the same job can never see a previous attempt's leftover.
+                    staging_dir = Path(WMR_STAGING_BASE) / self.resource_id / f"attempt-{_job_attempt(ctx.job_id)}" / ctx.job_id
+                    staging_dir.mkdir(parents=True, exist_ok=True)
+
+                    set_tab_download_dir(self.driver, str(staging_dir), resource_id=self.resource_id)
+
+                    append_runtime_log(f"{prefix} UPLOADING RAW PNG")
                     _wmr_expose_file_inputs(self.driver)
                     file_input = _wmr_find_file_input(self.driver)
+                    if file_input is None:
+                        raise RuntimeError("WMR_UPLOAD_FAILED: no file input on page")
                     file_input.send_keys(str(Path(ctx.raw_path).resolve()))
+                    # POSITIVE evidence the upload was accepted (page navigated
+                    # to workspace or preview appeared) within its OWN timeout.
+                    if not _wmr_wait_for_upload_accepted(self.driver, WMR_UPLOAD_ACCEPT_TIMEOUT_S):
+                        raise RuntimeError(f"WMR_UPLOAD_NOT_ACCEPTED within {WMR_UPLOAD_ACCEPT_TIMEOUT_S:.0f}s")
 
-                    try: _wmr_check_status(self.driver)
-                    except Exception: pass 
-                        
-                    try: _wmr_click_download(self.driver)
-                    except Exception: _wmr_click_download(self.driver, attempts=6)
+                    append_runtime_log(f"{prefix} PROCESSING")
+                    # Poll until the page reports DONE (or a terminal failure),
+                    # bounded by the dedicated PROCESS timeout (not one generic
+                    # timeout for the whole WMR operation).
+                    deadline = time.time() + WMR_PROCESS_TIMEOUT_S
+                    wmr_status = "LOADING"
+                    while time.time() < deadline:
+                        try:
+                            wmr_status = _wmr_check_status(self.driver)
+                        except Exception as status_err:
+                            wmr_status = "ERROR"
+                            append_runtime_log(f"{prefix} STATUS_CHECK_ERROR: {status_err}")
+                        if wmr_status in ("DONE", "NOT_FOUND"):
+                            break
+                        time.sleep(0.5)
+                    if wmr_status == "NOT_FOUND":
+                        raise RuntimeError("WMR_WATERMARK_NOT_DETECTED")
+                    if wmr_status not in ("DONE",):
+                        raise RuntimeError(f"WMR_PROCESSING_TIMEOUT after {WMR_PROCESS_TIMEOUT_S:.0f}s (last status={wmr_status})")
+                    job_mark(ctx.job_id, 'wmr', 'ok')
+
+                    clicked = _wmr_click_download(self.driver, attempts=6)
+                    if not clicked:
+                        raise RuntimeError("WMR_DOWNLOAD_BUTTON_NOT_FOUND")
+                    append_runtime_log(f"{prefix} DOWNLOAD CLICKED")
 
                     expected_png = f"{ctx.job_id}_clean.png"
+                    job_mark(ctx.job_id, 'dlclean', 'run')
                     ctx.transition_sync(JobState.WMR_DOWNLOAD_START)
 
-                    dl_guid, source = _detect_download_start(self.driver, staging_dir, timeout=60)
+                    dl_guid, source, suggested_filename = _detect_download_start(self.driver, staging_dir, timeout=WMR_DOWNLOAD_START_TIMEOUT_S)
+                    _log_download_start_confirmed(prefix, dl_guid, source)
 
                     record_id = f"wmr:{ctx.job_id}:{time.monotonic_ns()}"
                     with DOWNLOAD_REGISTRY_LOCK:
@@ -2778,14 +5579,18 @@ class WmrDriverThread(threading.Thread):
                             actual_filename=None,
                             target_state=JobState.CLEAN_READY,
                             started_at=time.time(),
-                            created_at=time.time()
+                            created_at=time.time(),
+                            suggested_filename=suggested_filename,
+                            attempt=_job_attempt(ctx.job_id),
                         )
                     
                     release_wmr_once(ctx)
                     ctx.transition_sync(JobState.WMR_RELEASED)
+                    append_runtime_log(f"{prefix} WMR RESOURCE RELEASED")
 
                 except Exception as e:
                     ctx.error = str(e)
+                    job_stop(ctx.job_id, 'WMR: ' + type(e).__name__ + ': ' + str(e)[:60])
                     ctx.transition_sync(JobState.FAILED)
                     WMR_BROKER.fail(self.resource_id, str(e))
                     try: self.driver.quit()
@@ -2797,45 +5602,197 @@ class WmrDriverThread(threading.Thread):
             else:
                 self.command_queue.task_done()
 
-# V16: Only initialize at runtime
-WMR_THREADS = {}
+def request_wmr_shutdown(thread: 'WmrDriverThread', timeout_s: float = 10.0) -> bool:
+    """Ask a WmrDriverThread to quit its own Selenium driver ON ITS OWN
+    THREAD and wait for acknowledgment, instead of touching thread.driver
+    from the caller's thread. Returns True if the thread acknowledged
+    within timeout_s, False otherwise (the thread may be stuck on a
+    long-running Selenium call; the caller decides how to log that)."""
+    ack = queue.Queue(maxsize=1)
+    thread.command_queue.put(("SHUTDOWN", ack))
+    try:
+        return ack.get(timeout=timeout_s)
+    except queue.Empty:
+        return False
+
+
+def request_wmr_recover(thread: 'WmrDriverThread', timeout_s: float = 30.0) -> bool:
+    """Ask a WmrDriverThread to quit + recreate its own Selenium driver ON
+    ITS OWN THREAD and wait for acknowledgment. Recovery must never touch
+    thread.driver from the broker's recovery-timer thread -- that races
+    with whatever this thread's EXECUTE loop is doing with the same
+    driver. Returns True only if the owner thread confirmed the new
+    driver is responsive.
+
+    Single-flight: if a RECOVER is already pending/running for this
+    resource, a second recovery-timer firing must not enqueue another
+    one -- that could stack multiple RECOVER commands on one owner
+    thread's queue."""
+    with thread.recovery_lock:
+        if thread.recovery_pending:
+            append_runtime_log(f'[WMR-{thread.resource_id}] RECOVER_ALREADY_PENDING')
+            return False
+        thread.recovery_pending = True
+    try:
+        ack = queue.Queue(maxsize=1)
+        thread.command_queue.put(("RECOVER", ack))
+        try:
+            return bool(ack.get(timeout=timeout_s))
+        except queue.Empty:
+            return False
+    finally:
+        with thread.recovery_lock:
+            thread.recovery_pending = False
+
+# V16: Only initialize at runtime. Reuse the previous run's WmrDriverThread
+# instances -- each owns a live WMR Chrome driver in its own thread;
+# resetting this to {} every re-run (this dict used to be recreated fresh
+# every time, deceiving initialize_runtime_once()'s `if not WMR_THREADS`
+# guard into always firing) silently launched 8 brand new WMR Chrome
+# processes/threads on every cell re-run while the previous 8 kept running
+# orphaned.
+if V16_STATE.WMR_THREADS is not None:
+    WMR_THREADS = V16_STATE.WMR_THREADS
+else:
+    WMR_THREADS = {}
+    V16_STATE.WMR_THREADS = WMR_THREADS
+
+def _fmt_span(start, end):
+    if start is None or end is None:
+        return "n/a"
+    return f"{end - start:.1f}s"
+
+def _print_job_timing(ctx: JobContext):
+    """Full timing breakdown goes to worker.log only -- the dashboard/
+    console stay compact."""
+    now = ctx.completed_at or time.time()
+    append_runtime_log(
+        f"[{ctx.job_id}] JOB TIMING "
+        f"queue_wait={_fmt_span(ctx.received_at, ctx.gemini_start_at)} "
+        f"gemini={_fmt_span(ctx.gemini_start_at, ctx.raw_download_start_at)} "
+        f"raw_download={_fmt_span(ctx.raw_download_start_at, ctx.raw_ready_at)} "
+        f"wmr={_fmt_span(ctx.wmr_start_at, ctx.clean_download_start_at)} "
+        f"clean_download={_fmt_span(ctx.clean_download_start_at, ctx.clean_ready_at)} "
+        f"webp={_fmt_span(ctx.clean_ready_at, ctx.webp_at)} "
+        f"r2_db={_fmt_span(ctx.webp_at, ctx.r2_at)} "
+        f"total={_fmt_span(ctx.received_at, now)}"
+    )
 
 async def execute_pipeline(ctx: JobContext):
     try:
         existing_status = str(ctx.payload.get('status') or '').lower()
         existing_output = ctx.payload.get('output_url')
         if existing_status == 'done' and existing_output:
-            log(f"[{ctx.job_id}] IDEMPOTENT_SKIP: generation already completed (status=done, output_url set) — not regenerating")
+            append_runtime_log(f"[{ctx.job_id}] IDEMPOTENT_SKIP: generation already completed (status=done, output_url set) — not regenerating")
             ctx.transition_sync(JobState.COMPLETED)
             return
 
-        prompt, garment_path, model_path, holo_path = resolve_prompt_and_refs(ctx.payload)
-        ctx.prompt = prompt
-        ctx.garment_path = garment_path
-        ctx.model_path = model_path
-        ctx.holo_path = holo_path
-        ctx.reference_paths = [p for p in (garment_path, holo_path, model_path) if p]
-        
-        for p in ctx.reference_paths:
-            if not Path(p).exists() or Path(p).stat().st_size == 0:
-                raise RuntimeError(f"Reference invalid: {p}")
-        
-        tid = await GEMINI_BROKER.acquire(ctx.job_id)
-        ctx.gemini_resource = tid
-        ctx.transition_sync(JobState.GEMINI_RESERVED)
-        
-        worker = GEMINI_WORKERS[tid]
-        await ctx.loop.run_in_executor(GEMINI_EXECUTOR, worker.do_execute_sync, ctx)
+        # job_progress_init() is what makes a job appear on the dashboard
+        # at all (dashboard_loop only iterates JOB_PROGRESS entries) --
+        # deliberately NOT called until the gate below is acquired, so a
+        # job BullMQ has admitted but that isn't its turn yet shows nothing
+        # at all instead of an empty "[G4/--] title |" line. progress_detail/
+        # job_mark/job_stop all no-op safely on a job_id with no entry yet,
+        # so nothing upstream of this point needs JOB_PROGRESS to exist.
+        #
+        # Only one job may be doing ANYTHING past this point -- resolving
+        # its prompt/refs from the DB, downloading reference images,
+        # waiting for/using Gemini -- at a time. BullMQ can still fetch/
+        # admit several jobs concurrently (so a job doing WMR/R2/DB work
+        # never blocks a new one from being picked up), but each one
+        # blocks HERE, before it does any of that work, until whichever
+        # job is currently ahead of it has been submitted into Gemini
+        # (reached Send). Gating only the Gemini hand-off (an earlier,
+        # narrower version of this gate) still let every admitted job
+        # resolve prompt/refs and download reference images in parallel,
+        # which is real wasted work for jobs that won't touch Gemini for a
+        # while, and is why several jobs could show "(N refs)" on the
+        # dashboard at once even though only one was ever in a tab. By
+        # explicit request: "pick one job, upload and hit enter in tab 1,
+        # only then fetch/pick the next one" -- moved to the very top so
+        # a newly admitted job does nothing else until this gate is free.
+        await GEMINI_ADMISSION_GATE.acquire()
+        try:
+            job_progress_init(ctx.job_id)
+            progress_detail(ctx.job_id, 'refs_state', 'resolving')
+            append_runtime_log(f"[{ctx.job_id}] RESOLVING PROMPT + REFERENCES")
+            prompt, garment_path, model_path, holo_path = resolve_prompt_and_refs(ctx.payload)
+            ctx.prompt = prompt
+
+            # PROMPT_PREFLIGHT: a missing/empty prompt must never reach
+            # Gemini at all -- failing here costs nothing, while
+            # discovering it after New Chat/Flash/Create Image/upload have
+            # already run wastes a whole Gemini resource-hold on a job
+            # that could never have sent anything. Never logs the full
+            # prompt text.
+            _norm_prompt = (ctx.prompt or '').strip()
+            if not _norm_prompt:
+                append_runtime_log(f"[{ctx.job_id}] PROMPT_PREFLIGHT prompt_present=False -- failing before Gemini acquisition")
+                raise RuntimeError("PROMPT_MISSING: resolved prompt is empty/None")
+            _prompt_hash = hashlib.sha256(_norm_prompt.encode('utf-8')).hexdigest()[:16]
+            append_runtime_log(
+                f"[{ctx.job_id}] PROMPT_PREFLIGHT prompt_present=True len={len(_norm_prompt)} "
+                f"sha256={_prompt_hash} first80={_norm_prompt[:80]!r} last80={_norm_prompt[-80:]!r}"
+            )
+
+            ctx.garment_path = garment_path
+            ctx.model_path = model_path
+            ctx.holo_path = holo_path
+            ctx.reference_paths = [p for p in (garment_path, holo_path, model_path) if p]
+
+            for p in ctx.reference_paths:
+                if not Path(p).exists() or Path(p).stat().st_size == 0:
+                    raise RuntimeError(f"Reference invalid: {p}")
+            # Local cache paths only -- never the original remote reference
+            # URLs (params_json/URLs are DB-owned strings that can carry
+            # pre-signed query params, so this stays as filenames only,
+            # not full paths).
+            append_runtime_log(
+                f"[{ctx.job_id}] REFERENCES READY garment={Path(garment_path).name if garment_path else None} "
+                f"model={Path(model_path).name if model_path else None} "
+                f"hologram={Path(holo_path).name if holo_path else None} "
+                f"count={len(ctx.reference_paths)}"
+            )
+            progress_detail(ctx.job_id, 'refs_count', len(ctx.reference_paths))
+            progress_detail(ctx.job_id, 'refs_state', 'ready')
+
+            append_runtime_log(f"[PIPELINE][{ctx.job_id}] GEMINI QUEUED")
+            # Only gemini_scheduler_loop() touches GEMINI_BROKER/the shared
+            # driver now -- this just hands the job off and waits for the
+            # scheduler to resolve gemini_done_future once setup through
+            # download-start + resource release is done (or raise on
+            # failure). Once GEMINI_READY_QUEUE.put succeeds, releasing the
+            # gate becomes the scheduler's job (_release_admission_gate,
+            # called on setup success or any Gemini failure) -- but if
+            # anything between acquiring the gate and that handoff raises,
+            # nothing else would ever release it, permanently blocking
+            # every future job from entering Gemini. That must never
+            # happen silently.
+            progress_detail(ctx.job_id, 'gemini_wait', True)
+            ctx.gemini_done_future = ctx.loop.create_future()
+            await GEMINI_READY_QUEUE.put(ctx)
+        except BaseException:
+            _release_admission_gate(ctx)
+            raise
+        append_runtime_log(f"[PIPELINE][{ctx.job_id}] Gemini execution started")
+        await ctx.gemini_done_future
         await ctx.wait_for_state(JobState.RAW_VALIDATED)
-        
+
         ctx.transition_sync(JobState.WMR_QUEUED)
+        append_runtime_log(f"[PIPELINE][{ctx.job_id}] WMR QUEUED")
+        append_runtime_log(f"[PIPELINE][{ctx.job_id}] Acquiring WMR resource")
         w_tid = await WMR_BROKER.acquire(ctx.job_id)
         ctx.wmr_resource = w_tid
+        _jp = JOB_PROGRESS.get(ctx.job_id)
+        if _jp is not None:
+            _jp['wmr_resource'] = w_tid
         ctx.transition_sync(JobState.WMR_RESERVED)
-        
+        append_runtime_log(f"[PIPELINE][{ctx.job_id}] WMR resource acquired = {w_tid}")
+
         WMR_THREADS[w_tid].command_queue.put(("EXECUTE", ctx))
         await ctx.wait_for_state(JobState.CLEAN_READY)
-        
+        append_runtime_log(f"[PIPELINE][{ctx.job_id}] CLEAN_READY")
+
         webp_path = Path(ctx.clean_png_path).with_suffix('.webp')
         result = subprocess.run(['cwebp', '-q', '80', ctx.clean_png_path, '-o', str(webp_path)], capture_output=True)
         if result.returncode != 0:
@@ -2848,11 +5805,13 @@ async def execute_pipeline(ctx: JobContext):
 
         if not validate_webp_file(str(webp_path)):
             raise RuntimeError("WebP validation failed (format/dimensions/size check)")
+        job_mark(ctx.job_id, 'webp', 'ok')
         ctx.webp_path = str(webp_path)
         ctx.transition_sync(JobState.WEBP_READY)
+        append_runtime_log(f"[PIPELINE][{ctx.job_id}] WEBP_READY")
 
         fs = sys.modules["fashion_studio"]
-        fs.push_generation(
+        push_result = fs.push_generation(
             image_path=ctx.clean_png_path,
             prompt=ctx.prompt,
             user_id=ctx.payload.get("user_id"),
@@ -2860,30 +5819,67 @@ async def execute_pipeline(ctx: JobContext):
             webp_path=ctx.webp_path,
             force=True
         )
+        ctx.output_url = (push_result or {}).get("output_url")
         ctx.transition_sync(JobState.R2_READY)
+        append_runtime_log(f"[PIPELINE][{ctx.job_id}] R2_READY (PNG + WebP uploaded)")
         ctx.transition_sync(JobState.DB_FINALIZING)
         ctx.transition_sync(JobState.DB_READY)
+        append_runtime_log(f"[PIPELINE][{ctx.job_id}] DB_READY")
 
         try:
             crd = sys.modules["credits"]
             crd.settle_look(ctx.job_id)
+            job_mark(ctx.job_id, 'settle', 'ok')
             ctx.transition_sync(JobState.CREDITS_SETTLED)
+            append_runtime_log(f"[PIPELINE][{ctx.job_id}] CREDITS_SETTLED")
         except Exception as e:
             # R2 upload + DB finalization already succeeded above -- the image was
             # delivered to the user. Do not fail/refund a completed job over a
             # credits-only settlement failure; log loudly for out-of-band reconciliation.
-            log(f"[{ctx.job_id}] CREDITS_SETTLE_FAILED (job still marked COMPLETED): {e}")
+            append_runtime_log(f"[{ctx.job_id}] CREDITS_SETTLE_FAILED (job still marked COMPLETED): {e}")
 
+        job_complete(ctx.job_id)
         ctx.transition_sync(JobState.COMPLETED)
+        DASHBOARD_STATE["queue"]["completed"] = DASHBOARD_STATE["queue"].get("completed", 0) + 1
+        set_last_event(f"{short_job_id(ctx.job_id)} COMPLETED")
+        append_runtime_log(
+            f"[COMPLETED] job_id={ctx.job_id} gemini={ctx.gemini_resource} wmr={ctx.wmr_resource} "
+            f"raw={ctx.raw_path} clean={ctx.clean_png_path} webp={ctx.webp_path} r2_url={ctx.output_url}"
+        )
+        _print_job_timing(ctx)
 
     except Exception as e:
         ctx.error = str(e)
+        job_stop(ctx.job_id, type(e).__name__ + ': ' + str(e)[:60])
         if ctx.state != JobState.FAILED:
             ctx.transition_sync(JobState.FAILED)
-        try:
-            sys.modules["credits"].refund_look(ctx.job_id, str(e)[:500])
-        except Exception:
-            pass
+
+        import traceback as _tb
+        set_last_event(f"ERROR [{ctx.gemini_resource or ctx.wmr_resource or '?'}] {short_job_id(ctx.job_id)} {type(e).__name__}: {str(e)[:80]}")
+        append_runtime_log(
+            f"[FAILED] job_id={ctx.job_id} state={ctx.state.name} error_type={type(e).__name__} "
+            f"error={e} gemini={ctx.gemini_resource} wmr={ctx.wmr_resource} "
+            f"raw_guid={ctx.raw_guid} wmr_guid={ctx.wmr_guid}\n{_tb.format_exc()}"
+        )
+        # Only mark the DB row failed + refund credits on BullMQ's FINAL
+        # attempt for this job. Doing this unconditionally on every attempt
+        # (the previous behavior) marked the generation 'failed' and
+        # refunded credits on attempt 1's transient browser/download/WMR
+        # error even when BullMQ still had retries left -- exactly the
+        # "Attempt: 2, DB status: failed" pattern seen in production. A
+        # later successful attempt's push_generation() unconditionally
+        # overwrites status back to 'done', so the DB itself self-heals,
+        # but the premature refund_look does not: a job that ultimately
+        # succeeds on attempt 2 would have already refunded the user's
+        # credits for attempt 1's failure, for free.
+        is_final_attempt = (ctx.attempts_made + 1) >= ctx.max_attempts
+        if is_final_attempt:
+            try:
+                sys.modules["credits"].refund_look(ctx.job_id, str(e)[:500])
+            except Exception as refund_err:
+                append_runtime_log(f"[{ctx.job_id}] REFUND_FAILED (final attempt): {refund_err}")
+        else:
+            append_runtime_log(f"[{ctx.job_id}] TRANSIENT_FAILURE_WILL_RETRY attempt={ctx.attempts_made + 1}/{ctx.max_attempts} -- DB/credits left untouched, BullMQ will retry")
         release_gemini_once(ctx)
         release_wmr_once(ctx)
 
@@ -2891,16 +5887,19 @@ async def execute_pipeline(ctx: JobContext):
 # DOWNLOAD WATCHER
 # ------------------------------------------------------------------------------
 
+_DOWNLOADS_SEEN_FILE = set()  # dict_key -> already printed "file detected" for this record
+
 async def poll_downloads_loop():
     while True:
         try:
             with DOWNLOAD_REGISTRY_LOCK:
                 items = list(DOWNLOAD_REGISTRY.items())
-            
+
             for dict_key, rec in items:
                 ctx = JOB_CONTEXTS.get(rec.job_id)
                 if not ctx or ctx.state == JobState.FAILED:
                     with DOWNLOAD_REGISTRY_LOCK: DOWNLOAD_REGISTRY.pop(dict_key, None)
+                    _DOWNLOADS_SEEN_FILE.discard(dict_key)
                     continue
 
                 staging = Path(rec.staging_dir)
@@ -2909,12 +5908,53 @@ async def poll_downloads_loop():
                 # staging is exclusively owned by this one job/resource (see get_chrome_job_dir /
                 # WMR per-resource staging dirs), so ownership is proven by directory scoping --
                 # never by guessing a filename or GUID-prefix Chrome doesn't actually produce.
+                # get_chrome_job_dir()/get_wmr_job_dir() never clear a job's incoming/ dir between
+                # attempts, so a BullMQ retry that reuses the same job_id can still find a stale
+                # leftover file from a prior failed attempt sitting there. Picking the FIRST
+                # non-temp file (directory iteration order, not creation order) could grab that
+                # stale file immediately instead of waiting for the real new download -- prefer
+                # rec.expected_filename if present, else the newest file created at/after this
+                # record's own started_at.
+                candidates = [f for f in staging.iterdir() if not f.name.endswith((".crdownload", ".tmp", ".part"))]
                 completed_file = None
-                for f in staging.iterdir():
-                    if f.name.endswith((".crdownload", ".tmp", ".part")):
-                        continue
-                    completed_file = f
-                    break
+                if rec.expected_filename:
+                    for f in candidates:
+                        if f.name == rec.expected_filename:
+                            completed_file = f
+                            break
+                if completed_file is None and rec.suggested_filename:
+                    # Chrome's own real filename (from Browser.downloadWillBegin's
+                    # suggestedFilename, or the observed .crdownload name on the
+                    # filesystem-fallback path) -- never required to equal our
+                    # canonical expected_filename, but a genuine hint from Chrome
+                    # itself, checked before falling back to plain newest-mtime.
+                    for f in candidates:
+                        if f.name == rec.suggested_filename:
+                            completed_file = f
+                            break
+                if completed_file is None:
+                    fresh = [f for f in candidates if f.stat().st_mtime >= rec.started_at]
+                    if fresh:
+                        completed_file = max(fresh, key=lambda f: f.stat().st_mtime)
+
+                kind = "RAW" if rec.target_state == JobState.RAW_VALIDATED else "CLEAN"
+                is_gemini_raw = rec.resource_type == "gemini"
+                if completed_file and dict_key not in _DOWNLOADS_SEEN_FILE:
+                    _DOWNLOADS_SEEN_FILE.add(dict_key)
+                    append_runtime_log(f"[DOWNLOAD][{rec.job_id}] {kind} DOWNLOAD STARTED")
+                    append_runtime_log(f"[DOWNLOAD][{rec.job_id}] waiting for filesystem completion")
+                    append_runtime_log(f"[DOWNLOAD][{rec.job_id}] file detected")
+                    if is_gemini_raw:
+                        # Real filename accepted as-is -- Chrome/Gemini can
+                        # name the file anything (e.g.
+                        # Gemini_Generated_Image_....png), never required
+                        # to equal expected_filename; ownership is proven
+                        # by this record's exclusive staging_dir, not by
+                        # the name matching.
+                        append_runtime_log(
+                            f"[GEMINI-DL] FILE_FOUND path={completed_file} size={completed_file.stat().st_size} "
+                            f"actual_filename={completed_file.name} expected_filename={rec.expected_filename}"
+                        )
 
                 if completed_file:
                     size_before = -1
@@ -2930,19 +5970,37 @@ async def poll_downloads_loop():
                         except Exception: pass
 
                     if stable:
+                        append_runtime_log(f"[DOWNLOAD][{rec.job_id}] file stable")
                         try:
                             validate_image_file(str(completed_file))
+                            append_runtime_log(f"[DOWNLOAD][{rec.job_id}] PNG VALIDATED")
+                            _sz = completed_file.stat().st_size
+                            if is_gemini_raw:
+                                append_runtime_log(
+                                    f"[GEMINI-DL] PNG_VALIDATED path={completed_file} size={_sz} detected_at={time.time():.0f}"
+                                )
+                            _jp = JOB_PROGRESS.get(rec.job_id)
                             if rec.target_state == JobState.RAW_VALIDATED:
                                 ctx.raw_path = str(completed_file)
+                                if _jp is not None:
+                                    _jp['dl_bytes'] = _sz
+                                job_mark(rec.job_id, 'dlraw', 'ok')
                                 ctx.transition_sync(JobState.RAW_READY)
                             else:
                                 ctx.clean_png_path = str(completed_file)
+                                if _jp is not None:
+                                    _jp['dlclean_bytes'] = _sz
+                                job_mark(rec.job_id, 'dlclean', 'ok')
 
                             ctx.transition_sync(rec.target_state)
+                            append_runtime_log(f"[DOWNLOAD][{rec.job_id}] {rec.target_state.name}")
+                            if is_gemini_raw:
+                                append_runtime_log(f"[GEMINI-DL] RAW_DOWNLOAD_COMPLETE job={rec.job_id} resource={rec.resource_id}")
                             with DOWNLOAD_REGISTRY_LOCK: DOWNLOAD_REGISTRY.pop(dict_key, None)
+                            _DOWNLOADS_SEEN_FILE.discard(dict_key)
                         except Exception as e:
-                            print(f"[{rec.job_id}] DOWNLOAD_VALIDATE_FAILED: {e}")
-                            
+                            append_runtime_log(f"[{rec.job_id}] DOWNLOAD_VALIDATE_FAILED: {e}")
+
         except Exception as e:
             print(f"[DOWNLOAD_WATCHER_ERROR] {e}")
         await asyncio.sleep(1)
@@ -2951,21 +6009,41 @@ async def poll_downloads_loop():
 # BULLMQ INTEGRATION
 # ------------------------------------------------------------------------------
 
+_LOGGED_RECEIPTS = set()  # (job.id, attempt) already logged -- never duplicate a receipt line
+
 async def process_bullmq_job(job, job_token):
+    # This is the ONLY place allowed to log REAL JOB RECEIVED -- it fires
+    # exactly once per real invocation from the BullMQ Worker itself, never
+    # inferred from queue counts or the queue monitor. Full detail (worker
+    # ID, job data keys, DB status, user ID, ...) goes to worker.log only;
+    # the dashboard is the console's live view now, not a growing wall of
+    # per-job header blocks.
     generation_id = job.data.get("generationId") or job.data.get("id") or job.id
-    print(f"[{WORKER_ID}] BullMQ job={job.id} generation={generation_id}")
+    attempt = job.attemptsMade + 1
+    receipt_key = (job.id, attempt)
+    if receipt_key not in _LOGGED_RECEIPTS:
+        _LOGGED_RECEIPTS.add(receipt_key)
+        set_last_event(f"{short_job_id(generation_id)} RECEIVED attempt={attempt}")
+        append_runtime_log(
+            f"[BULLMQ RECEIVED] worker={WORKER_ID} job_id={job.id} generation_id={generation_id} "
+            f"attempt={attempt} queue={QUEUE_NAME} "
+            f"data_keys={sorted(job.data.keys()) if isinstance(job.data, dict) else 'n/a'}"
+        )
 
     existing = JOB_CONTEXTS.get(generation_id)
     if existing is not None and existing.state not in (JobState.COMPLETED, JobState.FAILED):
-        log(f"[{generation_id}] DUPLICATE_JOB_REJECTED: already in-flight (state={existing.state.name})")
+        append_runtime_log(f"[{generation_id}] DUPLICATE_JOB_REJECTED: already in-flight (state={existing.state.name})")
         raise RuntimeError(f"Duplicate job for generation {generation_id} already in-flight (state={existing.state.name})")
 
     gen = fetch_generation(generation_id)
     if not gen: raise RuntimeError(f"Generation {generation_id} not found in DB.")
+    append_runtime_log(f"[{generation_id}] GENERATION FOUND db_status={gen.get('status')} user_id={gen.get('user_id')}")
 
     ctx = JobContext(job_id=generation_id, payload=gen, loop=asyncio.get_running_loop())
+    ctx.attempts_made = job.attemptsMade
+    ctx.max_attempts = getattr(job, "attempts", None) or job.opts.get("attempts", 1)
     JOB_CONTEXTS[generation_id] = ctx
-    
+
     await execute_pipeline(ctx)
 
     if ctx.state == JobState.FAILED:
@@ -2978,10 +6056,10 @@ async def process_bullmq_job(job, job_token):
 # ------------------------------------------------------------------------------
 
 def run_architecture_self_test():
-    assert len(GEMINI_BROKER.resource_ids) == 4
+    assert len(GEMINI_BROKER.resource_ids) == MAX_CONCURRENT_TABS
     assert len(WMR_BROKER.resource_ids) == 8
     assert "T0" in GEMINI_BROKER.resource_ids
-    assert "T3" in GEMINI_BROKER.resource_ids
+    assert f"T{MAX_CONCURRENT_TABS - 1}" in GEMINI_BROKER.resource_ids
     for rid in ["W0-T0","W0-T1","W1-T0","W1-T1","W2-T0","W2-T1","W3-T0","W3-T1"]:
         assert rid in WMR_BROKER.resource_ids
     # Preflight: every symbol the N2N pipeline depends on must exist before
@@ -2994,12 +6072,17 @@ def run_architecture_self_test():
     ):
         assert _name in globals(), f"PREFLIGHT_MISSING_SYMBOL: {_name}"
 
-BACKGROUND_TASKS = set()
-BULLMQ_WORKER = None
-QUEUE_MONITOR = None
-QUEUE_MONITOR_TASK = None
-HEARTBEAT_TASK = None
-WATCHER_TASK = None
+# V16_STATE itself is created once, at the top of this file (right after
+# imports) so it's available to the early resource-creation sites
+# (chrome_driver, brokers, etc.) too -- here we just mirror its
+# task/monitor fields into plain module globals for the code below.
+BACKGROUND_TASKS = V16_STATE.BACKGROUND_TASKS
+BULLMQ_WORKER = V16_STATE.BULLMQ_WORKER
+QUEUE_MONITOR = V16_STATE.QUEUE_MONITOR
+QUEUE_MONITOR_TASK = V16_STATE.QUEUE_MONITOR_TASK
+HEARTBEAT_TASK = V16_STATE.HEARTBEAT_TASK
+WATCHER_TASK = V16_STATE.WATCHER_TASK
+GEMINI_SCHEDULER_TASK = V16_STATE.GEMINI_SCHEDULER_TASK
 
 RUNTIME_HEALTH = {
     "redis": False,
@@ -3009,6 +6092,12 @@ RUNTIME_HEALTH = {
     "download_monitor": False,
     "heartbeat": False,
 }
+
+# Last-seen queue counts, updated only by redis_queue_monitor_loop -- used
+# for its own change-detection logging and mirrored into the heartbeat.
+# This is a cache for display only; it is never treated as proof of job
+# receipt (only process_bullmq_job's "[BULLMQ] REAL JOB RECEIVED" is that).
+LAST_QUEUE_COUNTS = {}
 
 def initialize_runtime_once():
     global WMR_THREADS
@@ -3032,37 +6121,55 @@ async def redis_queue_monitor_loop():
             "prefix": opts["prefix"],
         },
     )
+    V16_STATE.QUEUE_MONITOR = QUEUE_MONITOR
+
+    _was_idle = None  # None = not yet known, True/False = last reported idle state
 
     while True:
         try:
             counts = await QUEUE_MONITOR.getJobCounts()
             RUNTIME_HEALTH["redis"] = True
+            DASHBOARD_STATE["system"]["redis"] = "OK"
 
-            print("\n" + "=" * 60)
-            print("REDIS / BULLMQ QUEUE STATUS")
-            print("=" * 60)
-            print(f"Queue: {QUEUE_NAME}")
-            print(f"WAITING: {counts.get('waiting', 0)}")
-            print(f"ACTIVE: {counts.get('active', 0)}")
-            print(f"DELAYED: {counts.get('delayed', 0)}")
-            print(f"PRIORITIZED: {counts.get('prioritized', 0)}")
-            print(f"WAITING-CHILDREN: {counts.get('waiting-children', 0)}")
-            print(f"COMPLETED: {counts.get('completed', 0)}")
-            print(f"FAILED: {counts.get('failed', 0)}")
-            print("=" * 60)
+            waiting = counts.get("waiting", 0)
+            active = counts.get("active", 0)
+            delayed = counts.get("delayed", 0)
+            is_idle = not any([waiting, active, delayed])
 
-            if not any([
-                counts.get("waiting", 0),
-                counts.get("active", 0),
-                counts.get("delayed", 0),
-            ]):
-                print("[REDIS] QUEUE EMPTY — worker alive and waiting for jobs")
+            # Change detection against the previous poll -- this is a display
+            # convenience only, NEVER proof a worker actually picked up a job
+            # (that's exclusively process_bullmq_job's "REAL JOB RECEIVED").
+            # Feeds the live dashboard's top summary + last-event line instead
+            # of printing a console line every 5s -- the dashboard is now the
+            # authoritative live view; full history still goes to worker.log.
+            changed = [
+                f"{_key}={counts.get(_key, 0)}"
+                for _key in ("waiting", "active", "delayed", "failed", "completed")
+                if LAST_QUEUE_COUNTS.get(_key) != counts.get(_key, 0)
+            ]
+            LAST_QUEUE_COUNTS.update(counts)
+            LAST_QUEUE_COUNTS["_queue_name"] = QUEUE_NAME
 
+            DASHBOARD_STATE["queue"]["waiting"] = waiting
+            DASHBOARD_STATE["queue"]["active"] = active
+            DASHBOARD_STATE["queue"]["delayed"] = delayed
+            DASHBOARD_STATE["queue"]["completed"] = counts.get("completed", 0)
+            DASHBOARD_STATE["queue"]["failed"] = counts.get("failed", 0)
+
+            if changed:
+                set_last_event(f"QUEUE {QUEUE_NAME}: {' '.join(changed)}")
+
+            _was_idle = is_idle
         except Exception as e:
             RUNTIME_HEALTH["redis"] = False
-            print(f"[REDIS MONITOR ERROR] {type(e).__name__}: {e}")
+            DASHBOARD_STATE["system"]["redis"] = "ERROR"
+            append_runtime_log(f"[REDIS MONITOR ERROR] {type(e).__name__}: {e}")
+            is_idle = False
 
-        await asyncio.sleep(5)
+        # By explicit request: back off to a 10s poll when the queue has no
+        # waiting/active/delayed jobs, instead of always polling every 5s
+        # regardless of whether there's anything to see.
+        await asyncio.sleep(10 if is_idle else 5)
 
 JOB_CONTEXT_RETENTION_S = 600  # keep terminal JobContexts around briefly for the duplicate-job guard
 
@@ -3074,16 +6181,17 @@ def _resource_label(state_value: str) -> str:
     return "DEAD"  # RECOVERING or DEAD both surface as DEAD in the FREE/BUSY/DEAD heartbeat view
 
 async def worker_heartbeat_loop():
+    """Feeds DASHBOARD_STATE only -- the live dashboard (dashboard_loop) is
+    now the visual surface for this data. No console printing here at all;
+    the old ~25-line snapshot block (printed every 10-60s regardless of
+    activity) was a large share of the notebook-output flooding this
+    dashboard exists to replace. Full detail still goes to worker.log."""
     RUNTIME_HEALTH["heartbeat"] = True
     start_time = time.time()
+    DASHBOARD_STATE["start_time"] = start_time
 
     while True:
         try:
-            uptime = time.time() - start_time
-            hours, rem = divmod(uptime, 3600)
-            minutes, seconds = divmod(rem, 60)
-            uptime_str = f"{int(hours):02}:{int(minutes):02}:{int(seconds):02}"
-
             now = time.time()
             stale = [jid for jid, j in JOB_CONTEXTS.items()
                      if j.state in (JobState.COMPLETED, JobState.FAILED)
@@ -3091,207 +6199,603 @@ async def worker_heartbeat_loop():
             for jid in stale:
                 JOB_CONTEXTS.pop(jid, None)
 
-            gemini_states = GEMINI_BROKER.snapshot()
-            wmr_states = WMR_BROKER.snapshot()
             raw_downloads = sum(1 for r in DOWNLOAD_REGISTRY.values() if r.resource_type == "gemini")
             clean_downloads = sum(1 for r in DOWNLOAD_REGISTRY.values() if r.resource_type == "wmr")
             active_jobs = sum(1 for j in JOB_CONTEXTS.values() if j.state not in (JobState.COMPLETED, JobState.FAILED))
 
-            print("\n" + "=" * 60)
-            print("V16 WORKER HEARTBEAT")
-            print("=" * 60)
-            print(f"Worker ID: {WORKER_ID}  Uptime: {uptime_str}")
+            DASHBOARD_STATE["queue"]["local_active"] = active_jobs
+            DASHBOARD_STATE["queue"]["raw_downloads"] = raw_downloads
+            DASHBOARD_STATE["queue"]["clean_downloads"] = clean_downloads
+            DASHBOARD_STATE["system"]["bullmq"] = "OK" if RUNTIME_HEALTH["bullmq"] else "ERROR"
+            DASHBOARD_STATE["system"]["download"] = "OK" if RUNTIME_HEALTH["download_monitor"] else "ERROR"
 
-            print("\nRedis:")
-            print("CONNECTED" if RUNTIME_HEALTH["redis"] else "DISCONNECTED")
+            gemini_states = GEMINI_BROKER.snapshot_full()
+            wmr_states = WMR_BROKER.snapshot_full()
+            DASHBOARD_STATE["system"]["gemini"] = "OK" if any(r["state"] != ResourceState.DEAD.value for r in gemini_states.values()) else "ERROR"
+            DASHBOARD_STATE["system"]["wmr"] = "OK" if any(r["state"] != ResourceState.DEAD.value for r in wmr_states.values()) else "ERROR"
 
-            print("\nBullMQ:")
-            print("RUNNING" if RUNTIME_HEALTH["bullmq"] else "FAILED")
-
-            print("\nGemini:")
-            for rid in ["T0", "T1", "T2", "T3"]:
-                print(f"{rid} = {_resource_label(gemini_states.get(rid, 'DEAD'))}")
-
-            print("\nWMR:")
-            for rid in ["W0-T0", "W0-T1", "W1-T0", "W1-T1", "W2-T0", "W2-T1", "W3-T0", "W3-T1"]:
-                print(f"{rid} = {_resource_label(wmr_states.get(rid, 'DEAD'))}")
-
-            print("\nDownloads:")
-            print(f"RAW = {raw_downloads}")
-            print(f"CLEAN = {clean_downloads}")
-
-            print("\nJobs:")
-            print(f"ACTIVE = {active_jobs}")
-
-            print("\nWorker:")
-            print("ALIVE")
-            print("=" * 60)
+            append_runtime_log(
+                f"[HEARTBEAT] uptime={now - start_time:.0f}s waiting={LAST_QUEUE_COUNTS.get('waiting','n/a')} "
+                f"active={LAST_QUEUE_COUNTS.get('active','n/a')} local_active={active_jobs} "
+                f"raw_dl={raw_downloads} clean_dl={clean_downloads}"
+            )
 
         except Exception as e:
-            print(f"[HEARTBEAT ERROR] {type(e).__name__}: {e}")
+            append_runtime_log(f"[HEARTBEAT ERROR] {type(e).__name__}: {e}")
 
         await asyncio.sleep(10)
 
+# ------------------------------------------------------------------------------
+# DASHBOARD RESOURCE ADAPTERS -- read existing GEMINI_BROKER/WMR_BROKER/
+# JOB_CONTEXTS state and normalize it for display. No second state machine,
+# no second broker, no duplicate JobState.
+# ------------------------------------------------------------------------------
+
+_GEMINI_DASHBOARD_LABELS = {
+    JobState.GEMINI_RESERVED: ("ACQUIRED", "NEW_CHAT"),
+    JobState.GEMINI_NEW_CHAT: ("NEW_CHAT", "MODE_SELECT"),
+    JobState.GEMINI_MODE_SELECT: ("MODE_SELECT", "UPLOAD"),
+    JobState.GEMINI_UPLOADING: ("UPLOADING", "PROMPT"),
+    JobState.GEMINI_PROMPT: ("PROMPT", "SEND"),
+    JobState.GEMINI_SEND_PENDING: ("SEND", "VERIFY"),
+    JobState.GEMINI_GENERATING: ("GENERATING", "IMAGE_WAIT"),
+    JobState.RAW_DOWNLOAD_START: ("DOWNLOAD", "RELEASE"),
+    JobState.FAILED: ("ERROR", "--"),
+}
+_WMR_DASHBOARD_LABELS = {
+    JobState.WMR_RESERVED: ("ACQUIRE", "START"),
+    JobState.WMR_PROCESSING: ("PROCESSING", "CLEAN_WAIT"),
+    JobState.WMR_DOWNLOAD_START: ("DOWNLOAD", "RELEASE"),
+    JobState.FAILED: ("ERROR", "--"),
+}
+
+def _resource_dashboard_row(rec, label_map):
+    if not rec or rec.get("state") != ResourceState.BUSY.value or not rec.get("job_id"):
+        return {"job_id": None, "state": "FREE", "age": None, "next": "--"}
+    job_id = rec["job_id"]
+    age = time.time() - rec["last_used"] if rec.get("last_used") else 0
+    ctx = JOB_CONTEXTS.get(job_id)
+    label, nxt = label_map.get(ctx.state, ("BUSY", "--")) if ctx else ("BUSY", "--")
+    return {"job_id": job_id, "state": label, "age": age, "next": nxt}
+
+def get_gemini_dashboard_state():
+    snap = GEMINI_BROKER.snapshot_full()
+    return {rid: _resource_dashboard_row(snap.get(rid), _GEMINI_DASHBOARD_LABELS) for rid in GEMINI_BROKER.resource_ids}
+
+def get_wmr_dashboard_state():
+    # WMR_BROKER genuinely still holds and actively assigns all 8
+    # internal resources (W0-T0..W3-T1) -- this only narrows what the
+    # DASHBOARD renders, per explicit request, to the 3 requested slots.
+    # A job CAN still land on a hidden resource (e.g. W3-T1); it will
+    # process correctly, it just won't show on this particular view.
+    snap = WMR_BROKER.snapshot_full()
+    rids = [f"W{i}-T0" for i in range(3)]
+    return {rid: _resource_dashboard_row(snap.get(rid), _WMR_DASHBOARD_LABELS) for rid in rids}
+
+def _fmt_age(seconds):
+    if seconds is None:
+        return "--"
+    seconds = max(0, int(seconds))
+    return f"{seconds // 60:02d}:{seconds % 60:02d}"
+
+def _dashboard_table_row(resource, row):
+    jid = short_job_id(row["job_id"]) if row["job_id"] else "FREE"
+    return f'{resource:<7}| {jid:<26}| {row["state"]:<15}| {_fmt_age(row["age"]):<9}| {row["next"]}'
+
+def _render_live_progress_block() -> list:
+    """Compact live progress stream: one header line + ONE physical line per
+    active/recent job. No HTML table, no <div id=...>, no CSS, no JavaScript,
+    no second state machine -- it renders JOB_PROGRESS (verified-event mirror)
+    only. Completed/failed lines linger for a short retention window."""
+    prune_job_progress()
+    lines = []
+    q = DASHBOARD_STATE['queue']
+    uptime_s = int(time.time() - DASHBOARD_STATE['start_time'])
+    lines.append(
+        f"▒ LIVE PROGRESS · WAIT {q['waiting']} · ACTIVE {q['active']} · "
+        f"LOCAL {q['local_active']} · OK {q['completed']} · FAIL {q['failed']} · "
+        f"{uptime_s // 3600:02d}:{(uptime_s % 3600) // 60:02d}:{uptime_s % 60:02d}"
+    )
+    active = [jid for jid, p in JOB_PROGRESS.items()
+              if not p.get('completed_at') and not p.get('failed')]
+    finished = [(jid, p.get('completed_at') or p.get('failed_ts') or 0)
+                for jid, p in JOB_PROGRESS.items()
+                if p.get('completed_at') or p.get('failed')]
+    finished.sort(key=lambda x: x[1])
+    ordered = active + [jid for jid, _ in finished][-6:]
+    for jid in ordered:
+        line = render_job_line(jid)
+        if line:
+            lines.append(line)
+    if len(ordered) == 1:
+        lines.append("[1 job]")
+    elif ordered:
+        lines.append(f"[{len(active)} active / {len(ordered)} shown]")
+    return lines
+
+
+def render_dashboard_html() -> str:
+    # V16: the resource TABLE dashboard is replaced by the compact live
+    # progress stream below. The old table code path is intentionally gone --
+    # there is exactly ONE rendering of job state on screen now.
+    lines = _render_live_progress_block()
+    body = chr(10).join(lines)
+    return f'<pre style="font-family:monospace;font-size:13px;line-height:1.35;white-space:pre-wrap;">{body}</pre>'
+
+
+# --------------------------------------------------------------------------
+# The old resource-TABLE renderer was removed entirely in V16: the compact
+# live progress stream above is the ONLY on-screen view. No dormant duplicate
+# rendering code is kept.
+# --------------------------------------------------------------------------
+
+import html as _html_module
+
+
+def html_escape(value) -> str:
+    return _html_module.escape(str(value))
+
+
+_LIVE_PRINT_LOCK = threading.Lock()
+_IPY_DISPLAY_AVAILABLE = (ipy_display is not print)
+
+# Bookkeeping for which display_id slots already exist and what they last
+# showed lives on V16_STATE (sys.modules-backed, survives a Colab cell
+# re-run in the same kernel) rather than a plain module global -- a fresh
+# module global on every re-run would forget every already-born slot and
+# start creating duplicate output regions instead of updating the
+# existing ones. getattr fallbacks guard a kernel that ran an older
+# version of this file before these attributes existed.
+if not hasattr(V16_STATE, 'LIVE_DISPLAY_BORN'):
+    V16_STATE.LIVE_DISPLAY_BORN = set()
+if not hasattr(V16_STATE, 'LIVE_LAST_TEXT'):
+    V16_STATE.LIVE_LAST_TEXT = {}
+
+
+def emit_live_event(key: str, line: str):
+    """Update ONE persistent output slot per key IN PLACE -- one job keeps
+    exactly one line that refreshes as its state changes, never a fresh
+    line appended per change (that produced a scrolling wall of one line
+    per micro-step, which is not what "single updating line per job"
+    means). Uses IPython's own display_id update mechanism
+    (display(..., display_id=...) once, then update_display(...) after)
+    -- the actual supported way to refresh one output region in a
+    Jupyter/Colab notebook without clear_output(), which would erase
+    every OTHER job's line and all prior plain output too. Falls back to
+    plain print() outside a real IPython/Colab kernel, where there is no
+    output cell to refresh in place anyway. All updates go through one
+    lock so concurrent Gemini/WMR threads can't interleave a partial
+    line."""
+    born = V16_STATE.LIVE_DISPLAY_BORN
+    last_text = V16_STATE.LIVE_LAST_TEXT
+    with _LIVE_PRINT_LOCK:
+        if last_text.get(key) == line:
+            return
+        last_text[key] = line
+        text = f"[{time.strftime('%H:%M:%S')}] {line}"
+        if not _IPY_DISPLAY_AVAILABLE:
+            print(text, flush=True)
+            return
+        safe_key = re.sub(r'[^a-zA-Z0-9_:.-]', '_', key)
+        html = HTML(f'<pre style="font-family:monospace;font-size:13px;margin:0;white-space:pre-wrap;">{html_escape(text)}</pre>')
+        if safe_key in born:
+            update_display(html, display_id=safe_key)
+        else:
+            born.add(safe_key)
+            ipy_display(html, display_id=safe_key)
+
+
+async def dashboard_loop():
+    """Append-only live progress: NEVER clears or redraws prior notebook
+    output. Each tick prints only the job lines and the queue/resource
+    summary that actually changed since the previous tick (emit_live_event
+    dedupes on content per key) -- so the notebook accumulates a compact
+    history of real state transitions instead of a table being redrawn in
+    place. Stored on V16_STATE.DASHBOARD_TASK so a Colab cell re-run reuses
+    the existing task instead of starting a second one."""
+    while True:
+        try:
+            prune_job_progress()
+            active = [jid for jid, p in JOB_PROGRESS.items()
+                      if not p.get('completed_at') and not p.get('failed')]
+            finished = [(jid, p.get('completed_at') or p.get('failed_ts') or 0)
+                        for jid, p in JOB_PROGRESS.items()
+                        if p.get('completed_at') or p.get('failed')]
+            finished.sort(key=lambda x: x[1])
+            ordered = active + [jid for jid, _ in finished][-6:]
+            for jid in ordered:
+                line = render_job_line(jid)
+                if line:
+                    emit_live_event(f'job:{jid}', line)
+
+            q = DASHBOARD_STATE['queue']
+            uptime_s = int(time.time() - DASHBOARD_STATE['start_time'])
+            gemini_state = get_gemini_dashboard_state()
+            wmr_state = get_wmr_dashboard_state()
+            gemini_running = sum(1 for r in gemini_state.values() if r['job_id'])
+            wmr_running = sum(1 for r in wmr_state.values() if r['job_id'])
+            summary = (
+                f"▒ LIVE | WAIT={q['waiting']} ACTIVE={q['active']} LOCAL={q['local_active']} "
+                f"GEMINI={gemini_running}/{MAX_CONCURRENT_TABS} WMR={wmr_running}/3 DONE={q['completed']} "
+                f"FAIL={q['failed']} UP={uptime_s // 3600:02d}:{(uptime_s % 3600) // 60:02d}:{uptime_s % 60:02d}"
+            )
+            emit_live_event('summary', summary)
+
+            gemini_line = 'GEMINI ' + ' | '.join(
+                f"{rid}:{short_job_id(gemini_state[rid]['job_id'])}" if gemini_state[rid]['job_id'] else f"{rid}:FREE"
+                for rid in [f"T{i}" for i in range(MAX_CONCURRENT_TABS)]
+            )
+            emit_live_event('gemini_row', gemini_line)
+
+            # Narrowed display, per explicit request -- WMR_BROKER itself
+            # still holds all 8 resources (W0-T0..W3-T1) and can still
+            # route a job to any of them; only these 3 rows are shown here.
+            wmr_line = 'WMR ' + ' | '.join(
+                f"{rid}:{short_job_id(wmr_state[rid]['job_id'])}" if wmr_state[rid]['job_id'] else f"{rid}:FREE"
+                for rid in [f"W{i}-T0" for i in range(3)]
+            )
+            emit_live_event('wmr_row', wmr_line)
+        except Exception as e:
+            append_runtime_log(f"DASHBOARD_ERROR: {type(e).__name__}: {e}")
+        await asyncio.sleep(1)
+
+REDIS_STARTUP_TIMEOUT_S = float(os.environ.get("REDIS_STARTUP_TIMEOUT_S", "15"))
+
 async def main():
+    print("=" * 80, flush=True)
+    print("RUNTIME MAIN ENTERED", flush=True)
+    print("=" * 80, flush=True)
     try:
-        global BULLMQ_WORKER, QUEUE_MONITOR_TASK, HEARTBEAT_TASK, WATCHER_TASK
-        
-        print("STEP 11: REDIS HEALTH")
+        global BULLMQ_WORKER, QUEUE_MONITOR_TASK, HEARTBEAT_TASK, WATCHER_TASK, GEMINI_SCHEDULER_TASK
+
+        print("STEP 11: REDIS HEALTH", flush=True)
         opts = {"connection": os.environ.get("REDIS_URL"), "prefix": os.environ.get("REDIS_KEY_PREFIX")}
+        print("[REDIS] Building connection options", flush=True)
         real_opts = build_redis_connection_opts(opts["connection"])
         QUEUE_NAME = os.environ.get("QUEUE_NAME", "generations")
-        
-        # Redis pre-flight
+
+        # Redis pre-flight -- bounded by a hard timeout so an unreachable
+        # Redis (blocked egress, wrong host, firewalled port) fails loudly
+        # within REDIS_STARTUP_TIMEOUT_S instead of hanging startup forever
+        # (bullmq's own RedisConnection retries certain errors internally).
         try:
+            print("[REDIS] Creating Queue", flush=True)
             _q = Queue(QUEUE_NAME, {"connection": real_opts, "prefix": opts["prefix"]})
-            await _q.getJobCounts()
+            print("[REDIS] PING / getJobCounts starting", flush=True)
+            await asyncio.wait_for(_q.getJobCounts(), timeout=REDIS_STARTUP_TIMEOUT_S)
+            print("[REDIS] getJobCounts completed", flush=True)
             await _q.close()
-            print("[REDIS] CONNECTION = OK")
+            print("[REDIS] CONNECTION = OK", flush=True)
             RUNTIME_HEALTH["redis"] = True
-        except Exception as e:
-            print("[REDIS] CONNECTION = FAILED")
+        except asyncio.TimeoutError:
+            print(f"[REDIS] STARTUP TIMEOUT after {REDIS_STARTUP_TIMEOUT_S}s", flush=True)
+            print("[REDIS] CONNECTION = FAILED", flush=True)
+            raise
+        except Exception:
+            print("[REDIS] CONNECTION = FAILED", flush=True)
+            import traceback
+            traceback.print_exc()
             raise
 
-        print("STEP 12: DATABASE HEALTH")
+        print("STEP 12: DATABASE HEALTH", flush=True)
+        print("[DB] SELECT 1 starting", flush=True)
         db_conn = sys.modules['db'].borrow()
         db_conn.cursor().execute("SELECT 1")
         db_conn.close()
-        print("[DB] CONNECTION = OK")
+        print("[DB] SELECT 1 completed", flush=True)
+        print("[DB] CONNECTION = OK", flush=True)
         RUNTIME_HEALTH["db"] = True
+        DASHBOARD_STATE["system"]["db"] = "OK"
 
-        print("STEP 13: R2 HEALTH")
+        print("STEP 13: R2 HEALTH", flush=True)
+        print("[R2] health check starting", flush=True)
         if fs_configured():
             try:
                 _r2_client().head_bucket(Bucket=R2_BUCKET_NAME)
-                print("[R2] HEALTH = OK")
+                print("[R2] HEALTH = OK", flush=True)
                 RUNTIME_HEALTH["r2"] = True
+                DASHBOARD_STATE["system"]["r2"] = "OK"
             except Exception as e:
-                print(f"[R2] HEALTH = FAILED: {type(e).__name__}")
+                print(f"[R2] HEALTH = FAILED: {type(e).__name__}", flush=True)
                 RUNTIME_HEALTH["r2"] = False
+                DASHBOARD_STATE["system"]["r2"] = "ERROR"
                 raise
         else:
-            print("[R2] HEALTH = FAILED: R2 not configured")
+            print("[R2] HEALTH = FAILED: R2 not configured", flush=True)
             RUNTIME_HEALTH["r2"] = False
+            DASHBOARD_STATE["system"]["r2"] = "ERROR"
             raise RuntimeError("R2 required but not configured")
 
-        print("STEP 14: GEMINI BROKER")
+        print("STEP 14: GEMINI BROKER", flush=True)
         run_architecture_self_test()
 
-        print("STEP 15: WMR BROKER")
+        print("STEP 15: WMR BROKER", flush=True)
         initialize_runtime_once()
 
-        print("STEP 16: DOWNLOAD MONITOR")
+        print("STEP 16: DOWNLOAD MONITOR", flush=True)
         WATCHER_TASK = asyncio.create_task(poll_downloads_loop())
+        V16_STATE.WATCHER_TASK = WATCHER_TASK
         BACKGROUND_TASKS.add(WATCHER_TASK)
         RUNTIME_HEALTH["download_monitor"] = True
+        print("[DOWNLOAD] monitor task created", flush=True)
 
-        print("STEP 17: REDIS QUEUE MONITOR")
+        print("STEP 16b: GEMINI SCHEDULER", flush=True)
+        if GEMINI_SCHEDULER_TASK and not GEMINI_SCHEDULER_TASK.done():
+            print("[GEMINI SCHED] Already running", flush=True)
+        else:
+            GEMINI_SCHEDULER_TASK = asyncio.create_task(gemini_scheduler_loop())
+
+            def _gemini_scheduler_done_cb(t):
+                # The loop's own try/except now survives any tick error, so
+                # this only fires on cancellation (expected at shutdown) or
+                # a genuinely unexpected failure -- e.g. raised before the
+                # while-loop is even entered. Without this, asyncio just
+                # prints "Task exception was never retrieved" to stderr,
+                # which the live dashboard's screen-clearing makes
+                # invisible; log it loudly instead.
+                if t.cancelled():
+                    return
+                exc = t.exception()
+                if exc is not None:
+                    append_runtime_log(f"[GEMINI SCHED] TASK DIED: {type(exc).__name__}: {exc}")
+                    print(f"[GEMINI SCHED] TASK DIED: {type(exc).__name__}: {exc}", flush=True)
+
+            GEMINI_SCHEDULER_TASK.add_done_callback(_gemini_scheduler_done_cb)
+            V16_STATE.GEMINI_SCHEDULER_TASK = GEMINI_SCHEDULER_TASK
+            BACKGROUND_TASKS.add(GEMINI_SCHEDULER_TASK)
+        print("[GEMINI SCHED] task created", flush=True)
+
+        print("STEP 17: REDIS QUEUE MONITOR", flush=True)
         if QUEUE_MONITOR_TASK and not QUEUE_MONITOR_TASK.done():
-            print("[REDIS MONITOR] Already running")
+            print("[REDIS MONITOR] Already running", flush=True)
         else:
             QUEUE_MONITOR_TASK = asyncio.create_task(redis_queue_monitor_loop())
+            V16_STATE.QUEUE_MONITOR_TASK = QUEUE_MONITOR_TASK
             BACKGROUND_TASKS.add(QUEUE_MONITOR_TASK)
+        print("[QUEUE] monitor task created", flush=True)
 
-        print("STEP 18: WORKER HEARTBEAT")
+        print("STEP 18: WORKER HEARTBEAT", flush=True)
         if HEARTBEAT_TASK and not HEARTBEAT_TASK.done():
-            print("[HEARTBEAT] Already running")
+            print("[HEARTBEAT] Already running", flush=True)
         else:
             HEARTBEAT_TASK = asyncio.create_task(worker_heartbeat_loop())
+            V16_STATE.HEARTBEAT_TASK = HEARTBEAT_TASK
             BACKGROUND_TASKS.add(HEARTBEAT_TASK)
+        print("[HEARTBEAT] task created", flush=True)
 
-        print("STEP 19: BULLMQ WORKER")
+        print("STEP 19: BULLMQ WORKER", flush=True)
         # concurrency is BullMQ's own job-admission width, independent of the
         # 4 Gemini / 8 WMR resource counts -- those are enforced separately
         # by GEMINI_BROKER/WMR_BROKER.acquire() backpressure. Leaving this
         # unset falls back to bullmq's library default of 1, which would
         # serialize every job and starve the resource brokers.
+        print("[BULLMQ] Creating Worker", flush=True)
         BULLMQ_WORKER = Worker(QUEUE_NAME, process_bullmq_job, {"connection": real_opts, "prefix": opts["prefix"], "concurrency": BULLMQ_CONCURRENCY})
-        print(f"[BULLMQ] concurrency={BULLMQ_CONCURRENCY}")
+        V16_STATE.BULLMQ_WORKER = BULLMQ_WORKER
+        print(f"[BULLMQ] Worker CREATED (concurrency={BULLMQ_CONCURRENCY})", flush=True)
         RUNTIME_HEALTH["bullmq"] = True
 
-        print("STEP 20: WORKER READY")
-        print("\n============================================================")
-        print("N2N WORKER READY")
-        print("============================================================")
-        
+        print("[DASHBOARD] Starting live dashboard -- console goes quiet after this; full detail in worker.log", flush=True)
+        if V16_STATE.DASHBOARD_TASK is not None and not V16_STATE.DASHBOARD_TASK.done():
+            print("[DASHBOARD] Already running", flush=True)
+        else:
+            dashboard_task = asyncio.create_task(dashboard_loop())
+            V16_STATE.DASHBOARD_TASK = dashboard_task
+            BACKGROUND_TASKS.add(dashboard_task)
+
+        print("STEP 20: WORKER READY", flush=True)
+        print("\n============================================================", flush=True)
+        print("N2N WORKER READY", flush=True)
+        print("============================================================", flush=True)
+        print(f"[BULLMQ] Waiting for jobs from queue: {QUEUE_NAME}", flush=True)
+
         while True:
             await asyncio.sleep(3600)
-            
+
     except asyncio.CancelledError:
         raise
     except Exception:
-        print("============================================================")
-        print("[FATAL STARTUP ERROR]")
-        print("============================================================")
+        print("============================================================", flush=True)
+        print("[FATAL STARTUP ERROR]", flush=True)
+        print("============================================================", flush=True)
         import traceback
         traceback.print_exc()
         raise
 
 async def shutdown_worker():
     global BULLMQ_WORKER, QUEUE_MONITOR
-    if BULLMQ_WORKER: await BULLMQ_WORKER.close()
-    if QUEUE_MONITOR: await QUEUE_MONITOR.close()
-    
+
+    # 1. stop BullMQ worker (stops admitting new jobs)
+    if BULLMQ_WORKER:
+        await BULLMQ_WORKER.close()
+        print("[SHUTDOWN] BullMQ Worker closed.", flush=True)
+
+    # 2-5. stop queue monitor, heartbeat, download monitor, other background tasks
     if QUEUE_MONITOR_TASK: QUEUE_MONITOR_TASK.cancel()
     if HEARTBEAT_TASK: HEARTBEAT_TASK.cancel()
     if WATCHER_TASK: WATCHER_TASK.cancel()
     if WORKER_MAIN_TASK: WORKER_MAIN_TASK.cancel()
-    
     for task in BACKGROUND_TASKS:
         task.cancel()
     if BACKGROUND_TASKS:
         await asyncio.gather(*BACKGROUND_TASKS, return_exceptions=True)
-    
+    print("[SHUTDOWN] Monitor/heartbeat/download tasks stopped.", flush=True)
+
+    # 6. close Redis Queue clients -- this is what previously leaked as
+    # "Unclosed Redis client" when this step was skipped.
+    if QUEUE_MONITOR:
+        await QUEUE_MONITOR.close()
+        print("[SHUTDOWN] Redis Queue client closed.", flush=True)
+
+    # 7. release/close WMR drivers -- via the owning thread's own command
+    # queue (request_wmr_shutdown), never by calling thread.driver.quit()
+    # from this asyncio thread. Selenium drivers here are owned exclusively
+    # by their WmrDriverThread; quitting from another thread races with
+    # that thread's own cleanup and violates the one-owner-per-driver
+    # design this whole class exists to enforce.
+    for rid, thread in list(WMR_THREADS.items()):
+        if request_wmr_shutdown(thread):
+            print(f"[SHUTDOWN] WMR owner thread {rid} closed.", flush=True)
+        else:
+            print(f"[SHUTDOWN] WMR owner thread {rid} did not acknowledge shutdown.", flush=True)
+
+    # 8. close Gemini browser resources (the single shared chrome_driver)
+    try:
+        if "chrome_driver" in globals() and chrome_driver is not None:
+            chrome_driver.quit()
+            print("[SHUTDOWN] Gemini Chrome driver closed.", flush=True)
+    except Exception as e:
+        print(f"[SHUTDOWN] Gemini Chrome driver close failed: {e}", flush=True)
+
+    # 9. clear singleton state only now that shutdown actually succeeded
+    V16_STATE.BULLMQ_WORKER = None
+    V16_STATE.QUEUE_MONITOR = None
+    V16_STATE.QUEUE_MONITOR_TASK = None
+    V16_STATE.HEARTBEAT_TASK = None
+    V16_STATE.WATCHER_TASK = None
+    V16_STATE.GEMINI_SCHEDULER_TASK = None
+    V16_STATE.WORKER_MAIN_TASK = None
+    V16_STATE.RUNTIME_INITIALIZED = False
+
     print("[SHUTDOWN] Worker stopped cleanly.")
 
-WORKER_MAIN_TASK = None
-_RUNTIME_INITIALIZED = False
+# Source of truth is V16_STATE (persists across this file being re-run in
+# the same kernel); these plain globals are kept as a synced mirror only
+# because other code (e.g. shutdown_worker() above) reads them directly.
+WORKER_MAIN_TASK = V16_STATE.WORKER_MAIN_TASK
+_RUNTIME_INITIALIZED = V16_STATE.RUNTIME_INITIALIZED
 
 def _worker_main_task_done(task):
+    """Only reached via the compat branch in start_worker() below, when an
+    OLD-style background task (created by a prior version of this file, or
+    still alive across a Runtime > Interrupt) is being awaited instead of a
+    fresh main() call."""
     global _RUNTIME_INITIALIZED
     if task.cancelled():
-        print("[WORKER] MAIN TASK CANCELLED")
-        return
-
-    exc = task.exception()
-    if exc:
-        print("=" * 70)
-        print("[FATAL] WORKER MAIN TASK CRASHED")
-        print("=" * 70)
+        print("[WORKER] MAIN TASK CANCELLED", flush=True)
+    elif task.exception():
+        exc = task.exception()
+        print("=" * 70, flush=True)
+        print("[FATAL] WORKER MAIN TASK CRASHED", flush=True)
+        print("=" * 70, flush=True)
         import traceback
-        traceback.print_exception(
-            type(exc),
-            exc,
-            exc.__traceback__,
-        )
+        traceback.print_exception(type(exc), exc, exc.__traceback__)
     _RUNTIME_INITIALIZED = False
+    V16_STATE.RUNTIME_INITIALIZED = False
+    V16_STATE.WORKER_MAIN_TASK = None
 
 def start_worker():
+    """Blocks the calling cell until main() returns or raises, matching the
+    old worker script's behavior: STEP 11+ prints (Redis health, N2N worker
+    ready, job processing, ...) appear directly in this cell, with no
+    separate `await task` cell required.
+
+    Safe from inside Colab/IPython's already-running event loop because it
+    uses nest_asyncio, which patches asyncio to allow legitimate re-entrant
+    run_until_complete() calls. This is NOT the earlier-removed
+    IPython.run_cell() hack (that one crashed with "Cannot run the event
+    loop while another loop is running" because IPython's own cell runner
+    has no re-entrancy support) -- nest_asyncio is a purpose-built library
+    for exactly this.
+
+    Duplicate-run guard: since this call blocks, a second concurrent run is
+    only reachable if a previous run's main() task is still alive from
+    BEFORE this cell was interrupted (Runtime -> Interrupt leaves the
+    Python process, and any asyncio task on its loop, alive). In that case
+    this reuses/awaits the existing task instead of starting a second one.
+    """
     global WORKER_MAIN_TASK, _RUNTIME_INITIALIZED
-    
-    if _RUNTIME_INITIALIZED:
-        print("[BOOT] Existing worker already running")
-        return WORKER_MAIN_TASK
-        
-    try: loop = asyncio.get_running_loop()
-    except RuntimeError: return asyncio.run(main())
-    
-    if WORKER_MAIN_TASK and not WORKER_MAIN_TASK.done():
-        return WORKER_MAIN_TASK
-        
+
+    existing_task = V16_STATE.WORKER_MAIN_TASK
+    if V16_STATE.RUNTIME_INITIALIZED and existing_task is not None and not existing_task.done():
+        print("[BOOT] WORKER ALREADY RUNNING", flush=True)
+        print("[BOOT] REUSING EXISTING RUNTIME -- awaiting it now", flush=True)
+        WORKER_MAIN_TASK = existing_task
+        try:
+            loop = asyncio.get_running_loop()
+            import nest_asyncio
+            nest_asyncio.apply()
+            return loop.run_until_complete(existing_task)
+        except RuntimeError:
+            return asyncio.run(existing_task)
+
+    print("[BOOT] STARTING RUNTIME MAIN TASK (blocking mode)", flush=True)
     _RUNTIME_INITIALIZED = True
-    WORKER_MAIN_TASK = loop.create_task(main())
-    WORKER_MAIN_TASK.add_done_callback(_worker_main_task_done)
-    return WORKER_MAIN_TASK
+    V16_STATE.RUNTIME_INITIALIZED = True
+
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        # No loop running (plain `python FULL_QUEUE_WORKER_FINAL.py`).
+        try:
+            return asyncio.run(main())
+        finally:
+            _RUNTIME_INITIALIZED = False
+            V16_STATE.RUNTIME_INITIALIZED = False
+
+    # Colab/IPython: a loop is already running on this thread. nest_asyncio
+    # lets this block on it anyway, so the cell now behaves exactly like the
+    # old worker script.
+    try:
+        import nest_asyncio
+        nest_asyncio.apply()
+    except ImportError:
+        print("[BOOT] nest_asyncio not installed -- run `pip install nest_asyncio` first.", flush=True)
+        _RUNTIME_INITIALIZED = False
+        V16_STATE.RUNTIME_INITIALIZED = False
+        raise
+
+    print("[BOOT] Blocking this cell on main() via nest_asyncio -- to stop: Runtime -> Interrupt execution.", flush=True)
+    try:
+        return loop.run_until_complete(main())
+    finally:
+        _RUNTIME_INITIALIZED = False
+        V16_STATE.RUNTIME_INITIALIZED = False
+        V16_STATE.WORKER_MAIN_TASK = None
+        WORKER_MAIN_TASK = None
+
+def launch_worker():
+    """Alias for start_worker() -- kept for existing notebooks/cells that
+    call launch_worker(); it now also blocks the cell, same as
+    start_worker()."""
+    return start_worker()
+
+def run_worker_blocking():
+    """Deprecated alias -- start_worker() itself now blocks by default."""
+    return start_worker()
 
 if __name__ == '__main__':
-    # start_worker() already handles both cases: it schedules main() on the
-    # current running loop (Colab/IPython kernel loop) via create_task, or
-    # falls back to asyncio.run() when no loop is running (plain `python
-    # FULL_QUEUE_WORKER_FINAL.py`). Never drive a second loop on top of an
-    # already-running one (e.g. via IPython.run_cell("... await ...")) --
-    # that is what raised "Cannot run the event loop while another loop is
-    # running". When a loop is already running, the returned Task keeps
-    # executing on that same loop after this cell finishes; the launcher
-    # (FULL_QUEUE_WORKER_LAUNCHER.py) is the place to `await` it directly.
+    print("=" * 80, flush=True)
+    _self_path = globals().get('__file__')
+    if _self_path:
+        print("[BOOT] SOURCE FILE =", os.path.abspath(_self_path), flush=True)
+        try:
+            with open(_self_path, 'r', encoding='utf-8') as _f:
+                print("[BOOT] SOURCE LINE COUNT =", sum(1 for _ in _f), flush=True)
+        except Exception as _e:
+            print("[BOOT] SOURCE LINE COUNT = UNKNOWN:", _e, flush=True)
+        try:
+            _commit = subprocess.run(
+                ['git', 'rev-parse', '--short', 'HEAD'],
+                cwd=os.path.dirname(os.path.abspath(_self_path)),
+                capture_output=True, text=True, timeout=5,
+            )
+            print("[BOOT] SOURCE COMMIT =", _commit.stdout.strip() if _commit.returncode == 0 else "UNKNOWN", flush=True)
+        except Exception:
+            print("[BOOT] SOURCE COMMIT = UNKNOWN", flush=True)
+    else:
+        # Pasted directly into a Colab/notebook cell (not run via `%run` or
+        # `python file.py`) -- there is no __file__ to check in that mode.
+        print("[BOOT] SOURCE FILE = UNKNOWN (no __file__ -- running as a pasted notebook cell, not a script)", flush=True)
+        print("[BOOT] SOURCE LINE COUNT = UNKNOWN (no __file__ in this exec context)", flush=True)
+        print("[BOOT] SOURCE COMMIT = UNKNOWN (no __file__ in this exec context)", flush=True)
+    for _sym in ("main", "start_worker", "launch_worker", "process_bullmq_job", "execute_pipeline"):
+        print(f"[BOOT] {_sym}() =", "PRESENT" if _sym in globals() else "MISSING", flush=True)
+    print("=" * 80, flush=True)
+
+    # start_worker() blocks this cell until main() returns/raises (via
+    # nest_asyncio when a loop is already running, e.g. Colab/IPython, or
+    # asyncio.run() otherwise) -- STEP 11+ prints appear directly here,
+    # matching the old worker script's single-cell behavior. To stop:
+    # Runtime -> Interrupt execution.
     start_worker()
