@@ -1328,7 +1328,7 @@ print('=' * 80)
 print('🌐 STEP 6: INITIALIZING PERSISTENT CHROME DRIVERS')
 print('=' * 80)
 
-def set_tab_download_dir(drv, path):
+def set_tab_download_dir(drv, path, resource_id=''):
     """Sets the download destination for the CURRENTLY ACTIVE tab only.
     Browser.setDownloadBehavior is browser-context scoped, not tab scoped
     -- calling it per-job with a different path (as this used to do)
@@ -1341,13 +1341,22 @@ def set_tab_download_dir(drv, path):
     browser-wide, to make Browser.downloadWillBegin fire at all (the only
     source of real download GUIDs used elsewhere in this file) -- that is
     now set exactly once at driver creation in create_chrome_driver(),
-    never here."""
+    never here.
+
+    Returns True/False -- callers must not assume this silently succeeded.
+    A failed CDP call here means every download for this job goes to
+    whatever Chrome's actual default directory is instead, and nothing
+    downstream would ever look there -- that must be visible in
+    worker.log, never swallowed."""
     ap = os.path.abspath(str(path))
     os.makedirs(ap, exist_ok=True)
     try:
         drv.execute_cdp_cmd('Page.setDownloadBehavior', {'behavior': 'allow', 'downloadPath': ap})
-    except Exception:
-        pass
+        append_runtime_log(f"[DOWNLOAD-DIR] DOWNLOAD_DIR_SET resource={resource_id or '?'} path={ap}")
+        return True
+    except Exception as e:
+        append_runtime_log(f"[DOWNLOAD-DIR] DOWNLOAD_DIR_SET_FAILED resource={resource_id or '?'} path={ap} error={e}")
+        return False
 
 def create_chrome_driver():
     for fname in ['SingletonLock', 'SingletonCookie', 'SingletonSocket']:
@@ -4118,6 +4127,37 @@ def _hover_and_dl_single_click(drv, urls_before, chat_urls, prefix='') -> bool:
             time.sleep(DOWNLOAD_BUTTON_RETRY_GAP_S)
     return False
 
+def _check_gemini_download_snackbar(drv, prefix='') -> bool:
+    """Poll briefly for Gemini's own "Downloading full size..." snackbar
+    (div.snackbar-message [data-test-id="label"]) right after the download
+    button click -- real evidence straight from the Gemini UI that IT
+    believes a download just started, confirmed by production DOM (the
+    exact markup pasted in the request this was added for).
+
+    This is a SECOND, independent UI-level signal alongside the existing
+    CDP Browser.downloadWillBegin event and the filesystem
+    partial/final-file check -- never a replacement for either, and never
+    by itself proof the file is complete. It's a fast (<=2s) best-effort
+    check: its absence is not an error (a fast download can finish before
+    this ever gets a chance to see the snackbar), so it never raises and
+    never blocks the real start-detection loop that follows it."""
+    deadline = time.time() + 2.0
+    while time.time() < deadline:
+        try:
+            for el in drv.find_elements(By.CSS_SELECTOR, 'div.snackbar-message [data-test-id="label"]'):
+                if not el.is_displayed():
+                    continue
+                txt = (el.text or '').strip()
+                if 'downloading' in txt.lower():
+                    append_runtime_log(f'{prefix} [GEMINI-DL] UI_DOWNLOAD_STARTED')
+                    append_runtime_log(f'{prefix} [GEMINI-DL] snackbar="{txt}"')
+                    return True
+        except Exception:
+            pass
+        time.sleep(0.2)
+    return False
+
+
 def _direct_fetch_cdp(drv, save_path, urls_before) -> bool:
     """
     Fallback: direct CDP memory fetch of the generated image blob.
@@ -4917,7 +4957,9 @@ class GeminiWorker:
                 job_mark(ctx.job_id, 'newchat', 'ok')
 
                 job_dir, staging_dir = get_chrome_job_dir(tid_int, ctx.job_id)
-                set_tab_download_dir(self.driver, str(staging_dir))
+                _dl_dir_ok = set_tab_download_dir(self.driver, str(staging_dir), resource_id=self.tid)
+                if not _dl_dir_ok:
+                    raise RuntimeError(f"DOWNLOAD_DIR_SET_FAILED for {self.tid} -- Page.setDownloadBehavior raised, downloads for this job would go to Chrome's real default directory instead of {staging_dir}")
                 ctx.gemini_staging_dir = staging_dir
 
                 ctx.transition_sync(JobState.GEMINI_MODE_SELECT)
@@ -5052,6 +5094,7 @@ class GeminiWorker:
         # observed afterwards is provably caused by THIS click -- never a
         # stale queued event from an earlier action/job on this tab
         # (get_log('performance') consumes entries as it reads them).
+        before_click_at = time.time()
         with CHROME_DRIVER_LOCK:
             chrome_driver.switch_to.window(self.handle)
             before_files = _snapshot_staging_dir(staging_dir)
@@ -5065,10 +5108,16 @@ class GeminiWorker:
                 raise RuntimeError("DOWNLOAD_BUTTON_NOT_FOUND")
             append_runtime_log(f"{prefix} DOWNLOAD CLICKED")
             append_runtime_log(f'{prefix} GEMINI_DOWNLOAD_CLICKED')
+            append_runtime_log(f'{prefix} [GEMINI-DL] CLICKED')
+            # UI-level confirmation only -- never proof of completion, and
+            # its absence is not a failure (see _check_gemini_download_snackbar).
+            _check_gemini_download_snackbar(self.driver, prefix=prefix)
 
         expected_png = f"{ctx.job_id}.png"
         job_mark(ctx.job_id, 'download', 'run')
         ctx.transition_sync(JobState.RAW_DOWNLOAD_START)
+        append_runtime_log(f'{prefix} [GEMINI-DL] EXPECTED_DIR={staging_dir}')
+        append_runtime_log(f'{prefix} [GEMINI-DL] EXPECTED_FILENAME={expected_png}')
 
         # PHASE A (start detection) and PHASE B (completion) are
         # deliberately separate concerns with separate timeouts -- a
@@ -5090,6 +5139,7 @@ class GeminiWorker:
         # to eventually fail a job whose browser/resource is genuinely
         # dead (Chrome never even begins writing anything), not one that
         # is merely downloading slowly.
+        append_runtime_log(f'{prefix} [GEMINI-DL] SEARCHING_FOR_FILE')
         result = None
         deadline = time.time() + DOWNLOAD_START_SAFETY_TIMEOUT_S
         while time.time() < deadline:
@@ -5101,6 +5151,31 @@ class GeminiWorker:
             time.sleep(0.5)
         if result is None:
             observed_files = sorted(_snapshot_staging_dir(staging_dir) - before_files)
+            # Diagnostic only -- never accepted as this job's file. If the
+            # registered staging dir stayed empty despite the UI/click
+            # evidence, look under the whole Chrome download base for
+            # anything created AFTER this attempt started, so a
+            # misconfigured download path (e.g. DOWNLOAD_DIR_SET_FAILED
+            # upstream) shows up as "found elsewhere" instead of a bare
+            # timeout with no clue why.
+            stray_hits = []
+            try:
+                for p in Path(CHROME_DL_BASE).rglob('*'):
+                    try:
+                        if p.is_file() and p.stat().st_mtime >= before_click_at:
+                            stray_hits.append(str(p))
+                    except Exception:
+                        continue
+                    if len(stray_hits) >= 10:
+                        break
+            except Exception:
+                pass
+            append_runtime_log(
+                f"{prefix} [GEMINI-DL] UI_STARTED_BUT_FILE_NOT_FOUND "
+                f"expected_dir={staging_dir} job={ctx.job_id} resource={self.tid} "
+                f"attempt={_job_attempt(ctx.job_id)} files_in_expected_dir={observed_files} "
+                f"chrome_base_search_hits={stray_hits}"
+            )
             append_runtime_log(
                 f"{prefix} DOWNLOAD_START_TIMEOUT resource={self.tid} job={ctx.job_id} "
                 f"configured_dir={staging_dir} files_before={sorted(before_files)[:5]} "
@@ -5110,11 +5185,15 @@ class GeminiWorker:
         dl_guid, source = result
         ctx.raw_guid = dl_guid
         append_runtime_log(f"{prefix} DOWNLOAD START DETECTED")
+        append_runtime_log(f'{prefix} [GEMINI-DL] SOURCE={source}')
         if source == 'cdp':
             append_runtime_log(f'{prefix} GEMINI_DOWNLOAD_EVENT GUID={dl_guid}')
             append_runtime_log(f'{prefix} GEMINI_DOWNLOAD_STARTED guid={dl_guid}')
+            append_runtime_log(f'{prefix} [GEMINI-DL] CDP_DOWNLOAD_STARTED guid={dl_guid}')
         else:
             append_runtime_log(f'{prefix} GEMINI_DOWNLOAD_STARTED guid=NOT_CAPTURED source=filesystem')
+            append_runtime_log(f'{prefix} [GEMINI-DL] CDP_DOWNLOAD_STARTED guid=NOT_CAPTURED')
+        append_runtime_log(f'{prefix} [GEMINI-DL] EXPECTED_DIR={staging_dir}')
         _log_download_start_confirmed(prefix, dl_guid, source)
 
         record_id = f"gemini:{ctx.job_id}:{time.monotonic_ns()}"
@@ -5137,6 +5216,7 @@ class GeminiWorker:
         job_mark(ctx.job_id, 'download', 'ok')
         job_mark(ctx.job_id, 'released', 'ok')
         release_gemini_once(ctx)
+        append_runtime_log(f'{prefix} [GEMINI-DL] RESOURCE_RELEASED')
         ctx.transition_sync(JobState.GEMINI_RELEASED)
         ctx.transition_sync(JobState.RAW_DOWNLOADING)
         append_runtime_log(f"{prefix} GEMINI RESOURCE RELEASED")
@@ -5416,7 +5496,7 @@ class WmrDriverThread(threading.Thread):
                     staging_dir = Path(WMR_STAGING_BASE) / self.resource_id / f"attempt-{_job_attempt(ctx.job_id)}" / ctx.job_id
                     staging_dir.mkdir(parents=True, exist_ok=True)
 
-                    set_tab_download_dir(self.driver, str(staging_dir))
+                    set_tab_download_dir(self.driver, str(staging_dir), resource_id=self.resource_id)
 
                     append_runtime_log(f"{prefix} UPLOADING RAW PNG")
                     _wmr_expose_file_inputs(self.driver)
@@ -5823,11 +5903,23 @@ async def poll_downloads_loop():
                         completed_file = max(fresh, key=lambda f: f.stat().st_mtime)
 
                 kind = "RAW" if rec.target_state == JobState.RAW_VALIDATED else "CLEAN"
+                is_gemini_raw = rec.resource_type == "gemini"
                 if completed_file and dict_key not in _DOWNLOADS_SEEN_FILE:
                     _DOWNLOADS_SEEN_FILE.add(dict_key)
                     append_runtime_log(f"[DOWNLOAD][{rec.job_id}] {kind} DOWNLOAD STARTED")
                     append_runtime_log(f"[DOWNLOAD][{rec.job_id}] waiting for filesystem completion")
                     append_runtime_log(f"[DOWNLOAD][{rec.job_id}] file detected")
+                    if is_gemini_raw:
+                        # Real filename accepted as-is -- Chrome/Gemini can
+                        # name the file anything (e.g.
+                        # Gemini_Generated_Image_....png), never required
+                        # to equal expected_filename; ownership is proven
+                        # by this record's exclusive staging_dir, not by
+                        # the name matching.
+                        append_runtime_log(
+                            f"[GEMINI-DL] FILE_FOUND path={completed_file} size={completed_file.stat().st_size} "
+                            f"actual_filename={completed_file.name} expected_filename={rec.expected_filename}"
+                        )
 
                 if completed_file:
                     size_before = -1
@@ -5848,6 +5940,10 @@ async def poll_downloads_loop():
                             validate_image_file(str(completed_file))
                             append_runtime_log(f"[DOWNLOAD][{rec.job_id}] PNG VALIDATED")
                             _sz = completed_file.stat().st_size
+                            if is_gemini_raw:
+                                append_runtime_log(
+                                    f"[GEMINI-DL] PNG_VALIDATED path={completed_file} size={_sz} detected_at={time.time():.0f}"
+                                )
                             _jp = JOB_PROGRESS.get(rec.job_id)
                             if rec.target_state == JobState.RAW_VALIDATED:
                                 ctx.raw_path = str(completed_file)
@@ -5863,6 +5959,8 @@ async def poll_downloads_loop():
 
                             ctx.transition_sync(rec.target_state)
                             append_runtime_log(f"[DOWNLOAD][{rec.job_id}] {rec.target_state.name}")
+                            if is_gemini_raw:
+                                append_runtime_log(f"[GEMINI-DL] RAW_DOWNLOAD_COMPLETE job={rec.job_id} resource={rec.resource_id}")
                             with DOWNLOAD_REGISTRY_LOCK: DOWNLOAD_REGISTRY.pop(dict_key, None)
                             _DOWNLOADS_SEEN_FILE.discard(dict_key)
                         except Exception as e:
