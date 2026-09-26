@@ -1983,24 +1983,33 @@ def _wmr_find_file_input(drv):
 
 def _wmr_wait_for_upload_accepted(drv, timeout_s: float) -> bool:
     """POSITIVE browser evidence that WMR actually accepted the file:
-    page left the landing/upload state (title/url changed to a workspace/
-    editor route or an 'after'/preview image appeared). send_keys()
-    returning is NOT proof -- without this check a silent rejection used
-    to burn the full processing timeout."""
+    an 'after'/preview image appeared, or the page reports a
+    processing/detecting busy state. send_keys() returning is NOT proof
+    -- without this check a silent rejection used to burn the full
+    processing timeout.
+
+    Previously this checked the URL for a lack of "upload" in the path
+    (plus an exact watermarkremover.io homepage match) -- a pattern
+    inherited from a different WMR provider. The real production
+    WMR_SERVICE_URL's path never contains "upload" at all, so that
+    check was true from the very first poll regardless of whether the
+    upload actually took, making this function a no-op rubber stamp.
+    Replaced with the same preview-image/busy-text signals
+    _wmr_check_status() already uses successfully for this exact site."""
     t0 = time.time()
     while time.time() - t0 < timeout_s:
         try:
             res = drv.execute_script(
-                "var url=(location.href||'').toLowerCase();"
-                "if(url.indexOf('upload')===-1 && url!=='https://www.watermarkremover.io/') return 'NAV';"
                 "var imgs=document.querySelectorAll('img');"
                 "for(var i=0;i<imgs.length;i++){"
                 "  var alt=(imgs[i].getAttribute('alt')||'').toLowerCase();"
                 "  var src=imgs[i].getAttribute('src')||'';"
-                "  if((alt.indexOf('after')!==-1||src.indexOf('blob:')===0)&&imgs[i].offsetParent!==null) return 'PREVIEW';"
+                "  if((alt.indexOf('after')!==-1||src.indexOf('blob:')===0||src.indexOf('data:')===0)&&imgs[i].offsetParent!==null) return 'PREVIEW';"
                 "}"
+                "var t=document.body?document.body.innerText.toLowerCase():'';"
+                "if(t.indexOf('detecting')!==-1||t.indexOf('processing')!==-1) return 'BUSY';"
                 "return 'WAIT';")
-            if res in ('NAV', 'PREVIEW'):
+            if res in ('PREVIEW', 'BUSY'):
                 append_runtime_log(f'[WMR] UPLOAD_ACCEPTED via={res} elapsed={time.time()-t0:.1f}s')
                 return True
         except Exception:
@@ -4828,9 +4837,17 @@ class WmrDriverThread(threading.Thread):
                     job_mark(ctx.job_id, 'wmr', 'run')
                     if self.driver is None:
                         self.driver = create_wmr_chrome_driver(self.resource_id)
-                        self.driver.get("https://www.watermarkremover.io/upload")
                     append_runtime_log(f"{prefix} DRIVER READY")
-                    append_runtime_log(f"{prefix} OPENING WMR")
+                    # Navigate to the real production WMR service on EVERY
+                    # job, not only when the driver was just (re)created --
+                    # a previous version only navigated once per driver
+                    # lifetime (to the wrong site, see below), so every job
+                    # after the first on this same resource silently reused
+                    # whatever page state the prior job's completed run left
+                    # behind (its before/after result view) instead of a
+                    # fresh upload page.
+                    self.driver.get(WMR_SERVICE_URL)
+                    append_runtime_log(f"{prefix} OPENING WMR url={WMR_SERVICE_URL}")
 
                     ctx.transition_sync(JobState.WMR_PROCESSING)
 
