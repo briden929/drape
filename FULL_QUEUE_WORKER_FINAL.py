@@ -255,6 +255,7 @@ if _V16_STATE_KEY not in sys.modules:
     _v16_state.QUEUE_MONITOR_TASK = None
     _v16_state.HEARTBEAT_TASK = None
     _v16_state.WATCHER_TASK = None
+    _v16_state.GEMINI_SCHEDULER_TASK = None
     _v16_state.WORKER_MAIN_TASK = None
     _v16_state.RUNTIME_INITIALIZED = False
     _v16_state.chrome_driver = None
@@ -3998,6 +3999,17 @@ class JobContext:
 
     state_waiters: Dict[JobState, List[asyncio.Future]] = field(default_factory=dict)
 
+    # Central Gemini scheduler bookkeeping -- gemini_done_future is resolved
+    # by gemini_scheduler_loop() (success) or _handle_gemini_failure()
+    # (exception) once this job's Gemini phase (setup through download-start
+    # + resource release) is fully done; execute_pipeline() awaits it instead
+    # of calling GEMINI_BROKER.acquire()/GeminiWorker directly, since only
+    # the scheduler is allowed to touch the shared Gemini driver now.
+    gemini_done_future: Optional[asyncio.Future] = None
+    gemini_acquired_at: Optional[float] = None
+    generation_started_at: Optional[float] = None
+    gemini_staging_dir: Optional[Path] = None
+
     def transition_sync(self, new_state: JobState):
         self.loop.call_soon_threadsafe(self._set_state_threadsafe, new_state)
 
@@ -4370,19 +4382,6 @@ else:
 
 CHROME_DRIVER_LOCK = threading.RLock()
 
-# Explicit hard rule (by request): after a job's own setup (NewChat through
-# Send + verify_generation_started) completes, before that job's setup-phase
-# turn on the shared driver ends, it must check the status of whichever
-# OTHER job's tab most recently finished ITS OWN setup -- so the sequence in
-# worker.log genuinely reads "T0 setup done -> check T1 -> T1 setup done ->
-# check T0 -> ..." instead of relying on incidental lock-contention timing.
-# This check is READ-ONLY: it never clicks download or releases a resource
-# itself -- that tab's own thread already owns its Phase 2 polling loop and
-# will act on its own image-ready state independently. Duplicating the
-# action here would race two threads over the same download click.
-_LAST_SETUP_LOCK = threading.Lock()
-_LAST_SETUP_TID = {'value': None}
-
 def _recover_gemini_resource(resource_id: str) -> bool:
     """Recreate this Gemini tab on the shared chrome_driver and prove it responds."""
     worker = GEMINI_WORKERS.get(resource_id)
@@ -4457,7 +4456,10 @@ def release_wmr_once(ctx: JobContext):
 # ------------------------------------------------------------------------------
 
 from concurrent.futures import ThreadPoolExecutor
-GEMINI_EXECUTOR = ThreadPoolExecutor(max_workers=4)
+# max_workers=1 by explicit request: only ONE Gemini browser action (a
+# job's setup, or one status-check-and-maybe-finish) is ever in flight at
+# a time -- see gemini_scheduler_loop(), the sole caller of this executor.
+GEMINI_EXECUTOR = ThreadPoolExecutor(max_workers=1)
 
 DEBUG_DIR = Path('debug')
 
@@ -4509,35 +4511,49 @@ class GeminiWorker:
         self.tid = tid
         self.driver = None
         self.handle = None
-        # Stored (not just local) so the NEXT job's setup-completion check
-        # can read THIS tab's own generation baseline URLs cross-thread --
-        # see _LAST_SETUP_TID / the read-only previous-tab check at the end
-        # of Phase 1 in do_execute_sync().
+        # Stored (not just local) so a LATER, separate
+        # check_and_maybe_finish_sync() call (a different scheduler tick)
+        # can read this tab's own generation baseline URLs.
         self.urls_before = set()
         self.chat_urls = set()
         self.current_job_id = None
 
-    def do_execute_sync(self, ctx: JobContext):
+    def run_setup_sync(self, ctx: JobContext):
+        """PHASE 1 ONLY: New Chat -> Flash -> Create Image -> upload ->
+        attach-verify -> prompt -> Send -> verify_generation_started.
+
+        Called by gemini_scheduler_loop() -- the single owner of the shared
+        Gemini driver -- via a one-worker executor, so only one job's setup
+        (or one job's status check, see check_and_maybe_finish_sync below)
+        is ever in flight at a time on the real browser. Raises on any
+        failure; the scheduler (not this method) is solely responsible for
+        cleanup and resource release on failure, via _handle_gemini_failure.
+
+        On success this stores urls_before/chat_urls/current_job_id on
+        self, and generation_started_at/gemini_staging_dir on ctx, so a
+        LATER, SEPARATE call to check_and_maybe_finish_sync() -- from a
+        different scheduler tick, possibly seconds or minutes later, after
+        other jobs' setups/checks have run in between -- can pick up
+        exactly where this left off without re-deriving anything."""
         prefix = f"[GEMINI][{self.tid}][{ctx.job_id}]"
         append_runtime_log(f"{prefix} START")
         tid_int = int(self.tid.replace('T', ''))
-        try:
-            # State was previously set to GEMINI_GENERATING here, before New
-            # Chat/Flash/Create Image/upload/prompt/send even ran -- so the
-            # dashboard could show "GENERATING" for many seconds while the
-            # browser was still sitting on the plain "Where should we
-            # start?" composer. Each state below is only set AFTER the
-            # browser action it names has actually run; GEMINI_GENERATING
-            # itself is now set only once verify_generation_started()
-            # below returns True.
-            ctx.transition_sync(JobState.GEMINI_NEW_CHAT)
-            _t_gemini_acquired = time.time()
-            append_runtime_log(f"{prefix} GEMINI_ACQUIRED resource={self.tid}")
+        # State was previously set to GEMINI_GENERATING here, before New
+        # Chat/Flash/Create Image/upload/prompt/send even ran -- so the
+        # dashboard could show "GENERATING" for many seconds while the
+        # browser was still sitting on the plain "Where should we
+        # start?" composer. Each state below is only set AFTER the
+        # browser action it names has actually run; GEMINI_GENERATING
+        # itself is only set once verify_generation_started() below
+        # returns True.
+        ctx.transition_sync(JobState.GEMINI_NEW_CHAT)
+        ctx.gemini_acquired_at = time.time()
+        append_runtime_log(f"{prefix} GEMINI_ACQUIRED resource={self.tid}")
 
-            # Phase 1: setup (all short Selenium operations) -- held under
-            # the lock for its whole duration since these need the shared
-            # chrome_driver's focused window to stay put between calls.
-            with CHROME_DRIVER_LOCK:
+        # Setup is a short, bounded sequence of Selenium operations -- held
+        # under the lock for its whole duration since these need the
+        # shared chrome_driver's focused window to stay put between calls.
+        with CHROME_DRIVER_LOCK:
                 # T0-T3 are TABS of the single shared, already-authenticated chrome_driver
                 # (see _create_gemini_tab) -- never a second Chrome process on the same profile.
                 append_runtime_log(f"{prefix} OPENING GEMINI")
@@ -4560,6 +4576,7 @@ class GeminiWorker:
 
                 job_dir, staging_dir = get_chrome_job_dir(tid_int, ctx.job_id)
                 set_tab_download_dir(self.driver, str(staging_dir))
+                ctx.gemini_staging_dir = staging_dir
 
                 ctx.transition_sync(JobState.GEMINI_MODE_SELECT)
                 append_runtime_log(f"{prefix} FLASH MODE")
@@ -4626,181 +4643,177 @@ class GeminiWorker:
                 self.urls_before = urls_before
                 self.chat_urls = chat_urls
                 self.current_job_id = ctx.job_id
+                ctx.generation_started_at = time.time()
 
-                # HARD RULE (by explicit request): before this job's setup
-                # turn on the shared driver ends, check whichever OTHER tab
-                # most recently finished its own setup. Read-only -- this
-                # never clicks download or releases a resource; that tab's
-                # own thread already owns acting on its own image-ready
-                # state via its independent Phase 2 loop below. Duplicating
-                # the action here would race two threads over one click.
-                with _LAST_SETUP_LOCK:
-                    prev_tid = _LAST_SETUP_TID['value']
-                    _LAST_SETUP_TID['value'] = self.tid
-                if prev_tid and prev_tid != self.tid:
-                    prev_worker = GEMINI_WORKERS.get(prev_tid)
-                    if prev_worker is not None and prev_worker.driver is not None and prev_worker.handle:
-                        try:
-                            chrome_driver.switch_to.window(prev_worker.handle)
-                            prev_status, _ = nb_check_image(prev_worker.driver, prev_worker.urls_before, prev_worker.chat_urls)
-                            append_runtime_log(f"{prefix} CHECK_PREVIOUS_TAB tid={prev_tid} job={prev_worker.current_job_id} status={prev_status}")
-                        except Exception as e:
-                            append_runtime_log(f"{prefix} CHECK_PREVIOUS_TAB_ERROR tid={prev_tid}: {e}")
-                        finally:
-                            try:
-                                chrome_driver.switch_to.window(self.handle)
-                            except Exception:
-                                pass
+    def check_and_maybe_finish_sync(self, ctx: JobContext) -> bool:
+        """ONE-SHOT status check for a job already past setup (GENERATING).
 
-            # Phase 2: wait for the REAL generated image. Previously this
-            # called _has_generated_image() -- a single one-shot DOM check,
-            # never a poll -- exactly ONCE and printed "IMAGE DETECTED"
-            # unconditionally, discarding whatever it returned (almost
-            # always None, since Gemini image generation takes many
-            # seconds). The pipeline never actually waited for a real image
-            # before trying to hover-click a download button that usually
-            # didn't exist yet. nb_check_image() (already defined, never
-            # called) additionally catches REFUSED/LIMIT/ERROR states that
-            # a bare _has_generated_image() call never could.
-            #
-            # This loop also fixes the concurrency bottleneck of the old
-            # single all-encompassing `with CHROME_DRIVER_LOCK:`: the lock
-            # is now held only for each brief per-iteration DOM check, not
-            # for the whole 15-240s generation wait, so the other 3 Gemini
-            # tabs can make real progress on their own jobs while this one
-            # waits.
-            deadline = time.time() + GENERATION_TIMEOUT_S
-            status, img_src = "WAITING", None
-            while time.time() < deadline:
-                with CHROME_DRIVER_LOCK:
-                    chrome_driver.switch_to.window(self.handle)
-                    status, img_src = nb_check_image(self.driver, urls_before, chat_urls)
-                if status != "WAITING":
-                    break
-                time.sleep(0.5)
-            if status == "SUCCESS":
-                append_runtime_log(f"{prefix} IMAGE DETECTED")
-                _t_img = time.time()
-                _jp = JOB_PROGRESS.get(ctx.job_id)
-                if _jp is not None:
-                    _jp['image_at'] = _t_img
-                job_mark(ctx.job_id, 'image', 'ok')
-                try:
-                    _kind = 'blob_new' if str(img_src).startswith('blob:') else ('googleusercontent' if 'googleusercontent' in str(img_src) else 'other')
-                except Exception:
-                    _kind = 'unknown'
-                append_runtime_log(f'{prefix} GEMINI_IMAGE_DETECTED source={_kind} elapsed_from_acquire={_t_img - _t_gemini_acquired:.1f}s')
-                _gemini_state_snapshot(self.driver, 'after_image_detected', tid_int, ctx.job_id)
-            elif status == "REFUSED":
-                raise RuntimeError("Gemini refused the prompt")
-            elif status == "LIMIT":
-                raise RuntimeError("Gemini image-generation limit reached")
-            elif status == "ERROR":
-                raise RuntimeError("Gemini reported an error during generation")
-            else:
-                raise RuntimeError(f"Generation timed out after {GENERATION_TIMEOUT_S}s waiting for image (last status={status})")
+        Called repeatedly by gemini_scheduler_loop()'s round robin, never
+        in its own internal wait loop -- that's the whole point of
+        splitting this out of the old monolithic do_execute_sync(): no
+        single call here can hog the one shared Gemini thread for the
+        whole 15-240s generation wait the way the old always-poll-to-
+        completion loop did.
 
-            # Phase 3a: ARM FIRST, then click. The staging-dir snapshot AND a
-            # full drain of the shared driver's performance log happen BEFORE
-            # the download-button click, so any Browser.downloadWillBegin
-            # event observed afterwards is provably caused by THIS click --
-            # never a stale queued event from an earlier action/job on this
-            # tab (get_log('performance') consumes entries as it reads them).
+        Returns True once this job's Gemini phase is fully complete (image
+        downloaded, resource released); False if still generating and this
+        tab should be checked again on a later tick. Raises on a terminal
+        failure (refused/limit/error/timeout) -- the caller (the scheduler)
+        handles cleanup exactly like a setup failure, via
+        _handle_gemini_failure.
+
+        When status is SUCCESS, this same call also arms + clicks download
+        and waits (briefly, up to DOWNLOAD_START_WINDOW_S) for confirmed
+        download-start, then releases the Gemini resource -- by explicit
+        request: "if generated then click on download and move to other
+        free tab", i.e. the check step itself performs the hand-off the
+        moment it finds the image ready, rather than merely reporting it."""
+        prefix = f"[GEMINI][{self.tid}][{ctx.job_id}]"
+        tid_int = int(self.tid.replace('T', ''))
+        urls_before = self.urls_before
+        chat_urls = self.chat_urls
+        staging_dir = ctx.gemini_staging_dir
+
+        with CHROME_DRIVER_LOCK:
+            chrome_driver.switch_to.window(self.handle)
+            status, img_src = nb_check_image(self.driver, urls_before, chat_urls)
+
+        if status == "WAITING":
+            if time.time() - ctx.generation_started_at > GENERATION_TIMEOUT_S:
+                raise RuntimeError(f"Generation timed out after {GENERATION_TIMEOUT_S}s waiting for image (last status=WAITING)")
+            return False
+        elif status == "REFUSED":
+            raise RuntimeError("Gemini refused the prompt")
+        elif status == "LIMIT":
+            raise RuntimeError("Gemini image-generation limit reached")
+        elif status == "ERROR":
+            raise RuntimeError("Gemini reported an error during generation")
+        elif status != "SUCCESS":
+            raise RuntimeError(f"Generation timed out after {GENERATION_TIMEOUT_S}s waiting for image (last status={status})")
+
+        append_runtime_log(f"{prefix} IMAGE DETECTED")
+        _t_img = time.time()
+        _jp = JOB_PROGRESS.get(ctx.job_id)
+        if _jp is not None:
+            _jp['image_at'] = _t_img
+        job_mark(ctx.job_id, 'image', 'ok')
+        try:
+            _kind = 'blob_new' if str(img_src).startswith('blob:') else ('googleusercontent' if 'googleusercontent' in str(img_src) else 'other')
+        except Exception:
+            _kind = 'unknown'
+        append_runtime_log(f'{prefix} GEMINI_IMAGE_DETECTED source={_kind} elapsed_from_acquire={_t_img - ctx.gemini_acquired_at:.1f}s')
+        _gemini_state_snapshot(self.driver, 'after_image_detected', tid_int, ctx.job_id)
+
+        # ARM FIRST, then click. The staging-dir snapshot AND a full drain
+        # of the shared driver's performance log happen BEFORE the
+        # download-button click, so any Browser.downloadWillBegin event
+        # observed afterwards is provably caused by THIS click -- never a
+        # stale queued event from an earlier action/job on this tab
+        # (get_log('performance') consumes entries as it reads them).
+        with CHROME_DRIVER_LOCK:
+            chrome_driver.switch_to.window(self.handle)
+            before_files = _snapshot_staging_dir(staging_dir)
+            try:
+                _drained = self.driver.get_log('performance')
+                append_runtime_log(f"{prefix} DOWNLOAD_ARMED perflog_entries_drained={len(_drained)} staging_snapshot={sorted(before_files)[:5]}")
+            except Exception as drain_err:
+                append_runtime_log(f"{prefix} DOWNLOAD_ARMED perflog_drain_failed={drain_err}")
+            clicked = _hover_and_dl_single_click(self.driver, urls_before, chat_urls, prefix=prefix)
+            if not clicked:
+                raise RuntimeError("DOWNLOAD_BUTTON_NOT_FOUND")
+            append_runtime_log(f"{prefix} DOWNLOAD CLICKED")
+            append_runtime_log(f'{prefix} GEMINI_DOWNLOAD_CLICKED')
+
+        expected_png = f"{ctx.job_id}.png"
+        job_mark(ctx.job_id, 'download', 'run')
+        ctx.transition_sync(JobState.RAW_DOWNLOAD_START)
+
+        # Waiting up to DOWNLOAD_START_WINDOW_S (short: this only starts
+        # once an image is already confirmed ready) for real download-start
+        # evidence. Each get_log()/filesystem check is a WebDriver command
+        # on the shared session, so it needs a brief lock acquisition per
+        # iteration, just not held across the sleep in between -- kept as
+        # one bounded synchronous unit here (not chunked across further
+        # scheduler ticks) since it is short and is the critical hand-off
+        # step the resource release depends on.
+        deadline = time.time() + DOWNLOAD_START_WINDOW_S
+        result = None
+        while time.time() < deadline:
             with CHROME_DRIVER_LOCK:
                 chrome_driver.switch_to.window(self.handle)
-                before_files = _snapshot_staging_dir(staging_dir)
-                try:
-                    _drained = self.driver.get_log('performance')
-                    append_runtime_log(f"{prefix} DOWNLOAD_ARMED perflog_entries_drained={len(_drained)} staging_snapshot={sorted(before_files)[:5]}")
-                except Exception as drain_err:
-                    append_runtime_log(f"{prefix} DOWNLOAD_ARMED perflog_drain_failed={drain_err}")
-                clicked = _hover_and_dl_single_click(self.driver, urls_before, chat_urls, prefix=prefix)
-                if not clicked:
-                    raise RuntimeError("DOWNLOAD_BUTTON_NOT_FOUND")
-                append_runtime_log(f"{prefix} DOWNLOAD CLICKED")
-                append_runtime_log(f'{prefix} GEMINI_DOWNLOAD_CLICKED')
+                result = _detect_download_start_once(self.driver, before_files, staging_dir)
+            if result is not None:
+                break
+            time.sleep(0.5)
+        if result is None:
+            raise RuntimeError(f"Download start timeout after {DOWNLOAD_START_WINDOW_S}s (dir={staging_dir})")
+        dl_guid, source = result
+        ctx.raw_guid = dl_guid
+        append_runtime_log(f"{prefix} DOWNLOAD START DETECTED")
+        if source == 'cdp':
+            append_runtime_log(f'{prefix} GEMINI_DOWNLOAD_EVENT GUID={dl_guid}')
+            append_runtime_log(f'{prefix} GEMINI_DOWNLOAD_STARTED guid={dl_guid}')
+        else:
+            append_runtime_log(f'{prefix} GEMINI_DOWNLOAD_STARTED guid=NOT_CAPTURED source=filesystem')
+        _log_download_start_confirmed(prefix, dl_guid, source)
 
-            expected_png = f"{ctx.job_id}.png"
-            job_mark(ctx.job_id, 'download', 'run')
-            ctx.transition_sync(JobState.RAW_DOWNLOAD_START)
+        record_id = f"gemini:{ctx.job_id}:{time.monotonic_ns()}"
+        with DOWNLOAD_REGISTRY_LOCK:
+            DOWNLOAD_REGISTRY[record_id] = DownloadRecord(
+                record_id=record_id,
+                guid=dl_guid,
+                job_id=ctx.job_id,
+                resource_id=self.tid,
+                resource_type="gemini",
+                source=source,
+                staging_dir=str(staging_dir),
+                expected_filename=expected_png,
+                actual_filename=None,
+                target_state=JobState.RAW_VALIDATED,
+                started_at=time.time(),
+                created_at=time.time()
+            )
 
-            # Phase 3b: waiting up to DOWNLOAD_START_WINDOW_S for the real
-            # download-start evidence must NOT hold the shared driver lock
-            # for the whole window -- that would block T1/T2/T3 exactly the
-            # way the old single-lock generation wait did (see Phase 2's own
-            # fix above). Each get_log()/filesystem check is still a
-            # WebDriver command dispatched on the shared session, so it
-            # still needs a brief lock acquisition per iteration, just not
-            # held across the sleep in between.
-            deadline = time.time() + DOWNLOAD_START_WINDOW_S
-            result = None
-            while time.time() < deadline:
-                with CHROME_DRIVER_LOCK:
-                    chrome_driver.switch_to.window(self.handle)
-                    result = _detect_download_start_once(self.driver, before_files, staging_dir)
-                if result is not None:
-                    break
-                time.sleep(0.5)
-            if result is None:
-                raise RuntimeError(f"Download start timeout after {DOWNLOAD_START_WINDOW_S}s (dir={staging_dir})")
-            dl_guid, source = result
-            ctx.raw_guid = dl_guid
-            append_runtime_log(f"{prefix} DOWNLOAD START DETECTED")
-            if source == 'cdp':
-                append_runtime_log(f'{prefix} GEMINI_DOWNLOAD_EVENT GUID={dl_guid}')
-                append_runtime_log(f'{prefix} GEMINI_DOWNLOAD_STARTED guid={dl_guid}')
-            else:
-                append_runtime_log(f'{prefix} GEMINI_DOWNLOAD_STARTED guid=NOT_CAPTURED source=filesystem')
-            _log_download_start_confirmed(prefix, dl_guid, source)
+        job_mark(ctx.job_id, 'download', 'ok')
+        job_mark(ctx.job_id, 'released', 'ok')
+        release_gemini_once(ctx)
+        ctx.transition_sync(JobState.GEMINI_RELEASED)
+        ctx.transition_sync(JobState.RAW_DOWNLOADING)
+        append_runtime_log(f"{prefix} GEMINI RESOURCE RELEASED")
+        append_runtime_log(f'{prefix} GEMINI_RELEASED immediately_after_download_start={time.strftime("%H:%M:%S")}')
+        append_runtime_log(f"{prefix} RAW DOWNLOAD CONTINUES")
+        return True
 
-            record_id = f"gemini:{ctx.job_id}:{time.monotonic_ns()}"
-            with DOWNLOAD_REGISTRY_LOCK:
-                DOWNLOAD_REGISTRY[record_id] = DownloadRecord(
-                    record_id=record_id,
-                    guid=dl_guid,
-                    job_id=ctx.job_id,
-                    resource_id=self.tid,
-                    resource_type="gemini",
-                    source=source,
-                    staging_dir=str(staging_dir),
-                    expected_filename=expected_png,
-                    actual_filename=None,
-                    target_state=JobState.RAW_VALIDATED,
-                    started_at=time.time(),
-                    created_at=time.time()
-                )
-
-            job_mark(ctx.job_id, 'download', 'ok')
-            job_mark(ctx.job_id, 'released', 'ok')
-            release_gemini_once(ctx)
-            ctx.transition_sync(JobState.GEMINI_RELEASED)
-            ctx.transition_sync(JobState.RAW_DOWNLOADING)
-            append_runtime_log(f"{prefix} GEMINI RESOURCE RELEASED")
-            append_runtime_log(f'{prefix} GEMINI_RELEASED immediately_after_download_start={time.strftime("%H:%M:%S")}')
-            append_runtime_log(f"{prefix} RAW DOWNLOAD CONTINUES")
-
-        except Exception as e:
-            ctx.error = str(e)
-            _err = str(e)
-            if 'CREATE_IMAGE_VERIFY_FAILED' in _err:
-                job_stop(ctx.job_id, 'CREATE_IMAGE_VERIFY_FAILED')
-            elif 'PROMPT_VERIFY_FAILED' in _err or 'Prompt injection failed' in _err:
-                job_stop(ctx.job_id, 'PROMPT_VERIFY_FAILED')
-            else:
-                job_stop(ctx.job_id, type(e).__name__ + ': ' + _err[:60])
-            ctx.transition_sync(JobState.FAILED)
-            GEMINI_BROKER.fail(self.tid, str(e))
-            _dump_gemini_debug_artifacts(self.tid, self.handle, ctx.job_id, str(e))
-            try:
-                with CHROME_DRIVER_LOCK:
-                    if self.handle and self.handle in chrome_driver.window_handles:
-                        chrome_driver.switch_to.window(self.handle)
-                        chrome_driver.close()
-            except Exception:
-                pass
-            self.handle = None
-            self.driver = None
-            release_gemini_once(ctx)
+def _handle_gemini_failure(worker: 'GeminiWorker', ctx: JobContext, e: Exception):
+    """Shared failure path for both run_setup_sync() and
+    check_and_maybe_finish_sync(), called by gemini_scheduler_loop() --
+    consolidates exactly what the old do_execute_sync()'s single
+    try/except used to do (job_stop/FAILED transition/broker.fail/debug
+    dump/tab close/resource release), plus resolving gemini_done_future
+    with the exception so execute_pipeline()'s await raises it there."""
+    ctx.error = str(e)
+    _err = str(e)
+    if 'CREATE_IMAGE_VERIFY_FAILED' in _err:
+        job_stop(ctx.job_id, 'CREATE_IMAGE_VERIFY_FAILED')
+    elif 'PROMPT_VERIFY_FAILED' in _err or 'Prompt injection failed' in _err:
+        job_stop(ctx.job_id, 'PROMPT_VERIFY_FAILED')
+    else:
+        job_stop(ctx.job_id, type(e).__name__ + ': ' + _err[:60])
+    ctx.transition_sync(JobState.FAILED)
+    GEMINI_BROKER.fail(worker.tid, str(e))
+    _dump_gemini_debug_artifacts(worker.tid, worker.handle, ctx.job_id, str(e))
+    try:
+        with CHROME_DRIVER_LOCK:
+            if worker.handle and worker.handle in chrome_driver.window_handles:
+                chrome_driver.switch_to.window(worker.handle)
+                chrome_driver.close()
+    except Exception:
+        pass
+    worker.handle = None
+    worker.driver = None
+    release_gemini_once(ctx)
+    if ctx.gemini_done_future is not None and not ctx.gemini_done_future.done():
+        ctx.gemini_done_future.set_exception(RuntimeError(ctx.error))
 
 # Reuse the previous run's GeminiWorker instances -- each holds a live
 # `.handle`/`.driver` pointing at an actual open Chrome tab; a fresh dict
@@ -4811,6 +4824,93 @@ if V16_STATE.GEMINI_WORKERS is not None:
 else:
     GEMINI_WORKERS = {f"T{i}": GeminiWorker(f"T{i}") for i in range(4)}
     V16_STATE.GEMINI_WORKERS = GEMINI_WORKERS
+
+# ------------------------------------------------------------------------------
+# CENTRAL GEMINI SCHEDULER -- by explicit request, only ONE browser action
+# sequence (one job's full setup, OR one status-check-and-maybe-finish on an
+# already-generating tab) is ever in flight at a time, never four
+# independent worker threads racing for CHROME_DRIVER_LOCK. GEMINI_EXECUTOR
+# is a single-worker executor for exactly this reason -- it is the
+# mechanism that makes "only one thing happening at a time" a hard
+# guarantee rather than a convention.
+# ------------------------------------------------------------------------------
+GEMINI_READY_QUEUE: "asyncio.Queue[JobContext]" = asyncio.Queue()
+GEMINI_ACTIVE: Dict[str, JobContext] = {}
+_GEMINI_RR_CURSOR = {'idx': 0}
+
+async def gemini_scheduler_loop():
+    """The single owner of all Gemini browser interaction.
+
+    Every tick, in priority order:
+      A) If a Gemini resource is free (not already in GEMINI_ACTIVE) AND a
+         job is waiting in GEMINI_READY_QUEUE, acquire that resource and
+         run the job's FULL setup (run_setup_sync) -- "pick job N from
+         queue and do all process up to the enter thing into chat".
+      B) Otherwise, round-robin to exactly ONE already-generating tab and
+         run check_and_maybe_finish_sync on it -- "continuous checkout [of]
+         the previous generation tab" -- if it comes back ready, that same
+         call already clicked download and released the resource, so the
+         very next tick's step A can immediately reuse that same tab for a
+         new job ("if T0 already download[ed] ... it is free so new job
+         go into that T0, no need to create new tab").
+
+    Both steps run on GEMINI_EXECUTOR (max_workers=1), so this loop never
+    has two browser actions in flight at once; it only ever waits on
+    whichever single action is currently running, then immediately decides
+    the next one."""
+    loop = asyncio.get_running_loop()
+    while True:
+        did_work = False
+        free_ids = set(GEMINI_BROKER.free_resources)
+        free_tid = None
+        for cand in GEMINI_BROKER.resource_ids:
+            if cand in free_ids and cand not in GEMINI_ACTIVE:
+                free_tid = cand
+                break
+
+        if free_tid is not None and not GEMINI_READY_QUEUE.empty():
+            ctx = await GEMINI_READY_QUEUE.get()
+            try:
+                tid = await GEMINI_BROKER.acquire(ctx.job_id)
+            except Exception as e:
+                append_runtime_log(f"[GEMINI SCHED] acquire failed job={ctx.job_id}: {e}")
+                if ctx.gemini_done_future is not None and not ctx.gemini_done_future.done():
+                    ctx.gemini_done_future.set_exception(e)
+                continue
+            progress_detail(ctx.job_id, 'gemini_wait', False)
+            ctx.gemini_resource = tid
+            _jp = JOB_PROGRESS.get(ctx.job_id)
+            if _jp is not None:
+                _jp['resource'] = tid
+            ctx.transition_sync(JobState.GEMINI_RESERVED)
+            append_runtime_log(f"[PIPELINE][{ctx.job_id}] Gemini acquired = {tid}")
+            worker = GEMINI_WORKERS[tid]
+            try:
+                await loop.run_in_executor(GEMINI_EXECUTOR, worker.run_setup_sync, ctx)
+                GEMINI_ACTIVE[tid] = ctx
+            except Exception as e:
+                _handle_gemini_failure(worker, ctx, e)
+            did_work = True
+        elif GEMINI_ACTIVE:
+            tids = list(GEMINI_ACTIVE.keys())
+            idx = _GEMINI_RR_CURSOR['idx'] % len(tids)
+            _GEMINI_RR_CURSOR['idx'] += 1
+            tid = tids[idx]
+            ctx = GEMINI_ACTIVE[tid]
+            worker = GEMINI_WORKERS[tid]
+            try:
+                finished = await loop.run_in_executor(GEMINI_EXECUTOR, worker.check_and_maybe_finish_sync, ctx)
+                if finished:
+                    GEMINI_ACTIVE.pop(tid, None)
+                    if ctx.gemini_done_future is not None and not ctx.gemini_done_future.done():
+                        ctx.gemini_done_future.set_result(True)
+            except Exception as e:
+                GEMINI_ACTIVE.pop(tid, None)
+                _handle_gemini_failure(worker, ctx, e)
+            did_work = True
+
+        if not did_work:
+            await asyncio.sleep(0.2)
 
 class WmrDriverThread(threading.Thread):
     def __init__(self, resource_id: str):
@@ -5096,20 +5196,15 @@ async def execute_pipeline(ctx: JobContext):
         progress_detail(ctx.job_id, 'refs_state', 'ready')
 
         append_runtime_log(f"[PIPELINE][{ctx.job_id}] GEMINI QUEUED")
-        append_runtime_log(f"[PIPELINE][{ctx.job_id}] Acquiring Gemini resource")
+        # Only gemini_scheduler_loop() touches GEMINI_BROKER/the shared
+        # driver now -- this just hands the job off and waits for the
+        # scheduler to resolve gemini_done_future once setup through
+        # download-start + resource release is done (or raise on failure).
         progress_detail(ctx.job_id, 'gemini_wait', True)
-        tid = await GEMINI_BROKER.acquire(ctx.job_id)
-        progress_detail(ctx.job_id, 'gemini_wait', False)
-        ctx.gemini_resource = tid
-        _jp = JOB_PROGRESS.get(ctx.job_id)
-        if _jp is not None:
-            _jp['resource'] = tid
-        ctx.transition_sync(JobState.GEMINI_RESERVED)
-        append_runtime_log(f"[PIPELINE][{ctx.job_id}] Gemini acquired = {tid}")
-
-        worker = GEMINI_WORKERS[tid]
+        ctx.gemini_done_future = ctx.loop.create_future()
+        await GEMINI_READY_QUEUE.put(ctx)
         append_runtime_log(f"[PIPELINE][{ctx.job_id}] Gemini execution started")
-        await ctx.loop.run_in_executor(GEMINI_EXECUTOR, worker.do_execute_sync, ctx)
+        await ctx.gemini_done_future
         await ctx.wait_for_state(JobState.RAW_VALIDATED)
 
         ctx.transition_sync(JobState.WMR_QUEUED)
@@ -5388,6 +5483,7 @@ QUEUE_MONITOR = V16_STATE.QUEUE_MONITOR
 QUEUE_MONITOR_TASK = V16_STATE.QUEUE_MONITOR_TASK
 HEARTBEAT_TASK = V16_STATE.HEARTBEAT_TASK
 WATCHER_TASK = V16_STATE.WATCHER_TASK
+GEMINI_SCHEDULER_TASK = V16_STATE.GEMINI_SCHEDULER_TASK
 
 RUNTIME_HEALTH = {
     "redis": False,
@@ -5813,6 +5909,15 @@ async def main():
         RUNTIME_HEALTH["download_monitor"] = True
         print("[DOWNLOAD] monitor task created", flush=True)
 
+        print("STEP 16b: GEMINI SCHEDULER", flush=True)
+        if GEMINI_SCHEDULER_TASK and not GEMINI_SCHEDULER_TASK.done():
+            print("[GEMINI SCHED] Already running", flush=True)
+        else:
+            GEMINI_SCHEDULER_TASK = asyncio.create_task(gemini_scheduler_loop())
+            V16_STATE.GEMINI_SCHEDULER_TASK = GEMINI_SCHEDULER_TASK
+            BACKGROUND_TASKS.add(GEMINI_SCHEDULER_TASK)
+        print("[GEMINI SCHED] task created", flush=True)
+
         print("STEP 17: REDIS QUEUE MONITOR", flush=True)
         if QUEUE_MONITOR_TASK and not QUEUE_MONITOR_TASK.done():
             print("[REDIS MONITOR] Already running", flush=True)
@@ -5921,6 +6026,7 @@ async def shutdown_worker():
     V16_STATE.QUEUE_MONITOR_TASK = None
     V16_STATE.HEARTBEAT_TASK = None
     V16_STATE.WATCHER_TASK = None
+    V16_STATE.GEMINI_SCHEDULER_TASK = None
     V16_STATE.WORKER_MAIN_TASK = None
     V16_STATE.RUNTIME_INITIALIZED = False
 
