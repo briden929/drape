@@ -4415,6 +4415,14 @@ class DownloadRecord:
     target_state: JobState
     started_at: float
     created_at: float
+    # Chrome's own suggestedFilename from Browser.downloadWillBegin when
+    # available (e.g. "Gemini_Generated_Image_xxx.png") -- used as a
+    # correlation hint in poll_downloads_loop before falling back to
+    # newest-file-since-started_at. Never required to equal
+    # expected_filename; ownership is proven by the exclusive staging_dir,
+    # not by either filename matching.
+    suggested_filename: Optional[str] = None
+    attempt: int = 0
 
 DOWNLOAD_REGISTRY: Dict[str, DownloadRecord] = {}
 DOWNLOAD_REGISTRY_LOCK = threading.RLock()
@@ -4672,10 +4680,11 @@ def _snapshot_staging_dir(staging_dir: Path) -> set:
         return set()
 
 
-def _detect_download_start_once(drv, before: set, staging_dir: Path) -> Optional[Tuple[Optional[str], str]]:
+def _detect_download_start_once(drv, before: set, staging_dir: Path) -> Optional[Tuple[Optional[str], str, Optional[str]]]:
     """Single-iteration check, so callers that share a Chrome session across
     multiple threads (e.g. Gemini's CHROME_DRIVER_LOCK) can hold the lock
-    only around this brief call instead of the whole timeout window."""
+    only around this brief call instead of the whole timeout window.
+    Returns (guid, source, suggested_filename)."""
     try:
         for entry in drv.get_log('performance'):
             try:
@@ -4684,8 +4693,13 @@ def _detect_download_start_once(drv, before: set, staging_dir: Path) -> Optional
                     # Forensic: log the RAW GUID straight from Chrome --
                     # never synthesized. (GUID provenance note: see
                     # Phase-11 concurrency risk documented below.)
-                    append_runtime_log(f"[PERFLOG] Browser.downloadWillBegin guid={msg['params'].get('guid')} url_prefix={str(msg['params'].get('url',''))[:60]}")
-                    return (msg['params']['guid'], "cdp")
+                    _guid = msg['params'].get('guid')
+                    _suggested = msg['params'].get('suggestedFilename')
+                    append_runtime_log(
+                        f"[PERFLOG] Browser.downloadWillBegin guid={_guid} "
+                        f"suggestedFilename={_suggested} url_prefix={str(msg['params'].get('url',''))[:60]}"
+                    )
+                    return (_guid, "cdp", _suggested)
             except Exception:
                 pass
     except Exception:
@@ -4706,22 +4720,28 @@ def _detect_download_start_once(drv, before: set, staging_dir: Path) -> Optional
             partial = [n for n in new_names if n.endswith(('.crdownload', '.tmp', '.part', '.download'))]
             if partial:
                 append_runtime_log(f"[DL-START] filesystem partial file appeared: {partial[0]}")
-                return (None, "filesystem")
+                # The .crdownload name itself, minus the suffix, is real
+                # evidence of what Chrome is naming the file -- a genuine
+                # hint, not a guess, since it's Chrome's own in-progress
+                # filename observed directly on disk.
+                _hint = partial[0].rsplit('.crdownload', 1)[0] if partial[0].endswith('.crdownload') else None
+                return (None, "filesystem", _hint)
             if new_names:
-                return (None, "filesystem")
+                return (None, "filesystem", new_names[0])
     except Exception:
         pass
     return None
 
 
-def _detect_download_start(drv, staging_dir: Path, timeout: float = DOWNLOAD_START_WINDOW_S) -> Tuple[Optional[str], str]:
+def _detect_download_start(drv, staging_dir: Path, timeout: float = DOWNLOAD_START_WINDOW_S) -> Tuple[Optional[str], str, Optional[str]]:
     """
     Detect a download starting inside staging_dir, which must already be scoped
     exclusively to one job/resource (never a shared directory).
     Primary: real Browser.downloadWillBegin CDP GUID.
     Fallback: a newly-created, non-partial file appearing in staging_dir — ownership
     is proven by directory exclusivity, never by guessing a filename across jobs.
-    Returns (guid_or_None, source) where source is "cdp" or "filesystem".
+    Returns (guid_or_None, source, suggested_filename_or_None) where
+    source is "cdp" or "filesystem".
     Raises RuntimeError on timeout; never guesses.
 
     CROSS-JOB get_log('performance') CONSUMPTION: not currently possible.
@@ -5182,17 +5202,18 @@ class GeminiWorker:
                 f"newly_seen_files={observed_files} click=True safety_window_s={DOWNLOAD_START_SAFETY_TIMEOUT_S}"
             )
             raise RuntimeError(f"No download-start evidence after {DOWNLOAD_START_SAFETY_TIMEOUT_S}s (dir={staging_dir}) -- resource likely dead")
-        dl_guid, source = result
+        dl_guid, source, suggested_filename = result
         ctx.raw_guid = dl_guid
         append_runtime_log(f"{prefix} DOWNLOAD START DETECTED")
         append_runtime_log(f'{prefix} [GEMINI-DL] SOURCE={source}')
         if source == 'cdp':
             append_runtime_log(f'{prefix} GEMINI_DOWNLOAD_EVENT GUID={dl_guid}')
             append_runtime_log(f'{prefix} GEMINI_DOWNLOAD_STARTED guid={dl_guid}')
-            append_runtime_log(f'{prefix} [GEMINI-DL] CDP_DOWNLOAD_STARTED guid={dl_guid}')
+            append_runtime_log(f'{prefix} [GEMINI-DL] CDP_DOWNLOAD_STARTED guid={dl_guid} suggestedFilename={suggested_filename}')
         else:
             append_runtime_log(f'{prefix} GEMINI_DOWNLOAD_STARTED guid=NOT_CAPTURED source=filesystem')
             append_runtime_log(f'{prefix} [GEMINI-DL] CDP_DOWNLOAD_STARTED guid=NOT_CAPTURED')
+            append_runtime_log(f'{prefix} [GEMINI-DL] DOWNLOAD_CDP_MISSED -- filesystem fallback hint={suggested_filename}')
         append_runtime_log(f'{prefix} [GEMINI-DL] EXPECTED_DIR={staging_dir}')
         _log_download_start_confirmed(prefix, dl_guid, source)
 
@@ -5210,7 +5231,9 @@ class GeminiWorker:
                 actual_filename=None,
                 target_state=JobState.RAW_VALIDATED,
                 started_at=time.time(),
-                created_at=time.time()
+                created_at=time.time(),
+                suggested_filename=suggested_filename,
+                attempt=_job_attempt(ctx.job_id),
             )
 
         job_mark(ctx.job_id, 'download', 'ok')
@@ -5539,7 +5562,7 @@ class WmrDriverThread(threading.Thread):
                     job_mark(ctx.job_id, 'dlclean', 'run')
                     ctx.transition_sync(JobState.WMR_DOWNLOAD_START)
 
-                    dl_guid, source = _detect_download_start(self.driver, staging_dir, timeout=WMR_DOWNLOAD_START_TIMEOUT_S)
+                    dl_guid, source, suggested_filename = _detect_download_start(self.driver, staging_dir, timeout=WMR_DOWNLOAD_START_TIMEOUT_S)
                     _log_download_start_confirmed(prefix, dl_guid, source)
 
                     record_id = f"wmr:{ctx.job_id}:{time.monotonic_ns()}"
@@ -5556,7 +5579,9 @@ class WmrDriverThread(threading.Thread):
                             actual_filename=None,
                             target_state=JobState.CLEAN_READY,
                             started_at=time.time(),
-                            created_at=time.time()
+                            created_at=time.time(),
+                            suggested_filename=suggested_filename,
+                            attempt=_job_attempt(ctx.job_id),
                         )
                     
                     release_wmr_once(ctx)
@@ -5895,6 +5920,16 @@ async def poll_downloads_loop():
                 if rec.expected_filename:
                     for f in candidates:
                         if f.name == rec.expected_filename:
+                            completed_file = f
+                            break
+                if completed_file is None and rec.suggested_filename:
+                    # Chrome's own real filename (from Browser.downloadWillBegin's
+                    # suggestedFilename, or the observed .crdownload name on the
+                    # filesystem-fallback path) -- never required to equal our
+                    # canonical expected_filename, but a genuine hint from Chrome
+                    # itself, checked before falling back to plain newest-mtime.
+                    for f in candidates:
+                        if f.name == rec.suggested_filename:
                             completed_file = f
                             break
                 if completed_file is None:
