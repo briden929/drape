@@ -449,7 +449,12 @@ def build_redis_connection_opts(redis_url: str) -> dict:
         opts["ssl"] = True
     return opts
 
-MAX_CONCURRENT_TABS = 4
+# Diagnostic cap: GEMINI_ACTIVE_RESOURCES=1 restricts the whole Gemini
+# pool (broker, worker dict, tab slots, dashboard) to only T0, so a
+# suspected browser-interaction regression can be proven/disproven on a
+# single deterministic resource before re-enabling T1-T3. Defaults to 4
+# (unchanged behavior) when unset.
+MAX_CONCURRENT_TABS = max(1, min(4, int(os.environ.get('GEMINI_ACTIVE_RESOURCES', '4'))))
 CHROME_WMR_WORKERS = 4
 GENERATION_TIMEOUT_S = 240
 LOCAL_REDIS_PORT = 16379
@@ -536,7 +541,7 @@ def clog(msg, file=None):
 
 DASHBOARD_STATE = {
     'queue': {'waiting': 0, 'active': 0, 'delayed': 0, 'local_active': 0, 'completed': 0, 'failed': 0, 'raw_downloads': 0, 'clean_downloads': 0},
-    'gemini': {f'T{i}': {} for i in range(4)},
+    'gemini': {f'T{i}': {} for i in range(MAX_CONCURRENT_TABS)},
     'wmr': {f'W{i}-T{j}': {} for i in range(4) for j in range(2)},
     'system': {'redis': 'OK', 'db': 'OK', 'r2': 'OK', 'bullmq': 'OK', 'download': 'OK', 'gemini': 'OK', 'wmr': 'OK'},
     'last_event': '--',
@@ -4685,7 +4690,7 @@ def _detect_download_start(drv, staging_dir: Path, timeout: float = DOWNLOAD_STA
 if V16_STATE.GEMINI_BROKER is not None:
     GEMINI_BROKER = V16_STATE.GEMINI_BROKER
 else:
-    GEMINI_BROKER = FirstFreeBroker("GEMINI", [f"T{i}" for i in range(4)])
+    GEMINI_BROKER = FirstFreeBroker("GEMINI", [f"T{i}" for i in range(MAX_CONCURRENT_TABS)])
     V16_STATE.GEMINI_BROKER = GEMINI_BROKER
 
 if V16_STATE.WMR_BROKER is not None:
@@ -5158,7 +5163,7 @@ def _handle_gemini_failure(worker: 'GeminiWorker', ctx: JobContext, e: Exception
 if V16_STATE.GEMINI_WORKERS is not None:
     GEMINI_WORKERS = V16_STATE.GEMINI_WORKERS
 else:
-    GEMINI_WORKERS = {f"T{i}": GeminiWorker(f"T{i}") for i in range(4)}
+    GEMINI_WORKERS = {f"T{i}": GeminiWorker(f"T{i}") for i in range(MAX_CONCURRENT_TABS)}
     V16_STATE.GEMINI_WORKERS = GEMINI_WORKERS
 
 # ------------------------------------------------------------------------------
@@ -5536,6 +5541,22 @@ async def execute_pipeline(ctx: JobContext):
         append_runtime_log(f"[{ctx.job_id}] RESOLVING PROMPT + REFERENCES")
         prompt, garment_path, model_path, holo_path = resolve_prompt_and_refs(ctx.payload)
         ctx.prompt = prompt
+
+        # PROMPT_PREFLIGHT: a missing/empty prompt must never reach Gemini
+        # at all -- failing here costs nothing, while discovering it after
+        # New Chat/Flash/Create Image/upload have already run wastes a
+        # whole Gemini resource-hold on a job that could never have sent
+        # anything. Never logs the full prompt text.
+        _norm_prompt = (ctx.prompt or '').strip()
+        if not _norm_prompt:
+            append_runtime_log(f"[{ctx.job_id}] PROMPT_PREFLIGHT prompt_present=False -- failing before Gemini acquisition")
+            raise RuntimeError("PROMPT_MISSING: resolved prompt is empty/None")
+        _prompt_hash = hashlib.sha256(_norm_prompt.encode('utf-8')).hexdigest()[:16]
+        append_runtime_log(
+            f"[{ctx.job_id}] PROMPT_PREFLIGHT prompt_present=True len={len(_norm_prompt)} "
+            f"sha256={_prompt_hash} first80={_norm_prompt[:80]!r} last80={_norm_prompt[-80:]!r}"
+        )
+
         ctx.garment_path = garment_path
         ctx.model_path = model_path
         ctx.holo_path = holo_path
@@ -5818,10 +5839,10 @@ async def process_bullmq_job(job, job_token):
 # ------------------------------------------------------------------------------
 
 def run_architecture_self_test():
-    assert len(GEMINI_BROKER.resource_ids) == 4
+    assert len(GEMINI_BROKER.resource_ids) == MAX_CONCURRENT_TABS
     assert len(WMR_BROKER.resource_ids) == 8
     assert "T0" in GEMINI_BROKER.resource_ids
-    assert "T3" in GEMINI_BROKER.resource_ids
+    assert f"T{MAX_CONCURRENT_TABS - 1}" in GEMINI_BROKER.resource_ids
     for rid in ["W0-T0","W0-T1","W1-T0","W1-T1","W2-T0","W2-T1","W3-T0","W3-T1"]:
         assert rid in WMR_BROKER.resource_ids
     # Preflight: every symbol the N2N pipeline depends on must exist before
