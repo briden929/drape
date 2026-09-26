@@ -4304,6 +4304,11 @@ class JobContext:
     gemini_acquired_at: Optional[float] = None
     generation_started_at: Optional[float] = None
     gemini_staging_dir: Optional[Path] = None
+    # Guards GEMINI_ADMISSION_GATE.release() from firing twice for the same
+    # job (once on setup success, once if a LATER failure -- e.g. during
+    # download -- also routes through _handle_gemini_failure after the
+    # gate was already released).
+    gemini_admission_released: bool = False
 
     def transition_sync(self, new_state: JobState):
         self.loop.call_soon_threadsafe(self._set_state_threadsafe, new_state)
@@ -5161,6 +5166,7 @@ def _handle_gemini_failure(worker: 'GeminiWorker', ctx: JobContext, e: Exception
     worker.handle = None
     worker.driver = None
     release_gemini_once(ctx)
+    _release_admission_gate(ctx)
     if ctx.gemini_done_future is not None and not ctx.gemini_done_future.done():
         ctx.gemini_done_future.set_exception(RuntimeError(ctx.error))
 
@@ -5186,6 +5192,25 @@ else:
 GEMINI_READY_QUEUE: "asyncio.Queue[JobContext]" = asyncio.Queue()
 GEMINI_ACTIVE: Dict[str, JobContext] = {}
 _GEMINI_RR_CURSOR = {'idx': 0}
+
+# By explicit request: BullMQ keeps a high concurrency (so a job doing
+# WMR/R2/DB work never blocks a NEW job from being fetched -- lowering
+# BULLMQ_CONCURRENCY itself caused exactly that regression earlier this
+# session), but only ONE job may be resolving its prompt/refs and waiting
+# to enter Gemini setup at a time. It's acquired in execute_pipeline()
+# right before a job is resolved/queued for Gemini, and released the
+# moment THIS job's setup reaches Send (not when its whole Gemini phase,
+# including download, finishes) -- so "pick one job, submit it into a
+# tab, only then fetch/prepare the next one" holds at the admission point,
+# while multiple already-submitted jobs still generate in their own tabs
+# in parallel afterward.
+GEMINI_ADMISSION_GATE = asyncio.Semaphore(1)
+
+
+def _release_admission_gate(ctx: JobContext):
+    if not ctx.gemini_admission_released:
+        ctx.gemini_admission_released = True
+        GEMINI_ADMISSION_GATE.release()
 
 async def gemini_scheduler_loop():
     """The single owner of all Gemini browser interaction.
@@ -5240,6 +5265,7 @@ async def gemini_scheduler_loop():
                     tid = await GEMINI_BROKER.acquire_preferred(ctx.job_id)
                 except Exception as e:
                     append_runtime_log(f"[GEMINI SCHED] acquire failed job={ctx.job_id}: {e}")
+                    _release_admission_gate(ctx)
                     if ctx.gemini_done_future is not None and not ctx.gemini_done_future.done():
                         ctx.gemini_done_future.set_exception(e)
                     continue
@@ -5254,6 +5280,12 @@ async def gemini_scheduler_loop():
                 try:
                     await loop.run_in_executor(GEMINI_EXECUTOR, worker.run_setup_sync, ctx)
                     GEMINI_ACTIVE[tid] = ctx
+                    # Setup reached Send -- this job is submitted into its
+                    # tab. Release the admission gate now (not when the
+                    # whole Gemini phase, including download, finishes) so
+                    # the NEXT queued job can be fetched/resolved and enter
+                    # setup while this one generates in the background.
+                    _release_admission_gate(ctx)
                 except Exception as e:
                     _handle_gemini_failure(worker, ctx, e)
                 did_work = True
@@ -5585,6 +5617,15 @@ async def execute_pipeline(ctx: JobContext):
         progress_detail(ctx.job_id, 'refs_count', len(ctx.reference_paths))
         progress_detail(ctx.job_id, 'refs_state', 'ready')
 
+        # Only one job may be waiting to enter Gemini setup at a time --
+        # BullMQ can still fetch/admit several jobs concurrently (so a job
+        # doing WMR/R2/DB work never blocks a new one from being picked
+        # up), but each one blocks HERE, before it ever shows up as
+        # "WAIT Gemini", until whichever job is currently going through
+        # Gemini setup has been submitted (reached Send). By explicit
+        # request: "pick one job, upload and hit enter in tab 1, only then
+        # fetch/pick the next one."
+        await GEMINI_ADMISSION_GATE.acquire()
         append_runtime_log(f"[PIPELINE][{ctx.job_id}] GEMINI QUEUED")
         # Only gemini_scheduler_loop() touches GEMINI_BROKER/the shared
         # driver now -- this just hands the job off and waits for the
@@ -5951,13 +5992,16 @@ async def redis_queue_monitor_loop():
                 set_last_event(f"QUEUE {QUEUE_NAME}: {' '.join(changed)}")
 
             _was_idle = is_idle
-
         except Exception as e:
             RUNTIME_HEALTH["redis"] = False
             DASHBOARD_STATE["system"]["redis"] = "ERROR"
             append_runtime_log(f"[REDIS MONITOR ERROR] {type(e).__name__}: {e}")
+            is_idle = False
 
-        await asyncio.sleep(5)
+        # By explicit request: back off to a 10s poll when the queue has no
+        # waiting/active/delayed jobs, instead of always polling every 5s
+        # regardless of whether there's anything to see.
+        await asyncio.sleep(10 if is_idle else 5)
 
 JOB_CONTEXT_RETENTION_S = 600  # keep terminal JobContexts around briefly for the duplicate-job guard
 
@@ -6199,14 +6243,14 @@ async def dashboard_loop():
             wmr_running = sum(1 for r in wmr_state.values() if r['job_id'])
             summary = (
                 f"▒ LIVE | WAIT={q['waiting']} ACTIVE={q['active']} LOCAL={q['local_active']} "
-                f"GEMINI={gemini_running}/4 WMR={wmr_running}/8 DONE={q['completed']} "
+                f"GEMINI={gemini_running}/{MAX_CONCURRENT_TABS} WMR={wmr_running}/8 DONE={q['completed']} "
                 f"FAIL={q['failed']} UP={uptime_s // 3600:02d}:{(uptime_s % 3600) // 60:02d}:{uptime_s % 60:02d}"
             )
             emit_live_event('summary', summary)
 
             gemini_line = 'GEMINI ' + ' | '.join(
                 f"{rid}:{short_job_id(gemini_state[rid]['job_id'])}" if gemini_state[rid]['job_id'] else f"{rid}:FREE"
-                for rid in ["T0", "T1", "T2", "T3"]
+                for rid in [f"T{i}" for i in range(MAX_CONCURRENT_TABS)]
             )
             emit_live_event('gemini_row', gemini_line)
 
